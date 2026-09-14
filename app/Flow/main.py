@@ -7,14 +7,14 @@ from strands.agent.conversation_manager.null_conversation_manager import NullCon
 from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model
-from mcp_client.client import get_streamable_http_mcp_client
+from mcp_client.client import get_mcp_clients
 from memory.session import get_memory_session_manager
 
 app = BedrockAgentCoreApp()
 log = app.logger
 
 # Define a Streamable HTTP MCP Client
-mcp_clients = [get_streamable_http_mcp_client()]
+mcp_clients = get_mcp_clients()
 
 DEFAULT_SYSTEM_PROMPT = """
 You are a helpful assistant. Use tools when appropriate.

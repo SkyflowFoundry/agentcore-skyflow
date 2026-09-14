@@ -29,10 +29,13 @@ Tags defined in `agentcore.json` flow through to deployed CloudFormation resourc
 ## Directory Structure
 
 ```
-myProject/
+agentcore/                  # repo root = git root = agentcore CLI root
 ├── AGENTS.md               # This file — AI coding assistant context
+├── README.md
+├── .mcp.json               # MCP servers for the coding assistant (aws-mcp, awsknowledge, bedrock-agentcore)
+├── .claude/                # Assistant config: AWS skills, secret-safety hook, settings
 ├── agentcore/
-│   ├── agentcore.json      # Main project config (AgentCoreProjectSpec)
+│   ├── agentcore.json      # Main project config (AgentCoreProjectSpec) — ALL resources
 │   ├── aws-targets.json    # Deployment targets (account + region)
 │   ├── .env.local          # Secrets — API keys (gitignored)
 │   ├── .llm-context/       # TypeScript type definitions for AI assistants
@@ -40,9 +43,40 @@ myProject/
 │   │   ├── agentcore.ts    # AgentCoreProjectSpec types
 │   │   └── aws-targets.ts  # AWS deployment target types
 │   └── cdk/                # AWS CDK project (@aws/agentcore-cdk L3 constructs)
-├── app/                    # Agent application code
+├── app/                    # Agent application code — one directory per runtime
+│   └── Flow/               # `Flow` runtime (Strands, CodeZip, PYTHON_3_14)
+├── gateway/                # Gateway target code — see gateway/README.md
+│   └── targets/            # One directory per code-backed target
 └── evaluators/             # Custom evaluator code (if any)
 ```
+
+## Project Conventions
+
+This repo is a single AgentCore project used to explore the platform. **One `agentcore/agentcore.json`
+holds every resource** — agents, gateways, memories, credentials, policy engines. Do not create nested
+projects; add resources to the existing config instead.
+
+| Adding | Command | Code lands in |
+| --- | --- | --- |
+| Agent | `agentcore add agent` | `app/<Name>/` |
+| Gateway | `agentcore add gateway` | — (config only) |
+| Gateway target | `agentcore add gateway-target` | `gateway/targets/<name>/` for code-backed targets |
+| Evaluator | `agentcore add evaluator` | `evaluators/` |
+
+Deployment target is named `dev` (account `571930033416`, `us-east-1`) in `agentcore/aws-targets.json`.
+
+### Agent runtime environment variables
+
+| Variable | Description |
+| --- | --- |
+| `MCP_ENDPOINTS` | Comma-separated streamable-HTTP MCP URLs. Unset falls back to the template example endpoint. |
+| `MCP_BEARER_TOKEN` | Bearer token sent to every endpoint in `MCP_ENDPOINTS`. |
+| `MEMORY_FLOWMEMORY_ID` | Injected by AgentCore for the `FlowMemory` resource. |
+| `LOCAL_DEV` | Set to `1` to use `.env.local` instead of AgentCore Identity. |
+
+An AgentCore Gateway is just another streamable-HTTP MCP endpoint — point `MCP_ENDPOINTS` at the URL
+from `agentcore fetch access`. See `gateway/README.md` for the four MCP interception seams.
+
 
 ## Schema Reference
 

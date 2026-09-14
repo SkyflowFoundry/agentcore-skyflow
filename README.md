@@ -5,17 +5,20 @@ This project was created with the [AgentCore CLI](https://github.com/aws/agentco
 ## Project Structure
 
 ```
-my-project/
+agentcore/                  # repo root — git root and `agentcore` CLI root
 ├── AGENTS.md               # AI coding assistant context
+├── README.md
+├── .mcp.json               # MCP servers for the coding assistant
+├── .claude/                # Assistant skills, hooks, settings
 ├── agentcore/
-│   ├── agentcore.json      # Project config (agents, memories, credentials, gateways, evaluators)
+│   ├── agentcore.json      # Project config — all agents, gateways, memories, credentials
 │   ├── aws-targets.json    # Deployment targets (account + region)
 │   ├── .env.local          # Secrets — API keys (gitignored)
 │   ├── .llm-context/       # TypeScript type definitions for AI assistants
-│   │   ├── agentcore.ts    # AgentCoreProjectSpec types
-│   │   └── aws-targets.ts  # Deployment target types
 │   └── cdk/                # CDK infrastructure (@aws/agentcore-cdk)
-├── app/                    # Agent application code
+├── app/                    # Agent application code — one directory per runtime
+│   └── Flow/               # `Flow` agent
+├── gateway/                # Gateway target code (see gateway/README.md)
 └── evaluators/             # Custom evaluator code (if any)
 ```
 

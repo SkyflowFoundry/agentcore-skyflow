@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "name": "dev",
+    "description": "Personal exploration target for AgentCore features",
+    "account": "571930033416",
+    "region": "us-east-1"
+  }
+]

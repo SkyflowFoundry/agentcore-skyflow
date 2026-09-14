@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"$0\" 2>/dev/null || python \"$0\" 2>/dev/null || py -3 \"$0\"' \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-safety.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "use_aws|mcp__aws.*|mcp__.*aws-mcp.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'python3 \"$0\" 2>/dev/null || python \"$0\" 2>/dev/null || py -3 \"$0\"' \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-safety.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
