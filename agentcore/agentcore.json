@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "agentflow",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "agentflow"
+  },
+  "runtimes": [
+    {
+      "name": "Flow",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/Flow/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP"
+    }
+  ],
+  "memories": [
+    {
+      "name": "FlowMemory",
+      "eventExpiryDuration": 30,
+      "strategies": []
+    }
+  ],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [
+    {
+      "name": "FlowConfig",
+      "type": "ConfigurationBundle",
+      "description": "Configuration for Flow — managed by agentcore CLI",
+      "components": {
+        "{{runtime:Flow}}": {
+          "configuration": {
+            "systemPrompt": "You are a helpful assistant. Use tools when appropriate.",
+            "toolDescriptions": {
+              "add_numbers": "Return the sum of two numbers"
+            }
+          }
+        }
+      },
+      "branchName": "mainline",
+      "commitMessage": "Initial configuration"
+    }
+  ],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "capacityProviders": [],
+  "payments": []
+}
