@@ -128,6 +128,20 @@ class Failure:
         return cls(on_error=raw.get("onError", "fail_closed"))
 
 
+def _bool_field(raw: dict, key: str, where: str) -> bool | None:
+    """Read an optional boolean, rejecting anything truthy-but-not-a-bool.
+
+    A policy that says "true" as a string would otherwise silently enable
+    payload logging.
+    """
+    if key not in raw:
+        return None
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise PolicyError(f"{where}.{key} must be true or false, got {type(value).__name__}")
+    return value
+
+
 @dataclass(frozen=True)
 class Policy:
     """Effective settings for one tool call."""
@@ -137,10 +151,28 @@ class Policy:
     entities: tuple[str, ...] = tuple(DEFAULT_ENTITIES)
     scope: Scope = field(default_factory=Scope)
     failure: Failure = field(default_factory=Failure)
+    #: Log the upstream-facing form of each payload: the request after
+    #: de-identification and the response before re-identification. Those are
+    #: the two snapshots that carry tokens rather than original values. Off by
+    #: default; see `should_log_upstream` for what it does not promise.
+    log_upstream_payloads: bool = False
 
     @property
     def is_noop(self) -> bool:
         return self.request.action == "none" and self.response.action == "none"
+
+    def should_log_upstream(self, action: str) -> bool:
+        """Whether the upstream-facing payload for this direction may be logged.
+
+        Only when something was actually de-identified. With `action: none`
+        nothing is tokenized, so the "upstream" payload is the original one and
+        logging it would write user data to CloudWatch.
+
+        Even when it returns True this is a debugging aid, not a guarantee: the
+        payload is only as redacted as detection was complete, and anything
+        Skyflow did not recognize is still there in the clear.
+        """
+        return self.log_upstream_payloads and action in ("deidentify", "reidentify")
 
 
 @dataclass(frozen=True)
@@ -154,6 +186,7 @@ class Override:
     entities: tuple[str, ...] | None = None
     scope: Scope | None = None
     failure: Failure | None = None
+    log_upstream_payloads: bool | None = None
 
     def matches(self, server: str, tool: str) -> bool:
         server_ok = any(fnmatchcase(server, p) for p in self.servers)
@@ -174,6 +207,7 @@ class Override:
             entities=tuple(entities) if entities is not None else None,
             scope=Scope.from_json(raw["scope"], f"{where}.scope") if "scope" in raw else None,
             failure=Failure.from_json(raw["failure"], f"{where}.failure") if "failure" in raw else None,
+            log_upstream_payloads=_bool_field(raw, "logUpstreamPayloads", where),
         )
 
 
@@ -201,6 +235,8 @@ class PolicySet:
                 updates["scope"] = ov.scope
             if ov.failure is not None:
                 updates["failure"] = ov.failure
+            if ov.log_upstream_payloads is not None:
+                updates["log_upstream_payloads"] = ov.log_upstream_payloads
             return replace(self.defaults, **updates) if updates else self.defaults
         return self.defaults
 
@@ -234,6 +270,7 @@ class PolicySet:
             entities=tuple(entities),
             scope=Scope.from_json(defaults_raw.get("scope"), "defaults.scope"),
             failure=Failure.from_json(defaults_raw.get("failure"), "defaults.failure"),
+            log_upstream_payloads=bool(_bool_field(defaults_raw, "logUpstreamPayloads", "defaults")),
         )
 
         overrides_raw = raw.get("overrides", [])
@@ -299,4 +336,6 @@ class PolicySet:
             updates["scope"] = ov.scope
         if ov.failure is not None:
             updates["failure"] = ov.failure
+        if ov.log_upstream_payloads is not None:
+            updates["log_upstream_payloads"] = ov.log_upstream_payloads
         return replace(self.defaults, **updates) if updates else self.defaults

@@ -1,7 +1,12 @@
 {
   "defaults": {
-    "request": { "action": "deidentify", "tokenType": "vault_token" },
-    "response": { "action": "reidentify" },
+    "request": {
+      "action": "deidentify",
+      "tokenType": "vault_token"
+    },
+    "response": {
+      "action": "reidentify"
+    },
     "entities": [
       "name",
       "email_address",
@@ -13,7 +18,9 @@
     ],
     "scope": {
       "minLength": 8,
-      "includeKeys": ["*"],
+      "includeKeys": [
+        "*"
+      ],
       "excludeKeys": [
         "api_key",
         "authorization",
@@ -24,24 +31,42 @@
         "url"
       ]
     },
-    "failure": { "onError": "fail_closed" }
+    "failure": {
+      "onError": "fail_closed"
+    },
+    "logUpstreamPayloads": true
   },
-
   "toolNameSeparator": "___",
-
   "overrides": [
     {
-      "servers": ["", "*"],
-      "tools": ["x_amz_bedrock_agentcore_search"],
-      "request": { "action": "none" },
-      "response": { "action": "none" }
+      "servers": [
+        "",
+        "*"
+      ],
+      "tools": [
+        "x_amz_bedrock_agentcore_search"
+      ],
+      "request": {
+        "action": "none"
+      },
+      "response": {
+        "action": "none"
+      }
     },
-
     {
-      "servers": ["exa"],
-      "tools": ["web_fetch_exa"],
-      "request": { "action": "none" },
-      "response": { "action": "deidentify", "tokenType": "vault_token" }
+      "servers": [
+        "exa"
+      ],
+      "tools": [
+        "web_fetch_exa"
+      ],
+      "request": {
+        "action": "none"
+      },
+      "response": {
+        "action": "deidentify",
+        "tokenType": "vault_token"
+      }
     }
   ]
 }

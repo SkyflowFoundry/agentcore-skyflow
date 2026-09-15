@@ -149,6 +149,61 @@ packages at versions known to refresh correctly, so it is the reliable option:
 app/Flow/.venv/bin/python scripts/attach_interceptor.py ...
 ```
 
+## Seeing what the upstream server actually received
+
+`logUpstreamPayloads` logs the two snapshots that carry tokens rather than
+original values:
+
+- the request **after** de-identification — literally the bytes the gateway
+  sends upstream;
+- the response **before** re-identification — what the upstream sent back.
+
+The other two forms are never logged, and that is the whole safety argument:
+the inbound request is raw user data, and the outbound response has the
+original values restored.
+
+It is a policy field, so it flips without a redeploy:
+
+```bash
+# gateway/interceptor/config/policy.json
+"defaults": { ..., "logUpstreamPayloads": true }
+
+python3 scripts/put_policy.py          # picked up within the cache TTL, 60s
+```
+
+Scope it to one tool instead of everything with an override:
+
+```json
+{"servers": ["exa"], "tools": ["web_search_exa"], "logUpstreamPayloads": true}
+```
+
+Read it back:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name <interceptor log group> \
+  --filter-pattern upstream_request \
+  --region us-east-1 --query 'events[].message' --output text
+```
+
+```
+upstream_request server=exa tool=web_search_exa payload={"query":
+  "[NAME_AJbrIud] [EMAIL_ADDRESS_nJFlbfH] [PHONE_NUMBER_VVwjCfV]
+   [LOCATION_y3wQt7I] product launch", "objective": "Find coverage of the
+   launch by the person named in the query"}
+```
+
+Two limits worth stating plainly:
+
+- **Tokenized is not the same as safe.** The payload is only as redacted as
+  detection was complete. Anything Skyflow did not recognize is in the log in
+  the clear, so this is a debugging aid rather than a guarantee.
+- **Nothing is logged when the action is `none`.** With no transform the
+  "upstream" payload *is* the original, so logging it would write user data to
+  CloudWatch. `Policy.should_log_upstream` enforces that, not the caller.
+
+Log retention on the interceptor group is one week.
+
 ## Verify a live gateway
 
 `scripts/mcp_call.py` speaks MCP to the gateway with SigV4 auth:
