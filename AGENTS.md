@@ -67,15 +67,26 @@ Deployment target is named `dev` (account `571930033416`, `us-east-1`) in `agent
 
 ### Agent runtime environment variables
 
+Deploy injects one set per reachable resource, so an agent never hardcodes a URL or an ID.
+
 | Variable | Description |
 | --- | --- |
-| `MCP_ENDPOINTS` | Comma-separated streamable-HTTP MCP URLs. Unset falls back to the template example endpoint. |
-| `MCP_BEARER_TOKEN` | Bearer token sent to every endpoint in `MCP_ENDPOINTS`. |
+| `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | One pair per gateway in `agentCoreGateways[]`, wired to every runtime in the project. `<NAME>` is the gateway name upper-cased — `SKYFLOWGATEWAY` here. |
+| `GATEWAY_<ID>_URL`, `_AUTH_TYPE`, `_ARN` | One set per runtime `connections[]` entry pointing at a gateway outside the project. `<ID>` is the connection id upper-cased. |
 | `MEMORY_FLOWMEMORY_ID` | Injected by AgentCore for the `FlowMemory` resource. |
+| `MCP_ENDPOINTS` | Override — comma-separated MCP URLs that *replace* everything discovered. |
+| `MCP_AUTH_TYPE` | Auth for `MCP_ENDPOINTS`: `AWS_IAM`, `CUSTOM_JWT` or `NONE`. Defaults to `CUSTOM_JWT` when `MCP_BEARER_TOKEN` is set, else `NONE`. |
+| `MCP_BEARER_TOKEN` | Bearer token for `CUSTOM_JWT` endpoints. |
 | `LOCAL_DEV` | Set to `1` to use `.env.local` instead of AgentCore Identity. |
 
-An AgentCore Gateway is just another streamable-HTTP MCP endpoint — point `MCP_ENDPOINTS` at the URL
-from `agentcore fetch access`. See `gateway/README.md` for the four MCP interception seams.
+`SkyflowGateway` is `AWS_IAM`, so Flow SigV4-signs each MCP request with its execution role instead
+of carrying a token — the CDK grants `bedrock-agentcore:InvokeGateway` for in-project gateways
+without a `connections[]` entry. `app/Flow/mcp_client/` splits this three ways: `endpoints.py`
+(discovery, stdlib only), `auth.py` (which credential an endpoint gets), `sigv4.py` (the httpx auth
+hook). Their tests are in `tests/flow/`, outside `app/Flow/` because that directory is the CodeZip
+deployment root and everything under it ships to the runtime.
+
+See `gateway/README.md` for the four MCP interception seams.
 
 
 ## Schema Reference

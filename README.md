@@ -18,7 +18,9 @@ agentcore/                  # repo root — git root and `agentcore` CLI root
 │   └── cdk/                # CDK infrastructure (@aws/agentcore-cdk)
 ├── app/                    # Agent application code — one directory per runtime
 │   └── Flow/               # `Flow` agent
-├── gateway/                # Gateway target code (see gateway/README.md)
+├── gateway/                # Gateway interceptor and target code (see gateway/README.md)
+├── scripts/                # Operational scripts — policy push, interceptor attach, MCP calls
+├── tests/                  # Agent tests — outside app/ so they do not ship in the deploy bundle
 └── evaluators/             # Custom evaluator code (if any)
 ```
 

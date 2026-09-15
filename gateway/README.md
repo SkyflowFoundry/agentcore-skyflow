@@ -84,6 +84,34 @@ Declared in `agentCoreGateways[].targets[]` (`agentcore/.llm-context/agentcore.t
 Code-backed targets run on either `LambdaComputeConfig`
 (`agentcore.ts:405`) or `AgentCoreRuntimeComputeConfig` (`agentcore.ts:415`).
 
+## Calling the gateway from an agent
+
+An in-project gateway reaches every runtime in the project automatically — no
+`connections[]` entry required. Deploy injects `AGENTCORE_GATEWAY_<NAME>_URL`
+and `AGENTCORE_GATEWAY_<NAME>_AUTH_TYPE` into each runtime's environment and
+grants the execution role `bedrock-agentcore:InvokeGateway` on the gateway ARN.
+A gateway in another project or account is reached the same way through a
+runtime `connections[]` entry, which injects `GATEWAY_<ID>_*` instead.
+
+With `authorizerType: AWS_IAM` there is no token to fetch, store or rotate: the
+agent SigV4-signs each request for service `bedrock-agentcore`. The signing
+region comes from the gateway host rather than `AWS_REGION`, because a gateway
+reached over a connection can live in another region and a signature is only
+valid for the region that serves it.
+
+Signing is attached as an httpx auth hook
+(`app/Flow/mcp_client/sigv4.py`), not as pre-computed headers — one MCP
+connection sends several requests (the handshake POST, `notifications/initialized`,
+each `tools/call`, the SSE GET, the terminating DELETE) and every one needs its
+own signature over its own body.
+
+`agentcore fetch access` returns the URL and, for a JWT gateway, a token. The
+IAM case needs neither.
+
+Setting `MCP_ENDPOINTS` replaces discovery outright. That is how you point the
+agent straight at an upstream server to compare behaviour with the gateway —
+and its interceptors — taken out of the path.
+
 ## Policy engine — allow/deny
 
 `AgentCoreGateway.policyEngineConfiguration` (`agentcore.ts:354`) binds a Cedar

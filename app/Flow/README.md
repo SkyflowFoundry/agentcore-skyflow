@@ -13,6 +13,13 @@ file defines a Starlette ASGI app with the chosen Agent framework SDK running wi
 
 `model/load.py` instantiates your chosen model provider.
 
+`mcp_client/` supplies the agent's MCP tools. It is three modules so each can be
+tested at the weight it needs: `endpoints.py` decides which endpoints to connect
+to (stdlib only), `auth.py` decides what credential each one gets, `sigv4.py`
+signs requests to an `AWS_IAM` gateway. `client.py` glues them to Strands.
+Tests live in `tests/flow/` at the repo root — not here, because everything
+under this directory ships to the runtime in the CodeZip bundle.
+
 ## Input Validation
 
 Validate invocation input before forwarding it to Strands. Keep plain prompts typed as strings. If the app accepts a
@@ -24,6 +31,12 @@ invoking the agent.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity |
+| `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | Injected | One pair per gateway in the project; the agent discovers them rather than hardcoding a URL |
+| `MCP_ENDPOINTS` | No | Comma-separated MCP URLs that replace everything discovered |
+| `MCP_AUTH_TYPE` | No | `AWS_IAM`, `CUSTOM_JWT` or `NONE` for `MCP_ENDPOINTS` |
+| `MCP_BEARER_TOKEN` | No | Bearer token for `CUSTOM_JWT` endpoints |
+
+See `mcp_client/endpoints.py` for the full discovery rules.
 
 # Developing locally
 

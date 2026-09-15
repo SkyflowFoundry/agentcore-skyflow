@@ -42,6 +42,29 @@ jobs:
         # policy that would fail at runtime fails the build instead.
         run: python3 scripts/put_policy.py --dry-run
 
+  flow:
+    name: Flow agent unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install
+        # The MCP endpoint discovery module is stdlib only; signing needs httpx
+        # and botocore. The agent's full dependency tree (strands, mcp,
+        # bedrock-agentcore) is deliberately not needed to run these.
+        run: pip install --quiet httpx botocore
+
+      - name: Run tests
+        run: |
+          python -m unittest discover \
+            -s tests/flow \
+            -t tests/flow \
+            --verbose
+
   hook:
     name: secret-safety hook tests
     runs-on: ubuntu-latest
