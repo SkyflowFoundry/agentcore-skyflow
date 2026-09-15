@@ -104,6 +104,10 @@ def load_api_key() -> str:
         if not key:
             raise RuntimeError("Skyflow secret JSON contains no 'apiKey' field")
         _api_key_cache = key
+    elif isinstance(parsed, str):
+        # A JSON-encoded string: use the decoded value, or the key would carry
+        # its surrounding quotes into the Authorization header.
+        _api_key_cache = parsed.strip()
     else:
         _api_key_cache = stored.strip()
 

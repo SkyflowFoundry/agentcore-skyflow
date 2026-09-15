@@ -170,12 +170,27 @@ python3 scripts/put_policy.py --region us-east-1
 
 ## Tests
 
-Offline, stdlib `unittest`, no AWS and no Skyflow — a fake client stands in, so
-the round trip is asserted deterministically.
+Offline, stdlib `unittest`, no AWS and no Skyflow. Fakes stand in for the Detect
+client and both boto3 clients, so every assertion is deterministic.
 
 ```bash
-uv run --with boto3 python gateway/interceptor/tests/test_handler.py
+uv run --with boto3 python -m unittest discover \
+  -s gateway/interceptor/tests -t gateway/interceptor/tests
 ```
+
+| Suite | Covers |
+| --- | --- |
+| `test_handler.py` | Dispatch, direction routing, overrides, fail-closed/open, streaming, round trip |
+| `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
+| `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
+| `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
+| `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
+
+Each file also runs standalone (`python3 tests/test_policy.py`).
+
+CI runs these on every push and PR via `.github/workflows/tests.yml`, alongside
+the hook tests, policy validation, and a CDK typecheck plus credential-free
+synth that asserts the Lambda bundle still carries no dependencies.
 
 ## Tool naming
 

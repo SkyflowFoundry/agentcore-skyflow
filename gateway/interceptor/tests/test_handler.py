@@ -13,10 +13,12 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-os.environ.setdefault("POLICY_PARAMETER_NAME", "/test/policy")
-os.environ.setdefault("SKYFLOW_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:0:secret:test")
-os.environ.setdefault("SKYFLOW_VAULT_URL", "https://test.vault.skyflowapis.com")
-os.environ.setdefault("SKYFLOW_VAULT_ID", "vault123")
+# Set explicitly, not via setdefault: ambient values (a developer with
+# SKYFLOW_VAULT_ID exported, say) would otherwise leak into the tests.
+os.environ["POLICY_PARAMETER_NAME"] = "/test/policy"
+os.environ["SKYFLOW_SECRET_ARN"] = "arn:aws:secretsmanager:us-east-1:0:secret:test"
+os.environ["SKYFLOW_VAULT_URL"] = "https://test.vault.skyflowapis.com"
+os.environ["SKYFLOW_VAULT_ID"] = "vault123"
 
 import handler  # noqa: E402
 import settings  # noqa: E402
