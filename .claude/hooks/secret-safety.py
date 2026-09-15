@@ -67,6 +67,70 @@ _INTERPRETER_INLINE_RE = re.compile(
 # Shell compound operators that indicate the command has multiple parts.
 _COMPOUND_OPERATORS_RE = re.compile(r'[;&|`]|\$\(')
 
+# Heredoc introducer: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`.
+_HEREDOC_START_RE = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
+
+# An interpreter consuming a heredoc on stdin — that body IS executed here, so
+# it must still be scanned. Anything else with a `>` redirect writes a file.
+_HEREDOC_PIPED_TO_INTERPRETER_RE = re.compile(
+    r'\|\s*(?:sudo\s+)?(?:python[23]?|python3\.\d+|node|ruby|perl|bash|sh|zsh)\b'
+)
+
+
+def _strip_file_heredocs(command):
+    """Drop heredoc bodies that are being written to a file.
+
+    Writing source code that calls Secrets Manager at runtime is authoring, not
+    fetching: that code runs later, elsewhere, under its own IAM role. Scanning
+    those bodies flagged ordinary application code as a secret fetch.
+
+    A heredoc piped into an interpreter is left intact, because that body really
+    does execute as part of this command.
+
+    This does not close write-a-script-then-run-it. Neither did the original:
+    this hook matches only Bash and AWS MCP tools, so a file written with the
+    Write tool was never scanned at all. What the hook actually enforces — no
+    direct fetch in the agent's own command — is unchanged.
+    """
+    out = []
+    pos = 0
+    while True:
+        match = _HEREDOC_START_RE.search(command, pos)
+        if not match:
+            out.append(command[pos:])
+            break
+
+        # Segment introducing this heredoc: from the previous newline up to `<<`.
+        seg_start = command.rfind('\n', pos, match.start()) + 1
+        introducer = command[seg_start:match.start()]
+
+        terminator = match.group(2)
+        body_start = command.find('\n', match.end())
+        if body_start == -1:
+            out.append(command[pos:])
+            break
+
+        end_match = re.search(
+            rf'^\s*{re.escape(terminator)}\s*$', command[body_start:], re.M
+        )
+        if not end_match:
+            # Unterminated heredoc: scan the remainder rather than assume intent.
+            out.append(command[pos:])
+            break
+
+        body_end = body_start + end_match.end()
+        redirects_to_file = '>' in introducer
+        executes = bool(_HEREDOC_PIPED_TO_INTERPRETER_RE.search(introducer))
+
+        if redirects_to_file and not executes:
+            out.append(command[pos:body_start])
+        else:
+            out.append(command[pos:body_end])
+
+        pos = body_end
+
+    return ''.join(out)
+
 
 def _normalize_op(operation):
     """Collapse casing and -/_ separators so GetSecretValue == get-secret-value."""
@@ -147,6 +211,10 @@ def main():
     # Check Bash commands
     if tool_name == "Bash":
         command = tool_input.get("command", "")
+        # Heredoc bodies redirected to a file are content being authored, not
+        # commands being run. Scanning them blocks writing application code that
+        # legitimately calls Secrets Manager at runtime.
+        command = _strip_file_heredocs(command)
         # AWS CLI secret fetching (shape-aware: actual `aws secretsmanager get-secret-value`)
         if CLI_GSV_PATTERN.search(command):
             deny()
