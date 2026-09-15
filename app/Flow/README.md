@@ -31,6 +31,7 @@ invoking the agent.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity |
+| `BEDROCK_MODEL_ID` | No | Model or inference-profile id; defaults to `global.anthropic.claude-sonnet-5` |
 | `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | Injected | One pair per gateway in the project; the agent discovers them rather than hardcoding a URL |
 | `MCP_ENDPOINTS` | No | Comma-separated MCP URLs that replace everything discovered |
 | `MCP_AUTH_TYPE` | No | `AWS_IAM`, `CUSTOM_JWT` or `NONE` for `MCP_ENDPOINTS` |

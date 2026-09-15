@@ -77,6 +77,7 @@ Deploy injects one set per reachable resource, so an agent never hardcodes a URL
 | `MCP_ENDPOINTS` | Override — comma-separated MCP URLs that *replace* everything discovered. |
 | `MCP_AUTH_TYPE` | Auth for `MCP_ENDPOINTS`: `AWS_IAM`, `CUSTOM_JWT` or `NONE`. Defaults to `CUSTOM_JWT` when `MCP_BEARER_TOKEN` is set, else `NONE`. |
 | `MCP_BEARER_TOKEN` | Bearer token for `CUSTOM_JWT` endpoints. |
+| `BEDROCK_MODEL_ID` | Model or inference-profile id. Defaults to `global.anthropic.claude-sonnet-5`; the template's original default is not subscribed in this account. |
 | `LOCAL_DEV` | Set to `1` to use `.env.local` instead of AgentCore Identity. |
 
 `SkyflowGateway` is `AWS_IAM`, so Flow SigV4-signs each MCP request with its execution role instead
