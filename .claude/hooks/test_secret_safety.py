@@ -5,8 +5,11 @@ authoring source code that calls Secrets Manager must be allowed."""
 import json
 import subprocess
 import sys
+from pathlib import Path
 
-HOOK = "/Users/joe/Code/agentcore/.claude/hooks/secret-safety.py"
+# Resolved from this file, not hardcoded: the suite has to run on any checkout,
+# CI included.
+HOOK = Path(__file__).resolve().parent / "secret-safety.py"
 
 GSV = "get_secret" + "_value"          # split so this file is not itself a tripwire
 CLI_GSV = "get-secret" + "-value"
@@ -14,12 +17,19 @@ CLI_GSV = "get-secret" + "-value"
 
 def run(payload):
     proc = subprocess.run(
-        [sys.executable, HOOK],
+        [sys.executable, str(HOOK)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
         timeout=10,
     )
+    # A hook that fails to run writes nothing to stdout, which would read as
+    # "allow" and let every deny case silently pass. Treat it as a hard error
+    # so a broken hook cannot masquerade as a permissive one.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"hook exited {proc.returncode}\nstderr: {proc.stderr.strip()[:500]}"
+        )
     return "deny" in proc.stdout
 
 
@@ -77,6 +87,10 @@ CASES = [
 
 
 def main():
+    if not HOOK.exists():
+        print(f"hook not found at {HOOK}", file=sys.stderr)
+        return 1
+
     failures = 0
     for label, payload, expect_deny in CASES:
         got_deny = run(payload)
