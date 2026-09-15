@@ -32,8 +32,7 @@ The AgentCore CLI has no field for them. The order is:
 ```bash
 agentcore deploy                            # creates the gateway and its targets
 cd gateway/interceptor/cdk && npm run cdk deploy -- ...   # creates the Lambda
-python3 scripts/attach_interceptor.py ...   # update-gateway + IAM grant
-python3 scripts/grant_gateway_config_bundle.py ...        # see below
+python3 scripts/attach_interceptor.py ...   # update-gateway + the two IAM grants
 ```
 
 The gateway's **service role** needs `lambda:InvokeFunction` on the interceptor
@@ -124,12 +123,10 @@ HTTP 400 {"error":{"code":-32600,"message":"Config bundle fetch failed: ...
 is not authorized to perform: bedrock-agentcore:GetConfigurationBundleVersion ..."}}
 ```
 
-The *runtime* role gets this permission; the *gateway* role does not. Grant it
-after `agentcore deploy`, alongside the interceptor attach:
-
-```bash
-python3 scripts/grant_gateway_config_bundle.py --gateway-name agentflow-SkyflowGateway
-```
+The *runtime* role gets this permission; the *gateway* role does not.
+`scripts/attach_interceptor.py` grants it alongside the Lambda invoke grant, so
+there is one post-deploy step rather than two. Bundle ARNs come from
+`agentcore/.cli/deployed-state.json`; a project with no config bundle skips it.
 
 Worth knowing how this hides: a caller with no config bundle — an IAM user
 running `scripts/mcp_call.py`, say — triggers no fetch at all, so the gateway

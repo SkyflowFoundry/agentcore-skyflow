@@ -115,7 +115,8 @@ cp cdk.context.json.example cdk.context.json   # fill in your vault URL and ID
 npm install && npm run build
 npx cdk deploy --require-approval never
 
-# 3. attach it to the gateway (also grants the gateway role invoke)
+# 3. attach it to the gateway (also grants the gateway role invoke
+#    on the Lambda and read on the project's config bundles)
 #    Note the gateway name is prefixed with the project name.
 python3 scripts/attach_interceptor.py \
   --gateway-name agentflow-SkyflowGateway \
@@ -137,6 +138,15 @@ chain uses the login provider:
 
 ```bash
 uv run --with boto3 --with 'botocore[crt]' python scripts/attach_interceptor.py ...
+```
+
+That ephemeral environment can still fail to refresh an `aws login` session
+(`CreateOAuth2Token ... authorization grant is invalid, expired, revoked, or
+malformed`) even while the AWS CLI works. The agent's own virtualenv has both
+packages at versions known to refresh correctly, so it is the reliable option:
+
+```bash
+app/Flow/.venv/bin/python scripts/attach_interceptor.py ...
 ```
 
 ## Verify a live gateway
