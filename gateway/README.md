@@ -1,61 +1,97 @@
 # Gateway
 
-Source for AgentCore Gateway targets — the Lambda / AgentCore-Runtime functions that back
-custom tools, and any proxy or interception logic sitting between an agent and an upstream
-MCP server.
+Code for AgentCore Gateway: the **interceptors** that run on every invocation,
+and the functions that back code-defined **targets**.
 
-Gateways themselves are **declared** in `agentcore/agentcore.json` under `agentCoreGateways[]`.
-This directory only holds the *code* those declarations point at, via
-`targets[].compute.implementation.path`.
+Gateways and their targets are declared in `agentcore/agentcore.json` under
+`agentCoreGateways[]`. Interceptors are not — see below.
 
 ```
 gateway/
-└── targets/
-    └── <target-name>/     # one dir per code-backed target
+├── interceptor/        # Skyflow de-identify / re-identify interceptor
+└── targets/            # one directory per code-backed target
 ```
 
-## Four seams for proxying / intercepting MCP tool calls
+## Interceptors — the pre/post hook
 
-Schema reference: `agentcore/.llm-context/agentcore.ts`.
+A gateway can run a Lambda on every invocation, at two points:
 
-### 1. `mcpServer` target — front an existing MCP server
+- **REQUEST** — before the gateway calls the target. Validate, transform, or
+  authorize. Returning a `transformedGatewayResponse` short-circuits the call.
+- **RESPONSE** — after the target responds, before the caller sees it. Filter,
+  redact, or rewrite.
 
-`AgentCoreGatewayTarget.targetType: 'mcpServer'` + `endpoint` + `outboundAuth`
-(`agentcore.ts:372`). The gateway registers the upstream server's tools as its own and
-handles outbound credentials from the Token Vault. You get auth, logging, and policy
-enforcement for free. **No code, no mutation** — calls pass through unchanged.
+Both can **modify** the payload, not merely allow or deny it. At most one of
+each per gateway, and one Lambda can serve both by listing
+`interceptionPoints: ["REQUEST", "RESPONSE"]`.
 
-### 2. `passthrough` target — transparent proxy
+### Interceptors cannot be declared in `agentcore.json`
 
-`targetType: 'passthrough'` + `PassthroughConfig { endpoint, protocolType: 'MCP', stickinessConfiguration }`
-(`agentcore.ts:494`). Thinner than `mcpServer`: the gateway forwards the MCP protocol
-wholesale rather than modelling individual tools. `stickinessConfiguration` pins a caller to
-one upstream session. **No code, no mutation.**
+The AgentCore CLI has no field for them. The order is:
 
-### 3. Code target — full intercept (read *and* rewrite)
+```bash
+agentcore deploy                            # creates the gateway and its targets
+cd gateway/interceptor/cdk && npm run cdk deploy -- ...   # creates the Lambda
+python3 scripts/attach_interceptor.py ...   # update-gateway + IAM grant
+```
 
-This is the one to reach for when you need to see and change requests and responses.
+The gateway's **service role** needs `lambda:InvokeFunction` on the interceptor
+function — an identity-based grant, not a Lambda resource policy. Scope it to
+the specific function ARN, never a wildcard. `scripts/attach_interceptor.py`
+does this.
 
-`targetType: 'lambda'`, with `toolDefinitions[]` describing the tool surface you expose and
-`compute` pointing at your handler:
+### Payload shape depends on the target type
 
-- `LambdaComputeConfig` — `host: 'Lambda'`, `implementation: { language: 'TypeScript' | 'Python', path, handler }`,
-  plus `timeout`, `memorySize`, `iamPolicy` (`agentcore.ts:403`)
-- `AgentCoreRuntimeComputeConfig` — `host: 'AgentCoreRuntime'`, Python only, for
-  longer-running or stateful interceptors (`agentcore.ts:414`)
+This catches people out. The interceptor receives one of two shapes:
 
-Your handler receives the tool call, does whatever it likes — redact arguments, call the real
-upstream MCP server, filter or transform the response, emit telemetry — and returns the
-result. `path` is relative to the project root, so point it at `gateway/targets/<name>/`.
+| Target types | Event key | Body format |
+| --- | --- | --- |
+| `lambda`, `mcpServer`, `openApiSchema`, `smithyModel`, `apiGateway` | `mcp` | Parsed JSON-RPC object |
+| `httpRuntime` (AgentCore Runtime), `passthrough`, inference | `http` | Base64-encoded string |
 
-### 4. Policy engine — gate without touching the payload
+To front an external MCP server, prefer **`mcpServer`** over `passthrough`.
+Both reach the same upstream, but `passthrough` delivers the `http` shape —
+base64 bodies with no MCP framing, so there is no tool name or arguments to
+match a policy against.
 
-`AgentCoreGateway.policyEngineConfiguration: { policyEngineName, mode: 'LOG_ONLY' | 'ENFORCE' }`
-(`agentcore.ts:354`), with the engine and its Cedar policies declared in `policyEngines[]`
-(`agentcore.ts:515`). Allow/deny decisions on tool invocation. Cannot rewrite a call — pair it
-with seam 3 when you need both.
+Other behaviour worth knowing:
 
-Start in `LOG_ONLY` to see what would have been blocked before switching to `ENFORCE`.
+- Every MCP method arrives at the same handler, `tools/list` included. Dispatch
+  on `body.method`; a tool schema is not user data.
+- On MCP, a REQUEST short-circuit **still invokes** the RESPONSE interceptor.
+  On HTTP it does not.
+- With response streaming enabled, RESPONSE fires once per JSON-RPC event and
+  only the first may set headers or status code.
+- Lambda synchronous invocation caps request and response at 6 MB combined.
+  `payloadFilter` can drop `RESPONSE_BODY`, but only for the `http` shape.
+- Headers are withheld unless `passRequestHeaders` is true. Leave it off unless
+  needed — headers carry bearer tokens.
+- The gateway may retry an interceptor, so handlers must be idempotent.
+
+## Targets — where tools come from
+
+Declared in `agentCoreGateways[].targets[]` (`agentcore/.llm-context/agentcore.ts:372`).
+
+| Target type | Use |
+| --- | --- |
+| `mcpServer` | Front an existing MCP server, with outbound auth from the Token Vault |
+| `lambda` | Your own tool implementation; `compute.implementation.path` points into `targets/` |
+| `openApiSchema` / `smithyModel` / `apiGateway` | Expose an existing API as tools |
+| `httpRuntime` | An AgentCore Runtime in this project, by name |
+| `passthrough` | Transparent proxy; see the payload-shape caveat above |
+| `connector` | Managed `web-search` or `bedrock-knowledge-bases` |
+
+Code-backed targets run on either `LambdaComputeConfig`
+(`agentcore.ts:405`) or `AgentCoreRuntimeComputeConfig` (`agentcore.ts:415`).
+
+## Policy engine — allow/deny
+
+`AgentCoreGateway.policyEngineConfiguration` (`agentcore.ts:354`) binds a Cedar
+policy engine in `LOG_ONLY` or `ENFORCE` mode, with policies declared in
+`policyEngines[]` (`agentcore.ts:515`). Cedar decides whether a call proceeds; it
+cannot rewrite a payload. Pair it with an interceptor when you need both.
+
+Start in `LOG_ONLY` to see what would have been blocked.
 
 ## Adding a gateway
 
@@ -64,5 +100,5 @@ agentcore add gateway
 agentcore add gateway-target
 agentcore validate
 agentcore deploy
-agentcore fetch access          # gateway URL + token for MCP_ENDPOINTS / MCP_BEARER_TOKEN
+agentcore fetch access          # gateway URL + token
 ```
