@@ -1,0 +1,101 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same PR supersedes the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  interceptor:
+    name: interceptor unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Lambda runtime the interceptor deploys to.
+          python-version: '3.13'
+
+      - name: Install boto3
+        # The only dependency the Lambda has, and it is provided by the AWS
+        # runtime rather than bundled — so it is a test-time install here.
+        run: pip install --quiet boto3
+
+      - name: Run tests
+        run: |
+          python -m unittest discover \
+            -s gateway/interceptor/tests \
+            -t gateway/interceptor/tests \
+            --verbose
+
+      - name: Validate the shipped redaction policy
+        # Parses config/policy.json with the same model the Lambda uses, so a
+        # policy that would fail at runtime fails the build instead.
+        run: python3 scripts/put_policy.py --dry-run
+
+  hook:
+    name: secret-safety hook tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Run tests
+        # Stdlib only — no install step needed.
+        run: python3 .claude/hooks/test_secret_safety.py
+
+  cdk:
+    name: cdk typecheck and synth
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway/interceptor/cdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: gateway/interceptor/cdk/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Synth
+        # No AWS credentials: account and region come from
+        # agentcore/aws-targets.json, and the Skyflow secret is referenced by
+        # name, so nothing here performs a lookup. Vault identifiers live in the
+        # gitignored cdk.context.json, so CI supplies placeholders.
+        run: |
+          npm run build
+          npx cdk synth --quiet \
+            -c skyflowVaultUrl=https://ci.vault.example.com \
+            -c skyflowVaultId=ci-placeholder
+
+      - name: Assert the Lambda bundle carries no dependencies
+        # The interceptor deploys as plain source with no layer and no vendored
+        # packages. A stray dependency directory would mean the bundle drifted.
+        run: |
+          asset=$(find cdk.out -maxdepth 1 -type d -name 'asset.*' | head -1)
+          echo "Lambda asset contents:"
+          ls -A "$asset"
+          if find "$asset" -name '__pycache__' -o -name '*.dist-info' | grep -q .; then
+            echo "::error::Lambda asset contains build or dependency artifacts"
+            exit 1
+          fi

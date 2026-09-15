@@ -1,0 +1,23 @@
+{
+  "name": "skyflow-interceptor-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "interceptor": "dist/bin/interceptor.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "npm run build && cdk",
+    "clean": "rm -rf dist cdk.out"
+  },
+  "devDependencies": {
+    "@types/node": "~24.13.3",
+    "aws-cdk": "~2.1126.0",
+    "typescript": "~5.9.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "~2.261.0",
+    "constructs": "~10.7.0"
+  }
+}

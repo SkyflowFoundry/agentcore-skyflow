@@ -1,0 +1,4 @@
+{
+  "skyflowVaultUrl": "https://<cluster>.vault.skyflowapis.com",
+  "skyflowVaultId": "<vault-id>"
+}

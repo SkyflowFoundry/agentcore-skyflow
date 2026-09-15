@@ -29,13 +29,32 @@
   "credentials": [],
   "evaluators": [],
   "onlineEvalConfigs": [],
-  "agentCoreGateways": [],
+  "agentCoreGateways": [
+    {
+      "name": "SkyflowGateway",
+      "description": "MCP gateway fronting upstream servers, with Skyflow de-identify/re-identify interceptors",
+      "protocolType": "MCP",
+      "authorizerType": "AWS_IAM",
+      "enableSemanticSearch": true,
+      "exceptionLevel": "DEBUG",
+      "targets": [
+        {
+          "name": "exa",
+          "targetType": "mcpServer",
+          "endpoint": "https://mcp.exa.ai/mcp",
+          "outboundAuth": {
+            "type": "NONE"
+          }
+        }
+      ]
+    }
+  ],
   "policyEngines": [],
   "configBundles": [
     {
       "name": "FlowConfig",
       "type": "ConfigurationBundle",
-      "description": "Configuration for Flow — managed by agentcore CLI",
+      "description": "Configuration for Flow \u2014 managed by agentcore CLI",
       "components": {
         "{{runtime:Flow}}": {
           "configuration": {
