@@ -33,6 +33,7 @@ The AgentCore CLI has no field for them. The order is:
 agentcore deploy                            # creates the gateway and its targets
 cd gateway/interceptor/cdk && npm run cdk deploy -- ...   # creates the Lambda
 python3 scripts/attach_interceptor.py ...   # update-gateway + IAM grant
+python3 scripts/grant_gateway_config_bundle.py ...        # see below
 ```
 
 The gateway's **service role** needs `lambda:InvokeFunction` on the interceptor
@@ -111,6 +112,33 @@ IAM case needs neither.
 Setting `MCP_ENDPOINTS` replaces discovery outright. That is how you point the
 agent straight at an upstream server to compare behaviour with the gateway —
 and its interceptors — taken out of the path.
+
+### The gateway needs to read the caller's config bundle
+
+When a caller that has a ConfigBundle invokes a gateway, the gateway fetches
+that bundle to resolve tool descriptions. The gateway's service role, as the
+AgentCore CDK creates it, cannot, and `tools/list` fails:
+
+```
+HTTP 400 {"error":{"code":-32600,"message":"Config bundle fetch failed: ...
+is not authorized to perform: bedrock-agentcore:GetConfigurationBundleVersion ..."}}
+```
+
+The *runtime* role gets this permission; the *gateway* role does not. Grant it
+after `agentcore deploy`, alongside the interceptor attach:
+
+```bash
+python3 scripts/grant_gateway_config_bundle.py --gateway-name agentflow-SkyflowGateway
+```
+
+Worth knowing how this hides: a caller with no config bundle — an IAM user
+running `scripts/mcp_call.py`, say — triggers no fetch at all, so the gateway
+looks healthy from every direction except the one that matters. It only appears
+once a runtime calls it.
+
+Strands also reports it as `Connection to the MCP server was closed`, which is
+why `mcp_client/diagnostics.py` logs the body of any 4xx or 5xx from an MCP
+endpoint. Without that the status code never reaches the log.
 
 To exercise that client against the live gateway without deploying:
 
