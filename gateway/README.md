@@ -150,6 +150,46 @@ It imports the agent's own `mcp_client` package, so it covers discovery,
 credential choice and signing rather than re-implementing them the way
 `scripts/mcp_call.py` does.
 
+## Poking at it with the MCP Inspector
+
+The [MCP Inspector](https://modelcontextprotocol.io/docs/2026-07-28/tools/inspector)
+can send static headers but cannot SigV4-sign, and a signature covers the
+request body, so no fixed header works against an `AWS_IAM` gateway.
+`scripts/gateway_proxy.py` bridges the gap: it listens on loopback, signs each
+request with `mcp_client.sigv4` — the agent's own signer — and forwards.
+
+Inspector needs Node 22.19 or newer; `nvm use 24` is enough.
+
+```bash
+# terminal 1
+app/Flow/.venv/bin/python scripts/gateway_proxy.py
+
+# terminal 2
+npx @modelcontextprotocol/inspector --server-url http://127.0.0.1:8090/mcp --transport http
+```
+
+The CLI client is the quickest way to check a change:
+
+```bash
+npx @modelcontextprotocol/inspector --cli \
+  --server-url http://127.0.0.1:8090/mcp --transport http \
+  --method tools/call --tool-name exa___web_search_exa \
+  --tool-arg 'query=...' --tool-arg 'objective=...'
+```
+
+Two things to keep in mind:
+
+- **The proxy signs as you, not as the runtime.** Credentials come from
+  botocore's default chain, so Inspector exercises your IAM identity while the
+  deployed agent uses its execution role. A call that works in Inspector can
+  still fail in the agent.
+- **It has no authentication of its own.** Anyone who can reach the port calls
+  the gateway with your credentials, which is why it refuses to bind anything
+  but loopback. Stop it when you are done.
+
+Inspector opens an SSE stream with `GET /mcp`, which this gateway answers 405.
+That is expected and harmless — responses come back on the POST instead.
+
 ## Policy engine — allow/deny
 
 `AgentCoreGateway.policyEngineConfiguration` (`agentcore.ts:354`) binds a Cedar
