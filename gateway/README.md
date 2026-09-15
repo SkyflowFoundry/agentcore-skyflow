@@ -112,6 +112,19 @@ Setting `MCP_ENDPOINTS` replaces discovery outright. That is how you point the
 agent straight at an upstream server to compare behaviour with the gateway —
 and its interceptors — taken out of the path.
 
+To exercise that client against the live gateway without deploying:
+
+```bash
+app/Flow/.venv/bin/python scripts/flow_mcp_check.py
+app/Flow/.venv/bin/python scripts/flow_mcp_check.py \
+    --call exa___web_search_exa \
+    --arguments '{"query": "...", "objective": "..."}'
+```
+
+It imports the agent's own `mcp_client` package, so it covers discovery,
+credential choice and signing rather than re-implementing them the way
+`scripts/mcp_call.py` does.
+
 ## Policy engine — allow/deny
 
 `AgentCoreGateway.policyEngineConfiguration` (`agentcore.ts:354`) binds a Cedar
