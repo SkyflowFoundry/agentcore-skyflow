@@ -28,6 +28,7 @@ Behaviour worth knowing:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -41,6 +42,10 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 OUTPUT_VERSION = "1.0"
 JSONRPC_INTERNAL_ERROR = -32603
+
+#: Cap on a logged payload. A web search result runs to tens of kilobytes and
+#: the point is to see the shape and the tokens, not to archive the body.
+MAX_LOGGED_PAYLOAD = 4000
 
 
 # ---------------------------------------------------------------- entry point
@@ -111,6 +116,8 @@ def _on_request(mcp: dict) -> dict:
         return _on_failure_request(body, policy, exc, server, tool)
 
     logger.info("request_transformed server=%s tool=%s fields=%d", server, tool, count)
+    if policy.should_log_upstream(action):
+        _log_upstream("request", server, tool, transformed)
 
     new_body = dict(body)
     new_body["params"] = {**params, "arguments": transformed}
@@ -165,6 +172,12 @@ def _on_response(mcp: dict) -> dict:
     if action == "none":
         return _pass_response(gateway_response, streaming)
 
+    # Before the transform, not after: this is the form the upstream server
+    # returned, still carrying tokens. The transformed version has the original
+    # values back in it and must never reach a log.
+    if policy.should_log_upstream(action):
+        _log_upstream("response", server, tool, result)
+
     try:
         transformed, count = _apply(result, policy, policy.response.action, policy.response.token_type)
     except SkyflowError as exc:
@@ -202,6 +215,19 @@ def _on_failure_response(
 
 
 # ----------------------------------------------------------------- transform
+
+
+def _log_upstream(direction: str, server: str, tool: str, node) -> None:
+    """Log the upstream-facing form of a payload.
+
+    Callers must gate this on `Policy.should_log_upstream`, which is what knows
+    whether the payload is the tokenized side. This function only serializes.
+    """
+    try:
+        rendered = json.dumps(node, default=str)[:MAX_LOGGED_PAYLOAD]
+    except Exception:  # noqa: BLE001 - a diagnostic must not break the call
+        rendered = "<unserializable>"
+    logger.info("upstream_%s server=%s tool=%s payload=%s", direction, server, tool, rendered)
 
 
 def _apply(node, policy: Policy, action: str, token_type: str):

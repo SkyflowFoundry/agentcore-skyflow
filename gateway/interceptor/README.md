@@ -115,7 +115,8 @@ cp cdk.context.json.example cdk.context.json   # fill in your vault URL and ID
 npm install && npm run build
 npx cdk deploy --require-approval never
 
-# 3. attach it to the gateway (also grants the gateway role invoke)
+# 3. attach it to the gateway (also grants the gateway role invoke
+#    on the Lambda and read on the project's config bundles)
 #    Note the gateway name is prefixed with the project name.
 python3 scripts/attach_interceptor.py \
   --gateway-name agentflow-SkyflowGateway \
@@ -138,6 +139,70 @@ chain uses the login provider:
 ```bash
 uv run --with boto3 --with 'botocore[crt]' python scripts/attach_interceptor.py ...
 ```
+
+That ephemeral environment can still fail to refresh an `aws login` session
+(`CreateOAuth2Token ... authorization grant is invalid, expired, revoked, or
+malformed`) even while the AWS CLI works. The agent's own virtualenv has both
+packages at versions known to refresh correctly, so it is the reliable option:
+
+```bash
+app/Flow/.venv/bin/python scripts/attach_interceptor.py ...
+```
+
+## Seeing what the upstream server actually received
+
+`logUpstreamPayloads` logs the two snapshots that carry tokens rather than
+original values:
+
+- the request **after** de-identification — literally the bytes the gateway
+  sends upstream;
+- the response **before** re-identification — what the upstream sent back.
+
+The other two forms are never logged, and that is the whole safety argument:
+the inbound request is raw user data, and the outbound response has the
+original values restored.
+
+It is a policy field, so it flips without a redeploy:
+
+```bash
+# gateway/interceptor/config/policy.json
+"defaults": { ..., "logUpstreamPayloads": true }
+
+python3 scripts/put_policy.py          # picked up within the cache TTL, 60s
+```
+
+Scope it to one tool instead of everything with an override:
+
+```json
+{"servers": ["exa"], "tools": ["web_search_exa"], "logUpstreamPayloads": true}
+```
+
+Read it back:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name <interceptor log group> \
+  --filter-pattern upstream_request \
+  --region us-east-1 --query 'events[].message' --output text
+```
+
+```
+upstream_request server=exa tool=web_search_exa payload={"query":
+  "[NAME_AJbrIud] [EMAIL_ADDRESS_nJFlbfH] [PHONE_NUMBER_VVwjCfV]
+   [LOCATION_y3wQt7I] product launch", "objective": "Find coverage of the
+   launch by the person named in the query"}
+```
+
+Two limits worth stating plainly:
+
+- **Tokenized is not the same as safe.** The payload is only as redacted as
+  detection was complete. Anything Skyflow did not recognize is in the log in
+  the clear, so this is a debugging aid rather than a guarantee.
+- **Nothing is logged when the action is `none`.** With no transform the
+  "upstream" payload *is* the original, so logging it would write user data to
+  CloudWatch. `Policy.should_log_upstream` enforces that, not the caller.
+
+Log retention on the interceptor group is one week.
 
 ## Verify a live gateway
 

@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""Attach the Skyflow interceptor Lambda to an AgentCore Gateway.
+"""Wire an AgentCore Gateway up to everything `agentcore deploy` leaves undone.
 
-The AgentCore CLI cannot declare interceptors, so this runs after
-`agentcore deploy`:
+The AgentCore CLI cannot declare interceptors, and the CDK-created gateway role
+starts with no permissions at all, so this runs after `agentcore deploy`:
 
     agentcore deploy
     python3 scripts/attach_interceptor.py \
-        --gateway-name SkyflowGateway \
+        --gateway-name agentflow-SkyflowGateway \
         --function-arn arn:aws:lambda:us-east-1:...:function:... \
         --region us-east-1
 
-It does two things:
+Note the gateway name carries the project prefix: a gateway named
+`SkyflowGateway` in `agentcore.json` is deployed as `agentflow-SkyflowGateway`.
+
+It does three things:
 
 1. Grants the gateway's service role `lambda:InvokeFunction` on that one
    function. Per the AgentCore docs this is an identity-based grant on the
    gateway role, not a Lambda resource policy, and it is deliberately scoped to
    a single ARN rather than a wildcard.
-2. Calls `update-gateway` with `interceptorConfigurations`, preserving the
+2. Grants that same role `bedrock-agentcore:GetConfigurationBundleVersion` on
+   the project's config bundles. When a caller has a ConfigBundle the gateway
+   fetches it to resolve tool descriptions; without this, a runtime calling the
+   gateway fails at `tools/list` with HTTP 400. The CDK grants this to the
+   runtime role but not to the gateway role. It hides well: a caller with no
+   bundle — an IAM user running `scripts/mcp_call.py` — triggers no fetch, so
+   the gateway looks healthy from every direction except a runtime.
+3. Calls `update-gateway` with `interceptorConfigurations`, preserving the
    gateway's existing settings.
 
-Re-running is safe: the role policy is replaced in place and the interceptor
+Re-running is safe: role policies are replaced in place and the interceptor
 configuration is overwritten with the same values.
 """
 
@@ -28,11 +38,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
-INLINE_POLICY_NAME = "InvokeSkyflowInterceptor"
+INVOKE_POLICY_NAME = "InvokeSkyflowInterceptor"
+CONFIG_BUNDLE_POLICY_NAME = "ReadRuntimeConfigBundles"
+
+# The gateway resolves the caller's bundle at tools/list time. Reading a version
+# is all it does; it never lists or writes.
+CONFIG_BUNDLE_ACTIONS = ["bedrock-agentcore:GetConfigurationBundleVersion"]
+
+DEPLOYED_STATE = Path(__file__).resolve().parents[1] / "agentcore" / ".cli" / "deployed-state.json"
 
 
 def find_gateway(control, name: str) -> dict:
@@ -53,32 +71,62 @@ def find_gateway(control, name: str) -> dict:
     sys.exit(f"No gateway named {name!r}. Found: {', '.join(seen) or '(none)'}")
 
 
-def grant_invoke(role_arn: str, function_arn: str) -> None:
+def bundle_arns_from_state(target: str) -> list[str]:
+    """Config bundle ARNs recorded for a deployment target.
+
+    Returns empty rather than exiting: a project with no config bundle is
+    legitimate, and the interceptor attach should still proceed.
+    """
+    if not DEPLOYED_STATE.exists():
+        print(f"  no {DEPLOYED_STATE.name}; skipping the config bundle grant")
+        return []
+    state = json.loads(DEPLOYED_STATE.read_text())
+    bundles = state.get("targets", {}).get(target, {}).get("resources", {}).get("configBundles", {})
+    return sorted(b["bundleArn"] for b in bundles.values() if b.get("bundleArn"))
+
+
+def put_policy(role_arn: str, policy_name: str, statements: list[dict]) -> str:
     role_name = role_arn.rsplit("/", 1)[-1]
-    iam = boto3.client("iam")
-    document = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": "lambda:InvokeFunction",
-                "Resource": function_arn,
-            }
-        ],
-    }
-    iam.put_role_policy(
+    boto3.client("iam").put_role_policy(
         RoleName=role_name,
-        PolicyName=INLINE_POLICY_NAME,
-        PolicyDocument=json.dumps(document),
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": statements}),
+    )
+    return role_name
+
+
+def grant_invoke(role_arn: str, function_arn: str) -> None:
+    role_name = put_policy(
+        role_arn,
+        INVOKE_POLICY_NAME,
+        [{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": function_arn}],
     )
     print(f"  granted lambda:InvokeFunction to {role_name} on {function_arn.rsplit(':', 1)[-1]}")
 
 
+def grant_config_bundle_read(role_arn: str, bundle_arns: list[str]) -> None:
+    role_name = put_policy(
+        role_arn,
+        CONFIG_BUNDLE_POLICY_NAME,
+        [{"Effect": "Allow", "Action": CONFIG_BUNDLE_ACTIONS, "Resource": bundle_arns}],
+    )
+    print(f"  granted {', '.join(CONFIG_BUNDLE_ACTIONS)} to {role_name} on:")
+    for arn in bundle_arns:
+        print(f"    {arn.rsplit('/', 1)[-1]}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--gateway-name", required=True)
+    parser.add_argument("--gateway-name", required=True, help="deployed name, including the project prefix")
     parser.add_argument("--function-arn", required=True)
     parser.add_argument("--region", default=None)
+    parser.add_argument("--target", default="dev", help="deployment target, for the config bundle lookup")
+    parser.add_argument(
+        "--bundle-arn",
+        action="append",
+        dest="bundle_arns",
+        help="Config bundle ARN to grant. Repeatable. Defaults to every bundle in deployed state.",
+    )
     parser.add_argument(
         "--points",
         nargs="+",
@@ -92,7 +140,7 @@ def main() -> None:
         help="Include request headers in the interceptor payload. Off by default — "
         "headers carry bearer tokens and this interceptor does not need them.",
     )
-    parser.add_argument("--skip-iam", action="store_true", help="Skip the role grant (already done).")
+    parser.add_argument("--skip-iam", action="store_true", help="Skip both role grants (already done).")
     args = parser.parse_args()
 
     session = boto3.Session(region_name=args.region) if args.region else boto3.Session()
@@ -109,8 +157,14 @@ def main() -> None:
 
     if not args.skip_iam:
         if not role_arn:
-            sys.exit("Gateway has no roleArn; cannot grant invoke permission.")
+            sys.exit("Gateway has no roleArn; cannot grant permissions.")
         grant_invoke(role_arn, args.function_arn)
+
+        bundle_arns = args.bundle_arns or bundle_arns_from_state(args.target)
+        if bundle_arns:
+            grant_config_bundle_read(role_arn, bundle_arns)
+        else:
+            print("  no config bundles to grant")
 
     interceptor_configurations = [
         {
