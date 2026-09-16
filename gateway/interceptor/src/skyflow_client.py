@@ -99,6 +99,38 @@ class RunTimeout(SkyflowError):
     """The run did not reach a terminal state inside the caller's deadline."""
 
 
+def build_file_configuration(
+    entity_types: tuple[str, ...] | list[str] = (),
+    token_type: str = "counter",
+    data_format: str = "",
+) -> dict[str, Any]:
+    """A minimal inline Detect configuration.
+
+    Used when the policy names no `fileConfiguration` of its own. Vault tokens
+    are only requested for formats that accept them — asking for VAULT_TOKEN on
+    a PDF is rejected by the API — so this downgrades to counters rather than
+    sending a request that cannot succeed.
+
+    The interceptor never re-identifies a file: this is a one-way transform
+    applied before the agent sees the document. Vault tokens are still worth
+    requesting where supported, because they leave the original recoverable out
+    of band by someone with vault permissions.
+    """
+    reversible = token_type == "vault_token" and data_format in VAULT_TOKEN_FORMATS
+    deidentification = "VAULT_TOKEN" if reversible else "ENTITY_UNIQUE_COUNTER"
+    # v2 spells entity types in upper case; the string API and our policy use
+    # lower case.
+    types = [e.upper() for e in entity_types] or ["ALL"]
+    return {
+        "detect": {
+            "entities": [
+                {"entityType": t, "deidentificationType": deidentification}
+                for t in types
+            ]
+        }
+    }
+
+
 class SkyflowClient:
     """Thin client over the Detect string endpoints.
 
@@ -152,64 +184,32 @@ class SkyflowClient:
         self,
         file_url: str,
         data_format: str,
-        configuration_id: str | None = None,
-        entity_types: tuple[str, ...] | list[str] = (),
-        token_type: str = "counter",
+        configuration: dict[str, Any],
     ) -> str:
         """Submit a signed URL for de-identification. Returns a run id.
 
         Skyflow fetches the file itself, so the URL must still be valid when it
         does — a short presigned expiry is the likeliest cause of a failed run.
 
-        `configuration_id` is preferred: a Detect configuration lives in the
-        vault, where entity destinations and PDF processing mode belong. The
-        inline configuration built here is a fallback for when none is named.
+        `configuration` is an inline Detect configuration, passed through
+        essentially as given so the policy can express any Detect option
+        without this client modelling each one. Configurations are deliberately
+        inline rather than referenced by `configurationId`: a vault-stored
+        config would have to be updated and rolled out separately from the code
+        and policy that depend on it.
         """
         body: dict[str, Any] = {
             "dataSource": "PRESIGNED_URL",
             "value": file_url,
             "dataFormat": data_format,
+            "configuration": {"vaultId": self._vault_id, **configuration},
         }
-        if configuration_id:
-            body["configurationId"] = configuration_id
-        else:
-            body["configuration"] = self._inline_configuration(
-                entity_types, token_type, data_format
-            )
 
         data = self._post("/v2/detect/deidentify/file", body)
         run_id = data.get("runId")
         if not run_id:
             raise SkyflowError("Skyflow accepted the file but returned no runId")
         return run_id
-
-    def _inline_configuration(
-        self,
-        entity_types: tuple[str, ...] | list[str],
-        token_type: str,
-        data_format: str,
-    ) -> dict[str, Any]:
-        """Build a minimal Detect configuration.
-
-        Vault tokens are only requested for formats that support them. Asking
-        for VAULT_TOKEN on a PDF is rejected by the API, so this silently falls
-        back to counters rather than failing the call — the policy layer is
-        where that downgrade is surfaced to the operator.
-        """
-        reversible = token_type == "vault_token" and data_format in VAULT_TOKEN_FORMATS
-        deidentification = "VAULT_TOKEN" if reversible else "ENTITY_UNIQUE_COUNTER"
-        # v2 spells entity types in upper case; the string API and our policy
-        # use lower case.
-        types = [e.upper() for e in entity_types] or ["ALL"]
-        return {
-            "vaultId": self._vault_id,
-            "detect": {
-                "entities": [
-                    {"entityType": t, "deidentificationType": deidentification}
-                    for t in types
-                ]
-            },
-        }
 
     def get_run(self, run_id: str) -> FileRunResult:
         """Current state of a file run."""

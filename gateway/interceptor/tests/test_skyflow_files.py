@@ -21,6 +21,7 @@ from skyflow_client import (  # noqa: E402
     RunTimeout,
     SkyflowClient,
     SkyflowError,
+    build_file_configuration,
 )
 
 SIGNED_URL = "https://bucket.s3.amazonaws.com/claims/invoice.pdf?X-Amz-Signature=abc"
@@ -73,7 +74,7 @@ class SubmitTestCase(unittest.TestCase):
     def test_sends_the_url_rather_than_the_bytes(self):
         """The whole point: the file never passes through this Lambda."""
         client = RecordingClient([{"runId": "run-1"}])
-        run_id = client.deidentify_file_url(SIGNED_URL, "pdf", configuration_id="cfg-1")
+        run_id = client.deidentify_file_url(SIGNED_URL, "pdf", build_file_configuration())
 
         self.assertEqual(run_id, "run-1")
         method, path, body = client.requests[0]
@@ -82,48 +83,63 @@ class SubmitTestCase(unittest.TestCase):
         self.assertEqual(body["value"], SIGNED_URL)
         self.assertEqual(body["dataFormat"], "pdf")
 
-    def test_a_configuration_id_is_used_verbatim_and_suppresses_inline_config(self):
+    def test_the_vault_id_is_injected_into_the_configuration(self):
         client = RecordingClient([{"runId": "run-1"}])
-        client.deidentify_file_url(SIGNED_URL, "pdf", configuration_id="cfg-1")
-        body = client.bodies[0]
-        self.assertEqual(body["configurationId"], "cfg-1")
-        self.assertNotIn("configuration", body)
-
-    def test_without_a_configuration_id_an_inline_config_is_built(self):
-        client = RecordingClient([{"runId": "run-1"}])
-        client.deidentify_file_url(SIGNED_URL, "csv", entity_types=("name", "email_address"))
-        detect = client.bodies[0]["configuration"]["detect"]
+        client.deidentify_file_url(SIGNED_URL, "pdf", {"detect": {"entities": []}})
         self.assertEqual(client.bodies[0]["configuration"]["vaultId"], "vault123")
-        self.assertEqual(
-            [e["entityType"] for e in detect["entities"]],
-            ["NAME", "EMAIL_ADDRESS"],
-            "v2 spells entity types in upper case",
-        )
 
-    def test_no_entity_types_means_detect_everything(self):
+    def test_the_configuration_is_passed_through_as_given(self):
+        """The policy must be able to express Detect options this client does
+        not model, so the configuration is forwarded rather than rebuilt."""
+        configuration = {
+            "detect": {"customTypes": [{"label": "EMPLOYEE_ID", "match": ["EMP-[0-9]{6}"]}]},
+            "media": {"document": {"pdf": {"processingMode": "OCR", "density": 300}}},
+        }
         client = RecordingClient([{"runId": "run-1"}])
-        client.deidentify_file_url(SIGNED_URL, "csv")
-        entities = client.bodies[0]["configuration"]["detect"]["entities"]
-        self.assertEqual([e["entityType"] for e in entities], ["ALL"])
+        client.deidentify_file_url(SIGNED_URL, "pdf", configuration)
+        sent = client.bodies[0]["configuration"]
+        self.assertEqual(sent["media"], configuration["media"])
+        self.assertEqual(sent["detect"], configuration["detect"])
 
-    def test_vault_tokens_are_requested_for_a_supported_format(self):
+    def test_a_caller_supplied_vault_id_wins_over_the_client_default(self):
         client = RecordingClient([{"runId": "run-1"}])
-        client.deidentify_file_url(SIGNED_URL, "csv", entity_types=("name",), token_type="vault_token")
-        entities = client.bodies[0]["configuration"]["detect"]["entities"]
-        self.assertEqual(entities[0]["deidentificationType"], "VAULT_TOKEN")
-
-    def test_vault_tokens_are_downgraded_for_a_format_that_cannot_support_them(self):
-        """VAULT_TOKEN on a PDF is rejected by the API; counters still work."""
-        self.assertNotIn("pdf", VAULT_TOKEN_FORMATS)
-        client = RecordingClient([{"runId": "run-1"}])
-        client.deidentify_file_url(SIGNED_URL, "pdf", entity_types=("name",), token_type="vault_token")
-        entities = client.bodies[0]["configuration"]["detect"]["entities"]
-        self.assertEqual(entities[0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+        client.deidentify_file_url(SIGNED_URL, "pdf", {"vaultId": "other"})
+        self.assertEqual(client.bodies[0]["configuration"]["vaultId"], "other")
 
     def test_a_missing_run_id_is_an_error_rather_than_a_silent_pass(self):
         client = RecordingClient([{}])
         with self.assertRaises(SkyflowError):
-            client.deidentify_file_url(SIGNED_URL, "pdf", configuration_id="cfg-1")
+            client.deidentify_file_url(SIGNED_URL, "pdf", build_file_configuration())
+
+
+class BuildFileConfigurationTestCase(unittest.TestCase):
+    def test_entity_types_are_upper_cased_for_v2(self):
+        detect = build_file_configuration(("name", "email_address"))["detect"]
+        self.assertEqual(
+            [e["entityType"] for e in detect["entities"]], ["NAME", "EMAIL_ADDRESS"]
+        )
+
+    def test_no_entity_types_means_detect_everything(self):
+        detect = build_file_configuration()["detect"]
+        self.assertEqual([e["entityType"] for e in detect["entities"]], ["ALL"])
+
+    def test_vault_tokens_are_requested_for_a_supported_format(self):
+        detect = build_file_configuration(("name",), "vault_token", "csv")["detect"]
+        self.assertEqual(detect["entities"][0]["deidentificationType"], "VAULT_TOKEN")
+
+    def test_vault_tokens_are_downgraded_for_a_format_that_cannot_support_them(self):
+        """VAULT_TOKEN on a PDF is rejected by the API; counters still work."""
+        self.assertNotIn("pdf", VAULT_TOKEN_FORMATS)
+        detect = build_file_configuration(("name",), "vault_token", "pdf")["detect"]
+        self.assertEqual(detect["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+
+    def test_counters_are_the_default(self):
+        detect = build_file_configuration(("name",), data_format="csv")["detect"]
+        self.assertEqual(detect["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+
+    def test_no_vault_id_is_added_here(self):
+        """The client injects it, so a configuration stays portable."""
+        self.assertNotIn("vaultId", build_file_configuration())
 
 
 class GetRunTestCase(unittest.TestCase):
