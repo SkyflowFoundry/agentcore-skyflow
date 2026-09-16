@@ -239,5 +239,113 @@ class DataFormatTestCase(unittest.TestCase):
         self.assertIsNone(file_urls.data_format_for("https://x/v1.2/report"))
 
 
+
+class NamedFieldsTestCase(unittest.TestCase):
+    """A rule can say exactly where the file reference is, instead of scanning."""
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+
+    def use(self, files_rule):
+        policy = {**POLICY, "defaults": {**POLICY["defaults"], "files": files_rule}}
+        settings.load_policy = lambda force=False: PolicySet.from_json(policy)
+
+    def out(self, event):
+        return handler.lambda_handler(event, None)["mcp"]["transformedGatewayResponse"]["body"]["result"]
+
+    def test_only_the_named_field_is_touched(self):
+        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        elsewhere = ORIGINAL.replace("invoice", "other")
+        result = self.out(response_event({"url": ORIGINAL, "backup": elsewhere}))
+        self.assertEqual(result["url"], CLEAN)
+        self.assertEqual(result["backup"], elsewhere, "an unnamed field is left alone")
+
+    def test_a_list_path_covers_every_element(self):
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["content[*].url"], "maxFiles": 3})
+        event = response_event({"content": [{"url": ORIGINAL}, {"url": ORIGINAL}, {"type": "text"}]})
+        result = self.out(event)
+        self.assertEqual([c.get("url") for c in result["content"]], [CLEAN, CLEAN, None])
+
+    def test_a_named_field_that_is_absent_is_not_an_error(self):
+        """Tools legitimately return responses with no attachment."""
+        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        result = self.out(response_event({"content": [{"type": "text", "text": "nothing here"}]}))
+        self.assertEqual(result["content"][0]["text"], "nothing here")
+        self.assertEqual(self.client.submitted, [])
+
+    def test_patterns_are_not_required_once_fields_are_named(self):
+        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        self.assertEqual(self.out(response_event({"url": ORIGINAL}))["url"], CLEAN)
+
+    def test_a_reference_outside_the_named_fields_is_warned_about(self):
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
+        stray = ORIGINAL.replace("invoice", "stray")
+        with self.assertLogs("file_urls", level="WARNING") as logs:
+            result = self.out(response_event({"url": ORIGINAL, "extra": {"link": stray}}))
+        self.assertEqual(result["url"], CLEAN)
+        self.assertEqual(result["extra"]["link"], stray, "warned about, not acted on")
+        self.assertIn("extra.link", "\n".join(logs.output))
+
+    def test_no_warning_when_the_named_fields_cover_everything(self):
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
+        with self.assertNoLogs("file_urls", level="WARNING"):
+            self.out(response_event({"url": ORIGINAL}))
+
+    def test_no_warning_is_possible_without_patterns(self):
+        """Nothing to compare against, so the check is skipped rather than guessed."""
+        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        with self.assertNoLogs("file_urls", level="WARNING"):
+            self.out(response_event({"url": ORIGINAL, "extra": ORIGINAL}))
+
+
+class FieldPathTestCase(unittest.TestCase):
+    def test_plain_and_nested_keys(self):
+        self.assertEqual(file_urls.parse_field_path("url"), ("url",))
+        self.assertEqual(file_urls.parse_field_path("result.url"), ("result", "url"))
+
+    def test_wildcard_and_index(self):
+        self.assertEqual(file_urls.parse_field_path("c[*].url"), ("c", "*", "url"))
+        self.assertEqual(file_urls.parse_field_path("c[0].url"), ("c", 0, "url"))
+
+    def test_rejects_empty_and_malformed(self):
+        for bad in ("", "   ", "a..b", "a[", "a]b"):
+            with self.subTest(bad):
+                with self.assertRaises(file_urls.FieldPathError):
+                    file_urls.parse_field_path(bad)
+
+    def test_a_path_reaching_a_non_string_yields_nothing(self):
+        self.assertEqual(file_urls.resolve_field_paths({"url": {"nested": 1}}, ("url",)), [])
+
+    def test_an_index_beyond_the_list_yields_nothing(self):
+        self.assertEqual(file_urls.resolve_field_paths({"c": ["a"]}, ("c[3]",)), [])
+
+    def test_several_paths_are_all_resolved(self):
+        node = {"a": "x", "b": {"c": "y"}}
+        self.assertEqual(
+            file_urls.resolve_field_paths(node, ("a", "b.c")),
+            [(("a",), "x"), (("b", "c"), "y")],
+        )
+
+
+class RuleWithFieldsValidationTestCase(unittest.TestCase):
+    def test_neither_fields_nor_patterns_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify")
+
+    def test_fields_alone_is_accepted(self):
+        rule = FileRule(action="deidentify", fields=("url",))
+        self.assertFalse(rule.scans)
+
+    def test_patterns_alone_still_scans(self):
+        self.assertTrue(FileRule(action="deidentify", url_patterns=("*",)).scans)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

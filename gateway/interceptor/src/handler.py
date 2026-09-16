@@ -253,7 +253,15 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
     low `maxFiles` is the safeguard against blowing the interceptor's deadline.
     """
     rule = policy.files
-    matches = file_urls.collect_file_urls(node, rule)
+    if rule.scans:
+        matches = file_urls.collect_file_urls(node, rule)
+    else:
+        matches = file_urls.resolve_field_paths(node, rule.fields)
+        # Naming fields stops the scan, so a tool that changes its response
+        # shape would let files through unnoticed. Report what the named fields
+        # did not cover without acting on it.
+        file_urls.warn_unhandled_matches(node, rule, {path for path, _ in matches})
+
     if not matches:
         return node, ()
 

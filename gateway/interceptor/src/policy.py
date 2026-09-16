@@ -157,6 +157,12 @@ class FileRule:
     #: Globs matched against the whole URL. A value only counts as a file
     #: reference if it matches, so an arbitrary link in prose is left alone.
     url_patterns: tuple[str, ...] = ()
+    #: Where the file reference lives, relative to the tool's arguments on a
+    #: request or its result on a response — for example `url` or
+    #: `content[*].url`. When set, only these locations are examined and
+    #: `url_patterns` is no longer needed to find anything; it is then used only
+    #: to warn about references found elsewhere.
+    fields: tuple[str, ...] = ()
     #: Cap on files processed per call. Each one is a separate Skyflow run, and
     #: they are serialised inside a synchronous interceptor.
     max_files: int = 1
@@ -176,14 +182,22 @@ class FileRule:
                 )
         if self.max_files < 1:
             raise PolicyError(f"files.maxFiles must be at least 1, got {self.max_files}")
-        if self.action == "deidentify" and not self.url_patterns:
-            # Without patterns every string would be a candidate file URL, which
-            # would either submit nonsense to Skyflow or silently do nothing.
-            raise PolicyError("files.urlPatterns is required when files.action is deidentify")
+        if self.action == "deidentify" and not (self.fields or self.url_patterns):
+            # With neither, there is nothing to identify a file reference by:
+            # every string would be a candidate, which would either submit
+            # nonsense to Skyflow or silently do nothing.
+            raise PolicyError(
+                "files needs fields or urlPatterns when files.action is deidentify"
+            )
 
     @property
     def is_active(self) -> bool:
         return self.action == "deidentify"
+
+    @property
+    def scans(self) -> bool:
+        """Whether references are found by scanning rather than by named field."""
+        return not self.fields
 
     def applies_to(self, direction: str) -> bool:
         return self.is_active and direction in self.directions
@@ -204,6 +218,7 @@ class FileRule:
             action=raw.get("action", "none"),
             directions=tuple(raw.get("directions", ["response"])),
             url_patterns=tuple(raw.get("urlPatterns", [])),
+            fields=tuple(raw.get("fields", [])),
             max_files=int(raw.get("maxFiles", 1)),
             configuration=configuration,
         )
