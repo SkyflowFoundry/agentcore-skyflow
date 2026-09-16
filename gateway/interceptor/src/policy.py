@@ -14,6 +14,7 @@ per-field merge) — same semantics as the Context Forge `tool_overrides`.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from typing import Any
@@ -138,6 +139,41 @@ FILE_FORMATS = frozenset({
 })
 
 
+#: Marks `[*]` in a field path — every element of a list at this position.
+WILDCARD = "*"
+
+#: A path segment is either a key name or a bracketed index/wildcard:
+#: `content[*].url` -> "content", "[*]", "url".
+_PATH_SEGMENT = re.compile(r"[^.\[\]]+|\[(?:\*|\d+)\]")
+
+
+def parse_field_path(path: str) -> tuple:
+    """Turn `content[*].url` into ("content", WILDCARD, "url").
+
+    Paths are relative to the node being examined: the tool's arguments on a
+    request, the tool's result on a response. That matches how the rest of the
+    policy addresses payloads.
+    """
+    if not path or not path.strip():
+        raise ValueError("field path must not be empty")
+
+    segments: list = []
+    position = 0
+    for match in _PATH_SEGMENT.finditer(path):
+        if match.start() > position and path[position:match.start()] != ".":
+            raise ValueError(f"cannot parse field path {path!r}")
+        position = match.end()
+        token = match.group()
+        if token.startswith("["):
+            inner = token[1:-1]
+            segments.append(WILDCARD if inner == "*" else int(inner))
+        else:
+            segments.append(token)
+    if position != len(path) or not segments:
+        raise ValueError(f"cannot parse field path {path!r}")
+    return tuple(segments)
+
+
 @dataclass(frozen=True)
 class FileRule:
     """What to do with file URLs a tool hands back.
@@ -182,6 +218,13 @@ class FileRule:
                 )
         if self.max_files < 1:
             raise PolicyError(f"files.maxFiles must be at least 1, got {self.max_files}")
+        for path in self.fields:
+            # Parsed here rather than at first use: a typo should fail the
+            # policy that carries it, not a customer's call hours later.
+            try:
+                parse_field_path(path)
+            except ValueError as exc:
+                raise PolicyError(f"files.fields: {exc}") from exc
         if self.action == "deidentify" and not (self.fields or self.url_patterns):
             # With neither, there is nothing to identify a file reference by:
             # every string would be a candidate, which would either submit

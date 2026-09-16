@@ -149,6 +149,94 @@ packages at versions known to refresh correctly, so it is the reliable option:
 app/Flow/.venv/bin/python scripts/attach_interceptor.py ...
 ```
 
+## Files
+
+Tools that deal in documents return a signed URL, not the bytes. String
+redaction never sees the contents, so it does nothing useful for them.
+
+The interceptor instead replaces the reference. It sends the signed URL it
+received to Skyflow Detect, waits for the run to finish, and swaps in the URL of
+the de-identified copy. The agent only ever receives the clean version and never
+holds a link to the original.
+
+```
+S3 / Box  ──signed URL──▶  gateway  ──▶  interceptor
+                                            │  POST /v2/detect/deidentify/file
+                                            │    dataSource: PRESIGNED_URL
+                                            │  GET  /v2/detect/runs/{runId}
+                                            ▼
+                              new signed URL, de-identified  ──▶  agent
+```
+
+The bytes never pass through the Lambda, so neither the 6 MB synchronous
+invocation limit nor the size of the document applies. This needs **Detect v2**,
+which is beta and feature-flagged per vault: only v2 accepts `PRESIGNED_URL`.
+`scripts/check_detect_v2.py` confirms it end to end against a real bucket.
+
+This is a one-way transform. It governs what the agent is allowed to see, not a
+round trip — there is no re-identify step for files.
+
+The de-identified copy comes back in a Skyflow-owned bucket, which is the point
+rather than a caveat: the file stays in an approved region while the agent
+asking for it may not be.
+
+### Configuring it
+
+Off unless a `files` block says otherwise. Put it in an override to scope it to
+one server or tool, or in `defaults` to cover everything.
+
+```json
+{
+  "servers": ["s3"],
+  "tools": ["*"],
+  "files": {
+    "action": "deidentify",
+    "directions": ["response"],
+    "fields": ["url", "content[*].url"],
+    "urlPatterns": ["https://my-bucket.s3.amazonaws.com/*"],
+    "maxFiles": 2,
+    "configuration": { "detect": { "entities": [ ... ] } }
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `directions` | Which side carries the file. A download returns one in the response; an upload sends one in the request. |
+| `fields` | Where the reference is, relative to the tool's arguments or its result. `content[*].url` covers a list. Naming fields stops the scan. |
+| `urlPatterns` | Globs matched against whole strings. Used to find references when `fields` is absent, and to warn about strays when it is not. |
+| `maxFiles` | Cap per call. Each file is a separate run and they are processed in order. |
+| `configuration` | Inline Detect configuration, forwarded as given with `vaultId` injected. Anything the Detect API accepts works here without a code change. |
+
+Configurations are inline rather than referenced by `configurationId`: a
+vault-stored config would have to be updated and rolled out separately from the
+policy that depends on it.
+
+### Behaviour worth knowing
+
+- **A rule needs `fields` or `urlPatterns`.** With neither, every string is a
+  candidate reference.
+- **Exceeding `maxFiles` fails the call** rather than processing the first few.
+  A partial swap hands back some originals alongside some redacted copies.
+- **Named fields still get a stray check.** The rest of the response is matched
+  against `urlPatterns` and anything found is logged, not acted on, so a tool
+  that changes its response shape shows up rather than passing files through
+  silently. Skipped when the rule has no patterns.
+- **A named field that is absent is not an error.** Tools legitimately return
+  responses with no attachment.
+- **A swapped URL is excluded from string redaction.** Tokenizing a freshly
+  issued signed URL would produce a dead link.
+- **The format comes from the extension in the URL path**, ignoring query
+  parameters, since a presigned URL carries its signature after the path. An
+  unrecognised extension fails the call: `dataFormat` is how Skyflow picks a
+  processor.
+- **`VAULT_TOKEN` only applies to `txt`, `json`, `csv`, `xml`, `jsonl`, `docx`,
+  `xlsx` and `pptx`.** Other formats fall back to counters. This affects whether
+  the original stays recoverable out of band, not what the agent sees.
+- **Polling is bounded by the Lambda's remaining time**, because the gateway's
+  own interceptor deadline is not documented. A run that outlives the budget
+  fails closed.
+
 ## Seeing what the upstream server actually received
 
 `logUpstreamPayloads` logs the two snapshots that carry tokens rather than
@@ -250,6 +338,9 @@ uv run --with boto3 python -m unittest discover \
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
 | `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
+| `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
+| `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths |
+| `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
 
@@ -276,3 +367,10 @@ tokenizing those would break tool discovery.
   streaming gateway. Leave streaming off initially.
 - **`counter` tokens are unused in practice.** Every shipped rule mints
   `vault_token`s, which persist in the vault. Nothing prunes them.
+- **The gateway's interceptor deadline is unknown.** AWS documents no timeout
+  for an interceptor invocation. File polling is bounded by the Lambda's own
+  remaining time so it degrades predictably, but how long the gateway actually
+  waits has not been measured. A small text file completes in about 2.4s end to
+  end; a large PDF has not been tried.
+- **Files are processed one at a time.** `maxFiles` above 1 serialises the runs,
+  so the cap is really a statement about how much of the deadline to spend.

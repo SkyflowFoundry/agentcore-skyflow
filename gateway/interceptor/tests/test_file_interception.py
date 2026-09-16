@@ -25,7 +25,7 @@ os.environ["SKYFLOW_VAULT_ID"] = "vault123"
 import file_urls  # noqa: E402
 import handler  # noqa: E402
 import settings  # noqa: E402
-from policy import FileRule, PolicyError, PolicySet  # noqa: E402
+from policy import FileRule, PolicyError, PolicySet, parse_field_path  # noqa: E402
 from skyflow_client import FileOutput, FileRunResult, RunTimeout, SkyflowError  # noqa: E402
 
 ORIGINAL = "https://bucket.s3.amazonaws.com/claims/invoice.pdf?X-Amz-Signature=abc"
@@ -308,18 +308,25 @@ class NamedFieldsTestCase(unittest.TestCase):
 
 class FieldPathTestCase(unittest.TestCase):
     def test_plain_and_nested_keys(self):
-        self.assertEqual(file_urls.parse_field_path("url"), ("url",))
-        self.assertEqual(file_urls.parse_field_path("result.url"), ("result", "url"))
+        self.assertEqual(parse_field_path("url"), ("url",))
+        self.assertEqual(parse_field_path("result.url"), ("result", "url"))
 
     def test_wildcard_and_index(self):
-        self.assertEqual(file_urls.parse_field_path("c[*].url"), ("c", "*", "url"))
-        self.assertEqual(file_urls.parse_field_path("c[0].url"), ("c", 0, "url"))
+        self.assertEqual(parse_field_path("c[*].url"), ("c", "*", "url"))
+        self.assertEqual(parse_field_path("c[0].url"), ("c", 0, "url"))
 
     def test_rejects_empty_and_malformed(self):
         for bad in ("", "   ", "a..b", "a[", "a]b"):
             with self.subTest(bad):
-                with self.assertRaises(file_urls.FieldPathError):
-                    file_urls.parse_field_path(bad)
+                with self.assertRaises(ValueError):
+                    parse_field_path(bad)
+
+    def test_a_malformed_path_is_rejected_when_the_policy_loads(self):
+        """A typo should fail the policy that carries it, not a live call."""
+        with self.assertRaises(PolicyError):
+            PolicySet.from_json(
+                {"defaults": {"files": {"action": "deidentify", "fields": ["a["]}}}
+            )
 
     def test_a_path_reaching_a_non_string_yields_nothing(self):
         self.assertEqual(file_urls.resolve_field_paths({"url": {"nested": 1}}, ("url",)), [])

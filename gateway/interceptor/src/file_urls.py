@@ -1,5 +1,8 @@
 """Finding file references in an MCP payload, and naming their format.
 
+Field-path parsing lives in `policy`, not here, so a malformed path is rejected
+when the policy loads rather than when a request arrives.
+
 Deliberately independent of `payload.collect_strings`, which applies the
 redaction `Scope`. Scope excludes the key `url` and imposes a minimum length —
 both correct for text, both exactly wrong here, since the value we are looking
@@ -9,53 +12,11 @@ for usually lives under a key called `url` and is a long opaque string.
 from __future__ import annotations
 
 import logging
-import re
 from urllib.parse import unquote, urlsplit
 
-from policy import FILE_FORMATS, FileRule
+from policy import FILE_FORMATS, WILDCARD, FileRule, parse_field_path
 
 logger = logging.getLogger(__name__)
-
-#: Marks `[*]` in a field path — every element of a list at this position.
-WILDCARD = "*"
-
-#: A path segment is either a key name or a bracketed index/wildcard:
-#: `content[*].url` -> "content", "[*]", "url".
-_SEGMENT = re.compile(r"[^.\[\]]+|\[(?:\*|\d+)\]")
-
-
-class FieldPathError(ValueError):
-    """A field path that cannot be parsed."""
-
-
-def parse_field_path(path: str) -> tuple:
-    """Turn `content[*].url` into ("content", WILDCARD, "url").
-
-    Paths are relative to the node being examined: the tool's arguments on a
-    request, the tool's result on a response. That matches how the rest of the
-    policy addresses payloads.
-    """
-    if not path or not path.strip():
-        raise FieldPathError("field path must not be empty")
-
-    segments: list = []
-    position = 0
-    for match in _SEGMENT.finditer(path):
-        if match.start() > position and path[position:match.start()] != ".":
-            raise FieldPathError(f"cannot parse field path {path!r}")
-        position = match.end()
-        token = match.group()
-        if token.startswith("["):
-            inner = token[1:-1]
-            segments.append(WILDCARD if inner == "*" else int(inner))
-        else:
-            segments.append(token)
-    if position != len(path):
-        raise FieldPathError(f"cannot parse field path {path!r}")
-    if not segments:
-        raise FieldPathError(f"cannot parse field path {path!r}")
-    return tuple(segments)
-
 
 def resolve_field_paths(node, paths: tuple[str, ...]) -> list[tuple[tuple, str]]:
     """Return `(path, value)` for every string the given field paths reach.
