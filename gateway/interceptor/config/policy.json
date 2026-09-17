@@ -96,7 +96,8 @@
         "tokenType": "vault_token",
         "destinations": {
           "default": "table1.{entity}_entity"
-        }
+        },
+        "maxFileBytes": 524288
       }
     }
   ]

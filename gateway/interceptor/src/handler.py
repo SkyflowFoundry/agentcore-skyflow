@@ -287,6 +287,16 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
         if data_format is None:
             raise SkyflowError("file URL has no recognised extension; cannot pick a dataFormat")
 
+        if rule.max_file_bytes:
+            # Asking costs about a second. Submitting a document that cannot
+            # finish costs minutes and ends in the same refusal.
+            size = file_urls.content_length(url)
+            if size is not None and size > rule.max_file_bytes:
+                raise SkyflowError(
+                    f"document is {size} bytes which exceeds files.maxFileBytes="
+                    f"{rule.max_file_bytes}; raise the limit or de-identify it out of band"
+                )
+
         configuration = rule.configuration or build_file_configuration(
             policy.entities,
             rule.token_type_for(getattr(policy, direction).token_type),

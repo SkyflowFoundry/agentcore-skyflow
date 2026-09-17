@@ -219,6 +219,10 @@ class FileRule:
     #: Inline Detect configuration, forwarded to Skyflow as given. Empty means
     #: build a default from `entities`.
     configuration: dict | None = None
+    #: Refuse a document larger than this many bytes. Zero means no limit.
+    #: Skyflow processes roughly five kilobytes per second, so a large document
+    #: spends minutes inside a synchronous interceptor before failing anyway.
+    max_file_bytes: int = 0
     #: Where each entity's original value is stored when `token_type` resolves
     #: to `vault_token`. Keys are entity names and values are `table.column`
     #: strings. The key `default` supplies a template for any entity not named,
@@ -246,6 +250,10 @@ class FileRule:
                 )
         if self.max_files < 1:
             raise PolicyError(f"files.maxFiles must be at least 1, got {self.max_files}")
+        if self.max_file_bytes < 0:
+            raise PolicyError(
+                f"files.maxFileBytes cannot be negative, got {self.max_file_bytes}"
+            )
         if self.token_type and self.token_type not in TOKEN_TYPES:
             raise PolicyError(
                 f"files.tokenType must be one of {TOKEN_TYPES}, got {self.token_type!r}"
@@ -325,6 +333,7 @@ class FileRule:
             max_files=int(raw.get("maxFiles", 1)),
             configuration=configuration,
             token_type=raw.get("tokenType", ""),
+            max_file_bytes=int(raw.get("maxFileBytes", 0)),
             destinations=_destinations(raw.get("destinations"), where),
         )
 

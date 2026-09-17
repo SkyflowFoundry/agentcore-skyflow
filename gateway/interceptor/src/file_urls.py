@@ -11,6 +11,9 @@ for usually lives under a key called `url` and is a long opaque string.
 
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
+
 import logging
 from urllib.parse import unquote, urlsplit
 
@@ -108,3 +111,37 @@ def data_format_for(url: str) -> str | None:
         return None
     extension = extension.lower()
     return extension if extension in FILE_FORMATS else None
+
+
+def content_length(url: str, timeout: float = 5.0) -> int | None:
+    """Size of the document behind a signed URL, or None when it cannot be read.
+
+    Asking costs about a second. Skyflow processes roughly five kilobytes per
+    second, so a document that is too large burns minutes of a synchronous
+    interceptor before failing anyway. Asking first turns that into an immediate
+    and explicit refusal.
+
+    This requests a single byte rather than sending a HEAD. A presigned S3 URL
+    is signed for one method, so a HEAD against a URL signed for GetObject is
+    rejected with 403 and the size comes back unknown. A ranged GET uses the
+    same signature and the `Content-Range` header carries the total.
+    """
+    request = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_range = response.headers.get("Content-Range")
+            raw_length = response.headers.get("Content-Length")
+            response.read(1)
+    except (urllib.error.URLError, OSError, ValueError):
+        # A store that refuses the probe should not block de-identification.
+        return None
+
+    if content_range and "/" in content_range:
+        total = content_range.rsplit("/", 1)[1].strip()
+        if total.isdigit():
+            return int(total)
+    try:
+        # A store that ignores Range answers with the whole body length.
+        return int(raw_length)
+    except (TypeError, ValueError):
+        return None

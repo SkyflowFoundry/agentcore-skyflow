@@ -238,6 +238,44 @@ covering every entity, and it rejects a value that is not `table.column`.
 Counter tokens persist nothing so they take no destination. A format that cannot
 take vault tokens downgrades to counters and drops the destination with it.
 
+### How large a document can be
+
+Skyflow processes roughly five kilobytes per second, measured against the
+deployed gateway.
+
+| Size | Time | Result |
+| --- | --- | --- |
+| 137 bytes | about 5 seconds | de-identified |
+| 446 KiB | about 94 seconds | de-identified |
+| 2.2 MiB | never finished inside 295 seconds | refused |
+
+The gateway held the connection open for 298 seconds without giving up, so the
+binding constraint is Skyflow throughput rather than a gateway deadline. The
+Lambda timeout is 300 seconds for the same reason.
+
+`maxFileBytes` refuses anything larger before submitting it. The interceptor asks
+the document store for the size first, which costs about a second and turns a
+five minute failure into an immediate one.
+
+```json
+{"files": {"action": "deidentify", "maxFileBytes": 524288, "...": "..."}}
+```
+
+The size probe is a ranged GET for one byte rather than a HEAD. A presigned S3
+URL is signed for a single method, so a HEAD against a URL signed for GetObject
+comes back 403 and the size reads as unknown. An unknown size is allowed through
+because a store that refuses the probe should not block de-identification.
+
+### Which formats keep a reversible token
+
+Vault tokens are stored for `txt` and `json` and `csv` and `xml` and `jsonl` and
+`docx` and `xlsx` and `pptx`. Every other format downgrades to a one-way counter
+and the interceptor logs `vault_token_downgraded` so the downgrade is not
+silent.
+
+A PDF is still de-identified and the original values are gone from the output. It
+simply cannot be reversed afterwards.
+
 ### Tool results wrap their payload in a text block
 
 An MCP tool result does not hand back structured JSON. It hands back a JSON

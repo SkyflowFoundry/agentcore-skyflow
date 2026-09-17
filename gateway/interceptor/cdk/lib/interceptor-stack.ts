@@ -80,7 +80,12 @@ export class InterceptorStack extends cdk.Stack {
       // finishes, so the ceiling is set by how long a document takes rather
       // than by a single API call. The handler bounds its own polling by the
       // remaining Lambda time, so this is an upper limit rather than a target.
-      timeout: cdk.Duration.seconds(120),
+      //
+      // Measured against the deployed gateway: a 446 KiB text file finishes in
+      // about 94 seconds and a 2.2 MiB one does not finish inside 120. The
+      // gateway itself held the connection open for at least 118 seconds
+      // without giving up, so this limit binds before the gateway's does.
+      timeout: cdk.Duration.seconds(300),
       memorySize: 512,
       logGroup,
       environment: {

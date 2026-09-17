@@ -66,6 +66,52 @@ The long random suffix tells you which kind of token you got.
    the original out of band.
 2. `[NAME_1]` is a counter. Nothing can reverse it.
 
+## Which formats keep a reversible token
+
+Three formats were run end to end through the deployed gateway. The token shape
+in the output tells you which kind you got.
+
+| Format | Result | Token |
+| --- | --- | --- |
+| `txt` | de-identified | `[NAME_AJbrIud]` vault token |
+| `docx` | de-identified | `[NAME_AJbrIud]` vault token |
+| `pdf` | de-identified | `[NAME_1]` counter |
+
+A PDF still gets de-identified and the original values are gone from the output.
+It cannot carry a vault token because Skyflow only stores reversible tokens for
+`txt` and `json` and `csv` and `xml` and `jsonl` and `docx` and `xlsx` and
+`pptx`. Anything else downgrades to a one-way counter and the interceptor logs
+`vault_token_downgraded` when it happens.
+
+Try them yourself:
+
+```bash
+agentcore invoke --target dev "Get a download link for samples/claim-note.docx"
+agentcore invoke --target dev "Get a download link for samples/claim-note.pdf"
+```
+
+## How large a document can be
+
+Skyflow processes roughly five kilobytes per second, which sets a practical
+ceiling on a synchronous interceptor.
+
+| Size | Time | Result |
+| --- | --- | --- |
+| 137 bytes | about 5 seconds | de-identified |
+| 446 KiB | about 94 seconds | de-identified |
+| 2.2 MiB | never finished inside 295 seconds | refused |
+
+The gateway itself held the connection open for 298 seconds without giving up,
+so the limit is Skyflow throughput rather than a gateway deadline.
+
+The policy refuses anything above `maxFileBytes` which ships at 512 KiB. The
+refusal costs about five seconds because the interceptor asks the store for the
+size before submitting anything. Without that guard the caller waits five
+minutes and gets the same refusal.
+
+Raise the limit in `gateway/interceptor/config/policy.json` if your documents are
+larger and you can tolerate the wait.
+
 ## Test your own document
 
 ```bash
@@ -148,11 +194,37 @@ Two causes account for most failures.
 2. `<name> schema not found` means a destination names a table that the vault
    does not have.
 
+## Browsing the gateway from your own MCP client
+
+AWS ships a proxy that signs requests for you, so any MCP client that speaks
+stdio can talk to the gateway without implementing SigV4.
+
+```bash
+uvx mcp-proxy-for-aws@latest \
+  https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp \
+  --service bedrock-agentcore
+```
+
+This repository wires that up as an MCP server named `skyflow-gateway` in
+`.mcp.json`, so your coding assistant can list and call the gateway's tools
+directly. Every call still passes through the interceptor, which means a
+document you fetch that way comes back de-identified exactly as it does for the
+agent.
+
+The proxy uses your local AWS credentials. It needs
+`bedrock-agentcore:InvokeGateway` on the gateway.
+
 ## What runs where
 
 1. `agentcore invoke` calls the deployed Flow runtime which discovers the
    gateway from an injected environment variable.
 2. `scripts/mcp_call.py` skips the agent and speaks MCP to the gateway directly
-   with SigV4 authentication. Use it when you want to see the raw response.
-3. The interceptor Lambda reads its policy from SSM Parameter Store at
+   with SigV4 authentication. Use it when you want to see the raw response. Pass
+   `--timeout` when a large document is in play because it defaults to sixty
+   seconds.
+3. `mcp-proxy-for-aws` does the same signing for any stdio MCP client.
+4. The interceptor Lambda reads its policy from SSM Parameter Store at
    `/agentcore/interceptor/skyflow-policy` and caches it for sixty seconds.
+5. The S3 target resolves its bucket from the SSM parameter
+   `/agentcore/s3-target/bucket` and falls back to
+   `agentcore-skyflow-files-<account>` when that parameter does not exist.

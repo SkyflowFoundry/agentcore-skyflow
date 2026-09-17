@@ -123,6 +123,12 @@ def build_file_configuration(
     Counter tokens persist nothing and take no destination.
     """
     reversible = token_type == "vault_token" and data_format in VAULT_TOKEN_FORMATS
+    if token_type == "vault_token" and not reversible:
+        # Worth a log line because the caller asked for a reversible token and is
+        # getting a one-way one. Silence here looks like the policy was ignored.
+        logger.info(
+            "vault_token_downgraded format=%s reason=format_not_supported", data_format or "unknown"
+        )
     deidentification = "VAULT_TOKEN" if reversible else "ENTITY_UNIQUE_COUNTER"
     # v2 spells entity types in upper case; the string API and our policy use
     # lower case.

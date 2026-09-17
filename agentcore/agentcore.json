@@ -67,14 +67,21 @@
                   "Action": [
                     "s3:ListBucket"
                   ],
-                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-571930033416"
+                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-*"
                 },
                 {
                   "Effect": "Allow",
                   "Action": [
                     "s3:GetObject"
                   ],
-                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-571930033416/*"
+                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-*/*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:GetParameter"
+                  ],
+                  "Resource": "arn:aws:ssm:*:*:parameter/agentcore/s3-target/*"
                 }
               ]
             }

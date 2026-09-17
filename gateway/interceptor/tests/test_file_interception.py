@@ -10,6 +10,7 @@ Run: python3 gateway/interceptor/tests/test_file_interception.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import unittest
@@ -521,6 +522,122 @@ class DestinationCoverageTestCase(unittest.TestCase):
         with self.assertRaises(PolicyError) as caught:
             PolicySet.from_json(raw)
         self.assertIn("ALL", str(caught.exception))
+
+
+class FormatCoverageTestCase(unittest.TestCase):
+    """Which real document formats can carry a reversible token.
+
+    Confirmed against the deployed gateway: txt and docx come back with vault
+    tokens such as [NAME_AJbrIud] and pdf comes back with counters such as
+    [NAME_1] because Skyflow cannot store a reversible token for it.
+    """
+
+    def config(self, data_format):
+        rule = FileRule.from_json(
+            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+             "destinations": {"default": "table1.{entity}_entity"}},
+            "files",
+        )
+        return build_file_configuration(("name",), "vault_token", data_format, rule.destination_for)
+
+    def test_text_formats_keep_vault_tokens(self):
+        for data_format in ("txt", "json", "csv", "xml", "jsonl", "docx", "xlsx", "pptx"):
+            with self.subTest(data_format=data_format):
+                entity = self.config(data_format)["detect"]["entities"][0]
+                self.assertEqual(entity["deidentificationType"], "VAULT_TOKEN")
+                self.assertEqual(entity["destination"], "table1.name_entity")
+
+    def test_other_formats_downgrade_to_counters(self):
+        for data_format in ("pdf", "png", "jpeg", "mp3", "wav", ""):
+            with self.subTest(data_format=data_format):
+                entity = self.config(data_format)["detect"]["entities"][0]
+                self.assertEqual(entity["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+                self.assertNotIn("destination", entity)
+
+    def test_a_downgrade_is_logged(self):
+        """A silent downgrade looks like the policy was ignored."""
+        with self.assertLogs("skyflow_client", level="INFO") as captured:
+            self.config("pdf")
+        self.assertTrue(any("vault_token_downgraded" in line for line in captured.output))
+
+    def test_no_downgrade_log_when_the_format_supports_it(self):
+        with self.assertLogs("skyflow_client", level="INFO") as captured:
+            logging.getLogger("skyflow_client").info("marker")
+            self.config("docx")
+        self.assertFalse(any("vault_token_downgraded" in line for line in captured.output))
+
+
+class SizeLimitTestCase(unittest.TestCase):
+    """Refuse an oversized document before spending minutes on it.
+
+    Measured against the deployed gateway: a 446 KiB text file takes about 94
+    seconds and a 2.2 MiB one does not finish inside 295. Without this guard the
+    caller waits the full timeout and then gets a failure anyway.
+    """
+
+    POLICY = {
+        "defaults": {
+            "request": {"action": "none"},
+            "response": {"action": "none"},
+            "scope": {"minLength": 4},
+            "failure": {"onError": "fail_closed"},
+            "entities": ["name"],
+        },
+        "toolNameSeparator": "___",
+        "overrides": [{
+            "servers": ["s3"], "tools": ["*"],
+            "files": {
+                "action": "deidentify", "directions": ["response"],
+                "fields": ["url"], "urlPatterns": PATTERNS,
+                "maxFiles": 1, "maxFileBytes": 1000,
+            },
+        }],
+    }
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        self._length = file_urls.content_length
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.POLICY)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+        file_urls.content_length = self._length
+
+    def out(self, result):
+        return handler.lambda_handler(response_event(result), None)
+
+    def test_an_oversized_document_is_refused(self):
+        file_urls.content_length = lambda url, timeout=5.0: 5000
+        body = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]
+        self.assertIn("error", body)
+        self.assertEqual(self.client.submitted, [], "nothing should reach Skyflow")
+
+    def test_a_document_within_the_limit_is_processed(self):
+        file_urls.content_length = lambda url, timeout=5.0: 900
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+
+    def test_an_unknown_size_is_allowed_through(self):
+        """A store that refuses HEAD should not block de-identification."""
+        file_urls.content_length = lambda url, timeout=5.0: None
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+
+    def test_no_limit_means_no_head_request(self):
+        calls = []
+        file_urls.content_length = lambda url, timeout=5.0: calls.append(url)
+        policy = json.loads(json.dumps(self.POLICY))
+        policy["overrides"][0]["files"].pop("maxFileBytes")
+        settings.load_policy = lambda force=False: PolicySet.from_json(policy)
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+        self.assertEqual(calls, [])
+
+    def test_a_negative_limit_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify", url_patterns=("*",), max_file_bytes=-1)
 
 
 class McpEnvelopeTestCase(unittest.TestCase):
