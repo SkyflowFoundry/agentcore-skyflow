@@ -240,8 +240,10 @@ take vault tokens downgrades to counters and drops the destination with it.
 
 ### How large a document can be
 
-Skyflow processes roughly five kilobytes per second, measured against the
-deployed gateway.
+That depends entirely on the throughput of the vault you point at, so
+`maxFileBytes` is a per-deployment setting rather than a fixed limit.
+
+These timings came from a shared Skyflow trial environment:
 
 | Size | Time | Result |
 | --- | --- | --- |
@@ -249,13 +251,21 @@ deployed gateway.
 | 446 KiB | about 94 seconds | de-identified |
 | 2.2 MiB | never finished inside 295 seconds | refused |
 
-The gateway held the connection open for 298 seconds without giving up, so the
-binding constraint is Skyflow throughput rather than a gateway deadline. The
-Lambda timeout is 300 seconds for the same reason.
+Do not read those as product limits. A trial environment shares under-resourced
+capacity. Production Detect runs the model on GPUs and is far faster, so a
+production vault will carry much larger documents in the same wall clock.
+
+The shipped `maxFileBytes` of 512 KiB is sized for the trial environment above.
+Measure your own vault and raise it.
+
+The useful finding is where the ceiling is *not*. The gateway held the
+connection open for 298 seconds without giving up, so the binding constraint is
+whatever Skyflow takes rather than a gateway deadline. The Lambda timeout is 300
+seconds for the same reason.
 
 `maxFileBytes` refuses anything larger before submitting it. The interceptor asks
 the document store for the size first, which costs about a second and turns a
-five minute failure into an immediate one.
+long wait into an immediate refusal.
 
 ```json
 {"files": {"action": "deidentify", "maxFileBytes": 524288, "...": "..."}}
@@ -483,9 +493,9 @@ tokenizing those would break tool discovery.
    several calls.
 2. **Files are processed one at a time.** A `maxFiles` above one serialises the
    runs, so raising it multiplies the time a call takes.
-3. **Document size is capped at 512 KiB by the shipped policy.** Skyflow runs at
-   roughly five kilobytes per second so a larger document does not finish inside
-   a synchronous interceptor.
+3. **Document size is capped at 512 KiB by the shipped policy.** That number is
+   sized for a shared trial vault rather than being a product limit. Measure
+   your own throughput and raise `maxFileBytes`.
 4. **Only text formats keep a reversible token.** A PDF or an image is still
    de-identified but it comes back with one-way counters.
 5. **Streaming is untested.** The handler omits headers and status on streaming

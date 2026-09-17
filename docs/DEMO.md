@@ -128,8 +128,10 @@ agentcore invoke --target dev "Get a download link for samples/claim-note.pdf"
 
 ## How large a document can be
 
-Skyflow processes roughly five kilobytes per second, which sets a practical
-ceiling on a synchronous interceptor.
+That depends on the vault you point at rather than on anything in this
+repository.
+
+These timings came from a shared Skyflow trial environment:
 
 | Size | Time | Result |
 | --- | --- | --- |
@@ -137,16 +139,21 @@ ceiling on a synchronous interceptor.
 | 446 KiB | about 94 seconds | de-identified |
 | 2.2 MiB | never finished inside 295 seconds | refused |
 
+Do not quote those as product numbers. A trial environment shares
+under-resourced capacity. Production Detect runs the model on GPUs and is far
+faster, so a production vault handles much larger documents in the same wall
+clock.
+
 The gateway itself held the connection open for 298 seconds without giving up,
-so the limit is Skyflow throughput rather than a gateway deadline.
+so nothing in AgentCore is imposing the ceiling.
 
-The policy refuses anything above `maxFileBytes` which ships at 512 KiB. The
-refusal costs about five seconds because the interceptor asks the store for the
-size before submitting anything. Without that guard the caller waits five
-minutes and gets the same refusal.
+The policy refuses anything above `maxFileBytes` which ships at 512 KiB to suit
+the trial vault above. The refusal costs about five seconds because the
+interceptor asks the store for the size before submitting anything. Without that
+guard the caller waits for the full timeout and gets the same refusal.
 
-Raise the limit in `gateway/interceptor/config/policy.json` if your documents are
-larger and you can tolerate the wait.
+Measure your own vault and raise the limit in
+`gateway/interceptor/config/policy.json`.
 
 ## Test your own document
 

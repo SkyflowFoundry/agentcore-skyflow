@@ -81,10 +81,11 @@ export class InterceptorStack extends cdk.Stack {
       // than by a single API call. The handler bounds its own polling by the
       // remaining Lambda time, so this is an upper limit rather than a target.
       //
-      // Measured against the deployed gateway: a 446 KiB text file finishes in
-      // about 94 seconds and a 2.2 MiB one does not finish inside 120. The
-      // gateway itself held the connection open for at least 118 seconds
-      // without giving up, so this limit binds before the gateway's does.
+      // The gateway held a connection open for 298 seconds without giving up,
+      // so nothing upstream imposes a shorter ceiling than this one. How long a
+      // document actually takes depends on the vault being called: a shared
+      // trial vault managed 446 KiB in about 94 seconds where a production
+      // vault running on GPUs is far faster.
       timeout: cdk.Duration.seconds(300),
       memorySize: 512,
       logGroup,

@@ -116,10 +116,9 @@ def data_format_for(url: str) -> str | None:
 def content_length(url: str, timeout: float = 5.0) -> int | None:
     """Size of the document behind a signed URL, or None when it cannot be read.
 
-    Asking costs about a second. Skyflow processes roughly five kilobytes per
-    second, so a document that is too large burns minutes of a synchronous
-    interceptor before failing anyway. Asking first turns that into an immediate
-    and explicit refusal.
+    Asking costs about a second. A document too large for the vault's throughput
+    burns the whole interceptor timeout and then fails anyway, so asking first
+    turns that into an immediate and explicit refusal.
 
     This requests a single byte rather than sending a HEAD. A presigned S3 URL
     is signed for one method, so a HEAD against a URL signed for GetObject is

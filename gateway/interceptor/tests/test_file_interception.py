@@ -568,11 +568,11 @@ class FormatCoverageTestCase(unittest.TestCase):
 
 
 class SizeLimitTestCase(unittest.TestCase):
-    """Refuse an oversized document before spending minutes on it.
+    """Refuse an oversized document before spending the whole timeout on it.
 
-    Measured against the deployed gateway: a 446 KiB text file takes about 94
-    seconds and a 2.2 MiB one does not finish inside 295. Without this guard the
-    caller waits the full timeout and then gets a failure anyway.
+    What counts as oversized depends on the vault being called rather than on
+    anything here. Without this guard the caller waits the full timeout and then
+    gets a failure anyway.
     """
 
     POLICY = {

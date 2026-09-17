@@ -220,8 +220,10 @@ class FileRule:
     #: build a default from `entities`.
     configuration: dict | None = None
     #: Refuse a document larger than this many bytes. Zero means no limit.
-    #: Skyflow processes roughly five kilobytes per second, so a large document
-    #: spends minutes inside a synchronous interceptor before failing anyway.
+    #: The right value depends on the throughput of the vault being called, so
+    #: this is a per-deployment setting rather than a fixed ceiling. A document
+    #: that cannot finish spends the whole timeout inside a synchronous
+    #: interceptor and then fails anyway.
     max_file_bytes: int = 0
     #: Where each entity's original value is stored when `token_type` resolves
     #: to `vault_token`. Keys are entity names and values are `table.column`
