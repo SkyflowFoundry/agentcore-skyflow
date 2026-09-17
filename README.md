@@ -73,7 +73,8 @@ agentcore/                  # repo root
 │       ├── cdk/            # standalone CDK app for the Lambda and its SSM parameter
 │       └── tests/          # offline tests that touch neither AWS nor Skyflow
 ├── scripts/                # attach the interceptor, publish policy, call the gateway
-└── tests/flow/             # agent tests, kept outside app/ so they do not ship
+├── tests/flow/             # agent tests, kept outside app/ so they do not ship
+└── ui/                     # web console: Cognito login + chat UI for the Flow agent
 ```
 
 ## Prerequisites
@@ -194,6 +195,7 @@ CI runs four jobs on every push and pull request.
 | `gateway/README.md` | How AgentCore interceptors and targets work, including the payload shape trap that catches people out |
 | `gateway/interceptor/README.md` | The policy model, both redaction directions, file handling, deployment and debugging |
 | `app/Flow/README.md` | The agent runtime, its environment variables and how it discovers the gateway |
+| `ui/README.md` | The web console: Cognito login and a chat UI that talks to the Flow agent |
 | `AGENTS.md` | Context for AI coding assistants working in this repository |
 
 ## Limitations
