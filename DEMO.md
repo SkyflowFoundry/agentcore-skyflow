@@ -1,4 +1,4 @@
-# Trying it out
+# Demo
 
 This walks through proving that the gateway de-identifies a document before the
 agent can read it. Everything here runs against the deployed stack so there is
