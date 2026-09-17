@@ -180,6 +180,28 @@ The de-identified copy comes back in a Skyflow-owned bucket, which is the point
 rather than a caveat: the file stays in an approved region while the agent
 asking for it may not be.
 
+### Which token replaces a detected entity
+
+A file rule names its own token type. Leaving `tokenType` out means inherit it
+from the string rule for the same direction, which is how this behaved before
+the field existed.
+
+```json
+{"files": {"action": "deidentify", "tokenType": "vault_token", "...": "..."}}
+```
+
+Naming it matters because a file rule usually sits alongside `"action": "none"`
+on the string rule, and a rule that does nothing still carries the default of
+`counter`. The S3 rule hit exactly that and asked Skyflow for counters while
+vault tokens were available.
+
+Vault tokens are not usable for files yet. Skyflow rejects `VAULT_TOKEN` on a
+file unless every entity also names a `destination` of the form `table.column`,
+and nothing in the policy model can express that today. The shipped S3 rule
+therefore sets `counter` explicitly rather than relying on the inherited
+default. See `notes/detect-v2-destination-report.md` if that file is present in
+your checkout.
+
 ### Tool results wrap their payload in a text block
 
 An MCP tool result does not hand back structured JSON. It hands back a JSON

@@ -289,7 +289,7 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
 
         configuration = rule.configuration or build_file_configuration(
             policy.entities,
-            getattr(policy, direction).token_type,
+            rule.token_type_for(getattr(policy, direction).token_type),
             data_format,
         )
         run_id = client.deidentify_file_url(url, data_format, configuration)

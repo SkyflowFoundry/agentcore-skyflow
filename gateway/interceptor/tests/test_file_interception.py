@@ -27,7 +27,13 @@ import file_urls  # noqa: E402
 import handler  # noqa: E402
 import settings  # noqa: E402
 from policy import FileRule, PolicyError, PolicySet, parse_field_path  # noqa: E402
-from skyflow_client import FileOutput, FileRunResult, RunTimeout, SkyflowError  # noqa: E402
+from skyflow_client import (  # noqa: E402
+    FileOutput,
+    FileRunResult,
+    RunTimeout,
+    SkyflowError,
+    build_file_configuration,
+)
 
 ORIGINAL = "https://bucket.s3.amazonaws.com/claims/invoice.pdf?X-Amz-Signature=abc"
 CLEAN = "https://skyflow.s3.amazonaws.com/out/invoice.pdf?X-Amz-Signature=zzz"
@@ -354,6 +360,50 @@ class RuleWithFieldsValidationTestCase(unittest.TestCase):
 
     def test_patterns_alone_still_scans(self):
         self.assertTrue(FileRule(action="deidentify", url_patterns=("*",)).scans)
+
+
+class TokenTypeTestCase(unittest.TestCase):
+    """A file rule names its own token type rather than borrowing one.
+
+    Before this field existed the file rule read the token type off the string
+    rule for the same direction. An override that set `response.action` to
+    `none` therefore got `counter` from the Rule default and quietly asked for
+    ENTITY_UNIQUE_COUNTER even where vault tokens were supported.
+    """
+
+    def test_it_defaults_to_inheriting(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",))
+        self.assertEqual(rule.token_type, "")
+        self.assertEqual(rule.token_type_for("counter"), "counter")
+        self.assertEqual(rule.token_type_for("vault_token"), "vault_token")
+
+    def test_naming_it_overrides_the_string_rule(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        self.assertEqual(rule.token_type_for("counter"), "vault_token")
+
+    def test_an_unknown_token_type_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify", url_patterns=("*",), token_type="magic")
+
+    def test_it_parses_from_json(self):
+        rule = FileRule.from_json(
+            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token"},
+            "files",
+        )
+        self.assertEqual(rule.token_type, "vault_token")
+
+    def test_a_vault_token_is_requested_for_a_supported_format(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        config = build_file_configuration(("name",), rule.token_type_for("counter"), "txt")
+        self.assertEqual(config["detect"]["entities"][0]["deidentificationType"], "VAULT_TOKEN")
+
+    def test_an_unsupported_format_still_downgrades(self):
+        """Asking for VAULT_TOKEN on a PDF is rejected by the API."""
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        config = build_file_configuration(("name",), rule.token_type_for("counter"), "pdf")
+        self.assertEqual(
+            config["detect"]["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER"
+        )
 
 
 class McpEnvelopeTestCase(unittest.TestCase):

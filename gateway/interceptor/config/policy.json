@@ -92,7 +92,8 @@
         "urlPatterns": [
           "https://agentcore-skyflow-files-*.s3.amazonaws.com/*"
         ],
-        "maxFiles": 1
+        "maxFiles": 1,
+        "tokenType": "counter"
       }
     }
   ]

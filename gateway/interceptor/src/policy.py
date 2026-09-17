@@ -205,6 +205,14 @@ class FileRule:
     #: Inline Detect configuration, forwarded to Skyflow as given. Empty means
     #: build a default from `entities`.
     configuration: dict | None = None
+    #: Which kind of token replaces a detected entity inside the file.
+    #: `vault_token` leaves the original recoverable out of band by someone with
+    #: vault permissions and `counter` does not. Empty means inherit from the
+    #: string rule for the same direction, which is how this behaved before the
+    #: field existed. Naming it here is clearer because a file rule paired with
+    #: `action: none` on the string rule would otherwise silently inherit the
+    #: default of `counter`.
+    token_type: str = ""
 
     def __post_init__(self) -> None:
         if self.action not in ("deidentify", "none"):
@@ -218,6 +226,10 @@ class FileRule:
                 )
         if self.max_files < 1:
             raise PolicyError(f"files.maxFiles must be at least 1, got {self.max_files}")
+        if self.token_type and self.token_type not in TOKEN_TYPES:
+            raise PolicyError(
+                f"files.tokenType must be one of {TOKEN_TYPES}, got {self.token_type!r}"
+            )
         for path in self.fields:
             # Parsed here rather than at first use: a typo should fail the
             # policy that carries it, not a customer's call hours later.
@@ -245,6 +257,10 @@ class FileRule:
     def applies_to(self, direction: str) -> bool:
         return self.is_active and direction in self.directions
 
+    def token_type_for(self, fallback: str) -> str:
+        """The token type to request, falling back to the string rule's."""
+        return self.token_type or fallback
+
     def matches_url(self, value: str) -> bool:
         return any(fnmatchcase(value, pattern) for pattern in self.url_patterns)
 
@@ -264,6 +280,7 @@ class FileRule:
             fields=tuple(raw.get("fields", [])),
             max_files=int(raw.get("maxFiles", 1)),
             configuration=configuration,
+            token_type=raw.get("tokenType", ""),
         )
 
 
