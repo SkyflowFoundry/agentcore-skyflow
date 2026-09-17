@@ -22,6 +22,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 TOOL_NAME_SEPARATOR = "___"
+#: Optional SSM parameter naming the document bucket. Without it the bucket name
+#: is derived from the account so a fresh deployment needs no setup.
+BUCKET_PARAMETER = "/agentcore/s3-target/bucket"
+DEFAULT_BUCKET_PREFIX = "agentcore-skyflow-files-"
 DEFAULT_EXPIRES_IN = 900
 MAX_EXPIRES_IN = 3600
 MAX_KEYS = 100
@@ -29,20 +33,34 @@ MAX_KEYS = 100
 # Presigning must use the regional SigV4 endpoint so the URL carries a
 # signature the interceptor and Skyflow can both follow.
 _s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
+_ssm = boto3.client("ssm")
+
+
+_bucket_cache: dict[str, str] = {}
 
 
 def bucket_name(context) -> str:
-    """The document bucket for this account.
+    """The document bucket, resolved once per container.
 
-    LambdaComputeConfig has no environment block so the account comes from the
-    function ARN rather than from configuration. DOCUMENTS_BUCKET overrides it
-    for anyone pointing this at a bucket of their own.
+    LambdaComputeConfig has no environment block, so configuration arrives
+    through SSM the same way the interceptor's policy does. The parameter is
+    optional and the fallback derives a per-account name from the function ARN,
+    which keeps the demo working in a fresh account with nothing to set up.
     """
     override = os.environ.get("DOCUMENTS_BUCKET")
     if override:
         return override
+
     account = context.invoked_function_arn.split(":")[4]
-    return f"agentcore-skyflow-files-{account}"
+    if "value" not in _bucket_cache:
+        try:
+            parameter = _ssm.get_parameter(Name=BUCKET_PARAMETER)["Parameter"]["Value"]
+            _bucket_cache["value"] = parameter.strip()
+        except Exception:
+            # A missing parameter is the normal case rather than an error.
+            logger.info("no %s parameter; deriving the bucket from the account", BUCKET_PARAMETER)
+            _bucket_cache["value"] = f"{DEFAULT_BUCKET_PREFIX}{account}"
+    return _bucket_cache["value"]
 
 
 def tool_name(context) -> str:

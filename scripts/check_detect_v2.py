@@ -77,6 +77,34 @@ def ensure_bucket(s3, bucket: str, region: str) -> None:
     print(f"  created bucket {bucket} (public access blocked)")
 
 
+CDK_CONTEXT = (
+    Path(__file__).resolve().parents[1]
+    / "gateway" / "interceptor" / "cdk" / "cdk.context.json"
+)
+
+
+def resolve_vault(url: str | None, vault_id: str | None) -> tuple[str, str]:
+    """Vault identifiers from the flags, falling back to the CDK context file.
+
+    They are not credentials but they name real infrastructure, so they live in
+    the gitignored context file rather than in this script.
+    """
+    if url and vault_id:
+        return url, vault_id
+    try:
+        context = json.loads(CDK_CONTEXT.read_text())
+    except FileNotFoundError:
+        sys.exit(
+            f"No {CDK_CONTEXT} and no --vault-url/--vault-id. "
+            "Copy cdk.context.json.example and fill it in."
+        )
+    resolved_url = url or context.get("skyflowVaultUrl", "")
+    resolved_id = vault_id or context.get("skyflowVaultId", "")
+    if not resolved_url or not resolved_id:
+        sys.exit(f"{CDK_CONTEXT} is missing skyflowVaultUrl or skyflowVaultId")
+    return resolved_url, resolved_id
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -85,10 +113,20 @@ def main() -> None:
     parser.add_argument("--bucket", default=None, help="defaults to agentcore-skyflow-files-<account>")
     parser.add_argument("--key", default="samples/claim-intake.txt")
     parser.add_argument("--expires", type=int, default=900, help="presigned URL lifetime, seconds")
-    parser.add_argument("--vault-url", default="https://ebfc9bee4242.vault.skyflowapis.com")
-    parser.add_argument("--vault-id", default="a533828bcafd42ba869fb0aebfe65f93")
+    parser.add_argument(
+        "--vault-url",
+        default=None,
+        help="defaults to skyflowVaultUrl in gateway/interceptor/cdk/cdk.context.json",
+    )
+    parser.add_argument(
+        "--vault-id",
+        default=None,
+        help="defaults to skyflowVaultId in gateway/interceptor/cdk/cdk.context.json",
+    )
     parser.add_argument("--secret-name", default=SECRET_NAME)
     args = parser.parse_args()
+
+    vault_url, vault_id = resolve_vault(args.vault_url, args.vault_id)
 
     session = boto3.Session(region_name=args.region)
     account = session.client("sts").get_caller_identity()["Account"]
@@ -104,8 +142,8 @@ def main() -> None:
     print(f"  s3://{bucket}/{args.key}, presigned for {args.expires}s")
 
     client = SkyflowClient(
-        vault_url=args.vault_url,
-        vault_id=args.vault_id,
+        vault_url=vault_url,
+        vault_id=vault_id,
         api_key=load_api_key(session, args.secret_name),
         timeout_seconds=30.0,
     )

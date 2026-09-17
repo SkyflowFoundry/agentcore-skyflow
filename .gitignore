@@ -19,3 +19,6 @@ node_modules/
 
 # Working notes and issue reports. These name real infrastructure.
 notes/
+
+# Generated throughput fixtures. Rebuild with scripts/make_samples.py
+samples/claims-*.txt

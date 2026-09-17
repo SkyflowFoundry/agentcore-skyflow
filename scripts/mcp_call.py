@@ -39,7 +39,7 @@ def gateway_url_from_stack(session: boto3.Session, stack_name: str) -> str:
     sys.exit(f"{STACK_OUTPUT_KEY} not found in stack {stack_name}")
 
 
-def post(session: boto3.Session, url: str, region: str, body: dict, session_id: str | None):
+def post(session: boto3.Session, url: str, region: str, body: dict, session_id: str | None, timeout: int = 60):
     """Send one signed JSON-RPC message. Returns (parsed_or_None, headers)."""
     payload = json.dumps(body).encode("utf-8")
     headers = {
@@ -55,7 +55,7 @@ def post(session: boto3.Session, url: str, region: str, body: dict, session_id: 
 
     req = urllib.request.Request(url, data=payload, method="POST", headers=dict(aws_request.headers))
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             return parse_body(raw), dict(resp.headers)
     except urllib.error.HTTPError as exc:
@@ -87,6 +87,8 @@ def main() -> None:
     parser.add_argument("--name", help="tool name, for tools/call")
     parser.add_argument("--arguments", default="{}", help="JSON object of tool arguments")
     parser.add_argument("--names-only", action="store_true", help="tools/list: print tool names only")
+    parser.add_argument("--timeout", type=int, default=60,
+                        help="seconds to wait for the gateway; raise it when a large file is in play")
     args = parser.parse_args()
 
     session = boto3.Session(region_name=args.region)
@@ -116,7 +118,7 @@ def main() -> None:
 
     result, _ = post(session, url, args.region, {
         "jsonrpc": "2.0", "id": 2, "method": args.method, "params": params,
-    }, session_id)
+    }, session_id, timeout=args.timeout)
 
     if args.names_only and result and "result" in result:
         for tool in result["result"].get("tools", []):

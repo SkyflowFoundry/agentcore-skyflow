@@ -24,6 +24,15 @@
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"
       }
+    },
+    "skyflow-gateway": {
+      "command": "uvx",
+      "args": [
+        "mcp-proxy-for-aws@latest",
+        "${SKYFLOW_GATEWAY_URL}",
+        "--service",
+        "bedrock-agentcore"
+      ]
     }
   }
 }

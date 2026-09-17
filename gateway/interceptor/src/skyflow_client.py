@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ def build_file_configuration(
     entity_types: tuple[str, ...] | list[str] = (),
     token_type: str = "counter",
     data_format: str = "",
+    destination_for: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """A minimal inline Detect configuration.
 
@@ -115,20 +116,36 @@ def build_file_configuration(
     applied before the agent sees the document. Vault tokens are still worth
     requesting where supported, because they leave the original recoverable out
     of band by someone with vault permissions.
+
+    A vault token needs somewhere to store the original, so each entity carries
+    a `destination` of the form `table.column`. Skyflow rejects the whole run
+    with `Missing Destination for entity <NAME> in DetectConfigV2` without it.
+    Counter tokens persist nothing and take no destination.
     """
     reversible = token_type == "vault_token" and data_format in VAULT_TOKEN_FORMATS
+    if token_type == "vault_token" and not reversible:
+        # Worth a log line because the caller asked for a reversible token and is
+        # getting a one-way one. Silence here looks like the policy was ignored.
+        logger.info(
+            "vault_token_downgraded format=%s reason=format_not_supported", data_format or "unknown"
+        )
     deidentification = "VAULT_TOKEN" if reversible else "ENTITY_UNIQUE_COUNTER"
     # v2 spells entity types in upper case; the string API and our policy use
     # lower case.
     types = [e.upper() for e in entity_types] or ["ALL"]
-    return {
-        "detect": {
-            "entities": [
-                {"entityType": t, "deidentificationType": deidentification}
-                for t in types
-            ]
+
+    entities = []
+    for entity_type in types:
+        entity: dict[str, Any] = {
+            "entityType": entity_type,
+            "deidentificationType": deidentification,
         }
-    }
+        if reversible and destination_for is not None:
+            destination = destination_for(entity_type)
+            if destination:
+                entity["destination"] = destination
+        entities.append(entity)
+    return {"detect": {"entities": entities}}
 
 
 class SkyflowClient:

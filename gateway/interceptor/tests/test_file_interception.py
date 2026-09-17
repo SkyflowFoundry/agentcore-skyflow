@@ -10,6 +10,7 @@ Run: python3 gateway/interceptor/tests/test_file_interception.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import unittest
@@ -404,6 +405,239 @@ class TokenTypeTestCase(unittest.TestCase):
         self.assertEqual(
             config["detect"]["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER"
         )
+
+
+class DestinationTestCase(unittest.TestCase):
+    """Vault tokens need somewhere to store the original.
+
+    Skyflow rejects a vault-token file run with `Missing Destination for entity
+    NAME in DetectConfigV2` unless every entity names a `table.column`.
+    """
+
+    def rule(self, destinations):
+        return FileRule.from_json(
+            {
+                "action": "deidentify",
+                "urlPatterns": ["*"],
+                "tokenType": "vault_token",
+                "destinations": destinations,
+            },
+            "files",
+        )
+
+    def test_a_named_entity_wins(self):
+        rule = self.rule({"default": "t.{entity}_entity", "ssn": "t.ssn_secure"})
+        self.assertEqual(rule.destination_for("ssn"), "t.ssn_secure")
+
+    def test_the_default_template_fills_in_the_entity(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        self.assertEqual(rule.destination_for("name"), "table1.name_entity")
+
+    def test_lookup_is_case_insensitive(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        self.assertEqual(rule.destination_for("EMAIL_ADDRESS"), "table1.email_address_entity")
+
+    def test_an_unmapped_entity_returns_none(self):
+        rule = self.rule({"ssn": "t.ssn_secure"})
+        self.assertIsNone(rule.destination_for("name"))
+
+    def test_a_rule_without_destinations_returns_none(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",))
+        self.assertIsNone(rule.destination_for("name"))
+
+    def test_a_value_without_a_column_is_rejected(self):
+        for bad in ("nodot", "table.", ".column", "a.b.c"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PolicyError):
+                    self.rule({"name": bad})
+
+    def test_a_non_string_value_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            self.rule({"name": {"table": "t", "column": "c"}})
+
+    def test_the_configuration_carries_the_destination(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "vault_token", "txt", rule.destination_for)
+        entity = config["detect"]["entities"][0]
+        self.assertEqual(entity["deidentificationType"], "VAULT_TOKEN")
+        self.assertEqual(entity["destination"], "table1.name_entity")
+
+    def test_a_downgraded_format_carries_no_destination(self):
+        """A PDF cannot take vault tokens, so a destination would be meaningless."""
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "vault_token", "pdf", rule.destination_for)
+        entity = config["detect"]["entities"][0]
+        self.assertEqual(entity["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+        self.assertNotIn("destination", entity)
+
+    def test_counter_tokens_carry_no_destination(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "counter", "txt", rule.destination_for)
+        self.assertNotIn("destination", config["detect"]["entities"][0])
+
+
+class DestinationCoverageTestCase(unittest.TestCase):
+    """A missing destination must fail the policy rather than a live call."""
+
+    def policy(self, files):
+        return {
+            "defaults": {
+                "request": {"action": "none"},
+                "response": {"action": "none"},
+                "entities": ["name", "ssn"],
+            },
+            "toolNameSeparator": "___",
+            "overrides": [{"servers": ["s3"], "tools": ["*"], "files": files}],
+        }
+
+    def test_an_uncovered_entity_is_rejected(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"name": "table1.name_entity"},
+        })
+        with self.assertRaises(PolicyError) as caught:
+            PolicySet.from_json(raw)
+        self.assertIn("ssn", str(caught.exception))
+
+    def test_a_default_template_covers_everything(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"default": "table1.{entity}_entity"},
+        })
+        PolicySet.from_json(raw)
+
+    def test_counter_tokens_need_no_destinations(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "counter",
+        })
+        PolicySet.from_json(raw)
+
+    def test_an_empty_entity_list_needs_a_destination_for_all(self):
+        """An empty list means ALL, which no template can spell."""
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"default": "table1.{entity}_entity"},
+        })
+        raw["defaults"]["entities"] = []
+        with self.assertRaises(PolicyError) as caught:
+            PolicySet.from_json(raw)
+        self.assertIn("ALL", str(caught.exception))
+
+
+class FormatCoverageTestCase(unittest.TestCase):
+    """Which real document formats can carry a reversible token.
+
+    Confirmed against the deployed gateway: txt and docx come back with vault
+    tokens such as [NAME_AJbrIud] and pdf comes back with counters such as
+    [NAME_1] because Skyflow cannot store a reversible token for it.
+    """
+
+    def config(self, data_format):
+        rule = FileRule.from_json(
+            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+             "destinations": {"default": "table1.{entity}_entity"}},
+            "files",
+        )
+        return build_file_configuration(("name",), "vault_token", data_format, rule.destination_for)
+
+    def test_text_formats_keep_vault_tokens(self):
+        for data_format in ("txt", "json", "csv", "xml", "jsonl", "docx", "xlsx", "pptx"):
+            with self.subTest(data_format=data_format):
+                entity = self.config(data_format)["detect"]["entities"][0]
+                self.assertEqual(entity["deidentificationType"], "VAULT_TOKEN")
+                self.assertEqual(entity["destination"], "table1.name_entity")
+
+    def test_other_formats_downgrade_to_counters(self):
+        for data_format in ("pdf", "png", "jpeg", "mp3", "wav", ""):
+            with self.subTest(data_format=data_format):
+                entity = self.config(data_format)["detect"]["entities"][0]
+                self.assertEqual(entity["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+                self.assertNotIn("destination", entity)
+
+    def test_a_downgrade_is_logged(self):
+        """A silent downgrade looks like the policy was ignored."""
+        with self.assertLogs("skyflow_client", level="INFO") as captured:
+            self.config("pdf")
+        self.assertTrue(any("vault_token_downgraded" in line for line in captured.output))
+
+    def test_no_downgrade_log_when_the_format_supports_it(self):
+        with self.assertLogs("skyflow_client", level="INFO") as captured:
+            logging.getLogger("skyflow_client").info("marker")
+            self.config("docx")
+        self.assertFalse(any("vault_token_downgraded" in line for line in captured.output))
+
+
+class SizeLimitTestCase(unittest.TestCase):
+    """Refuse an oversized document before spending the whole timeout on it.
+
+    What counts as oversized depends on the vault being called rather than on
+    anything here. Without this guard the caller waits the full timeout and then
+    gets a failure anyway.
+    """
+
+    POLICY = {
+        "defaults": {
+            "request": {"action": "none"},
+            "response": {"action": "none"},
+            "scope": {"minLength": 4},
+            "failure": {"onError": "fail_closed"},
+            "entities": ["name"],
+        },
+        "toolNameSeparator": "___",
+        "overrides": [{
+            "servers": ["s3"], "tools": ["*"],
+            "files": {
+                "action": "deidentify", "directions": ["response"],
+                "fields": ["url"], "urlPatterns": PATTERNS,
+                "maxFiles": 1, "maxFileBytes": 1000,
+            },
+        }],
+    }
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        self._length = file_urls.content_length
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.POLICY)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+        file_urls.content_length = self._length
+
+    def out(self, result):
+        return handler.lambda_handler(response_event(result), None)
+
+    def test_an_oversized_document_is_refused(self):
+        file_urls.content_length = lambda url, timeout=5.0: 5000
+        body = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]
+        self.assertIn("error", body)
+        self.assertEqual(self.client.submitted, [], "nothing should reach Skyflow")
+
+    def test_a_document_within_the_limit_is_processed(self):
+        file_urls.content_length = lambda url, timeout=5.0: 900
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+
+    def test_an_unknown_size_is_allowed_through(self):
+        """A store that refuses HEAD should not block de-identification."""
+        file_urls.content_length = lambda url, timeout=5.0: None
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+
+    def test_no_limit_means_no_head_request(self):
+        calls = []
+        file_urls.content_length = lambda url, timeout=5.0: calls.append(url)
+        policy = json.loads(json.dumps(self.POLICY))
+        policy["overrides"][0]["files"].pop("maxFileBytes")
+        settings.load_policy = lambda force=False: PolicySet.from_json(policy)
+        result = self.out({"url": ORIGINAL})["mcp"]["transformedGatewayResponse"]["body"]["result"]
+        self.assertEqual(result["url"], CLEAN)
+        self.assertEqual(calls, [])
+
+    def test_a_negative_limit_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify", url_patterns=("*",), max_file_bytes=-1)
 
 
 class McpEnvelopeTestCase(unittest.TestCase):

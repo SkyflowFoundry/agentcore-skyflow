@@ -195,12 +195,96 @@ on the string rule, and a rule that does nothing still carries the default of
 `counter`. The S3 rule hit exactly that and asked Skyflow for counters while
 vault tokens were available.
 
-Vault tokens are not usable for files yet. Skyflow rejects `VAULT_TOKEN` on a
-file unless every entity also names a `destination` of the form `table.column`,
-and nothing in the policy model can express that today. The shipped S3 rule
-therefore sets `counter` explicitly rather than relying on the inherited
-default. See `notes/detect-v2-destination-report.md` if that file is present in
-your checkout.
+### Where a vault token stores the original
+
+A vault token has to put the original value somewhere. Skyflow rejects a
+vault-token file run with `Missing Destination for entity NAME in
+DetectConfigV2` unless every entity names a `destination`. The Detect v2 spec
+documents the field on `Detect_Entity` as a string described as "Target
+destination of the entity to be stored in vault". It does not state the format.
+The format is `table.column` and the API only tells you so by failing the run
+with `invalid tableColumn format: name`.
+
+```json
+{
+  "files": {
+    "action": "deidentify",
+    "tokenType": "vault_token",
+    "destinations": {
+      "default": "table1.{entity}_entity",
+      "ssn": "table1.ssn_secure"
+    }
+  }
+}
+```
+
+Each key is an entity name and each value is a `table.column` string. The key
+`default` supplies a template for any entity not named and `{entity}` is
+replaced with the entity name. A named entity wins over the template.
+
+The template cannot spell `ALL` because there is no `all` column, so an empty
+`entities` list needs an explicit `all` entry.
+
+Two things the API checks at different times, which is why the policy checks
+both up front:
+
+1. A missing destination fails at submit with HTTP 400.
+2. A malformed or nonexistent one submits with HTTP 200 and fails inside the
+   run, which reaches a caller as a fail-closed error much later.
+
+`put_policy.py --dry-run` rejects a rule that asks for vault tokens without
+covering every entity, and it rejects a value that is not `table.column`.
+
+Counter tokens persist nothing so they take no destination. A format that cannot
+take vault tokens downgrades to counters and drops the destination with it.
+
+### How large a document can be
+
+That depends entirely on the throughput of the vault you point at, so
+`maxFileBytes` is a per-deployment setting rather than a fixed limit.
+
+These timings came from a shared Skyflow trial environment:
+
+| Size | Time | Result |
+| --- | --- | --- |
+| 137 bytes | about 5 seconds | de-identified |
+| 446 KiB | about 94 seconds | de-identified |
+| 2.2 MiB | never finished inside 295 seconds | refused |
+
+Do not read those as product limits. A trial environment shares under-resourced
+capacity. Production Detect runs the model on GPUs and is far faster, so a
+production vault will carry much larger documents in the same wall clock.
+
+The shipped `maxFileBytes` of 512 KiB is sized for the trial environment above.
+Measure your own vault and raise it.
+
+The useful finding is where the ceiling is *not*. The gateway held the
+connection open for 298 seconds without giving up, so the binding constraint is
+whatever Skyflow takes rather than a gateway deadline. The Lambda timeout is 300
+seconds for the same reason.
+
+`maxFileBytes` refuses anything larger before submitting it. The interceptor asks
+the document store for the size first, which costs about a second and turns a
+long wait into an immediate refusal.
+
+```json
+{"files": {"action": "deidentify", "maxFileBytes": 524288, "...": "..."}}
+```
+
+The size probe is a ranged GET for one byte rather than a HEAD. A presigned S3
+URL is signed for a single method, so a HEAD against a URL signed for GetObject
+comes back 403 and the size reads as unknown. An unknown size is allowed through
+because a store that refuses the probe should not block de-identification.
+
+### Which formats keep a reversible token
+
+Vault tokens are stored for `txt` and `json` and `csv` and `xml` and `jsonl` and
+`docx` and `xlsx` and `pptx`. Every other format downgrades to a one-way counter
+and the interceptor logs `vault_token_downgraded` so the downgrade is not
+silent.
+
+A PDF is still de-identified and the original values are gone from the output. It
+simply cannot be reversed afterwards.
 
 ### Tool results wrap their payload in a text block
 
@@ -382,7 +466,8 @@ uv run --with boto3 python -m unittest discover \
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
 | `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
-| `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths |
+| `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
+| `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
@@ -403,17 +488,18 @@ tokenizing those would break tool discovery.
 
 ## Known gaps
 
-- **One Skyflow call per eligible string.** Fields within a payload are
-  redacted in parallel (up to 8), but a wide payload still costs several calls.
-- **Streaming is untested.** The handler omits headers and status on streaming
-  events as the docs require, but this has not been exercised against a
-  streaming gateway. Leave streaming off initially.
-- **`counter` tokens are unused in practice.** Every shipped rule mints
-  `vault_token`s, which persist in the vault. Nothing prunes them.
-- **The gateway's interceptor deadline is unknown.** AWS documents no timeout
-  for an interceptor invocation. File polling is bounded by the Lambda's own
-  remaining time so it degrades predictably, but how long the gateway actually
-  waits has not been measured. A small text file completes in about 2.4s end to
-  end; a large PDF has not been tried.
-- **Files are processed one at a time.** `maxFiles` above 1 serialises the runs,
-  so the cap is really a statement about how much of the deadline to spend.
+1. **One Skyflow call per eligible string.** Fields within a payload are
+   redacted in parallel up to a limit of eight, so a wide payload still costs
+   several calls.
+2. **Files are processed one at a time.** A `maxFiles` above one serialises the
+   runs, so raising it multiplies the time a call takes.
+3. **Document size is capped at 512 KiB by the shipped policy.** That number is
+   sized for a shared trial vault rather than being a product limit. Measure
+   your own throughput and raise `maxFileBytes`.
+4. **Only text formats keep a reversible token.** A PDF or an image is still
+   de-identified but it comes back with one-way counters.
+5. **Streaming is untested.** The handler omits headers and status on streaming
+   events as the documentation requires but nothing has exercised it against a
+   streaming gateway. Leave streaming off.
+6. **Nothing prunes vault tokens.** Every de-identification writes tokens that
+   persist in the vault.

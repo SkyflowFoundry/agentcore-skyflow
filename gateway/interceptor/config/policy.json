@@ -93,7 +93,11 @@
           "https://agentcore-skyflow-files-*.s3.amazonaws.com/*"
         ],
         "maxFiles": 1,
-        "tokenType": "counter"
+        "tokenType": "vault_token",
+        "destinations": {
+          "default": "table1.{entity}_entity"
+        },
+        "maxFileBytes": 524288
       }
     }
   ]

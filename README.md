@@ -190,6 +190,7 @@ CI runs four jobs on every push and pull request.
 
 | Path | What it covers |
 | --- | --- |
+| `docs/DEMO.md` | How to prove the de-identification works against the deployed stack |
 | `gateway/README.md` | How AgentCore interceptors and targets work, including the payload shape trap that catches people out |
 | `gateway/interceptor/README.md` | The policy model, both redaction directions, file handling, deployment and debugging |
 | `app/Flow/README.md` | The agent runtime, its environment variables and how it discovers the gateway |
@@ -202,13 +203,17 @@ CI runs four jobs on every push and pull request.
    several calls.
 2. **Files are processed one at a time.** A response carrying three files takes
    roughly three times as long as a response carrying one.
-3. **The gateway's interceptor deadline is undocumented and unmeasured.** Polling
-   is bounded by the Lambda's own remaining time so it fails predictably. A large
-   PDF has not been tried.
-4. **Streaming is untested.** The handler omits headers and status on streaming
+3. **Document size is capped at 512 KiB by the shipped policy.** That number
+   comes from a shared Skyflow trial environment and is not a product limit.
+   Production Detect runs on GPUs and is far faster, so raise `maxFileBytes`
+   once you know the throughput of the vault you are pointing at.
+4. **Only text formats keep a reversible token.** A PDF or an image is still
+   de-identified but it comes back with one-way counters because Skyflow cannot
+   store a vault token for those formats.
+5. **Streaming is untested.** The handler omits headers and status on streaming
    events as the documentation requires but nothing has exercised it against a
    streaming gateway.
-5. **Nothing prunes vault tokens.** Every shipped rule mints tokens that persist
+6. **Nothing prunes vault tokens.** Every shipped rule mints tokens that persist
    in the vault.
 
 ## References
