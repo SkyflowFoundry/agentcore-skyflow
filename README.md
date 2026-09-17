@@ -2,8 +2,9 @@
 
 This project puts Skyflow between an AI agent and the tools it calls. An Amazon
 Bedrock AgentCore Gateway fronts every MCP tool server and a Lambda interceptor
-rewrites each request and response as it passes through. The agent keeps working
-with real values while the upstream tool server only ever receives tokens.
+rewrites each request and response as it passes through. You decide for each tool
+which side is allowed to see sensitive values and the interceptor enforces that
+decision in both directions.
 
 The interceptor is the part worth reading. Everything else in this repository
 exists to give it something real to sit in front of.
