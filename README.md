@@ -190,6 +190,7 @@ CI runs four jobs on every push and pull request.
 
 | Path | What it covers |
 | --- | --- |
+| `docs/trying-it-out.md` | How to prove the de-identification works against the deployed stack |
 | `gateway/README.md` | How AgentCore interceptors and targets work, including the payload shape trap that catches people out |
 | `gateway/interceptor/README.md` | The policy model, both redaction directions, file handling, deployment and debugging |
 | `app/Flow/README.md` | The agent runtime, its environment variables and how it discovers the gateway |
