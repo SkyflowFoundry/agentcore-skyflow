@@ -9,8 +9,15 @@ Gateways and their targets are declared in `agentcore/agentcore.json` under
 ```
 gateway/
 ├── interceptor/        # Skyflow de-identify / re-identify interceptor
-└── targets/            # one directory per code-backed target
+└── targets/
+    └── s3/             # documents in S3, returned as presigned URLs
 ```
+
+The `s3` target exists so the interceptor has real documents to work on. Its
+`get_document` tool returns a presigned URL rather than the bytes, which is what
+S3 and Box and Google Drive all do, and which is the case the file rule handles.
+Returning bytes would cap document size at the Lambda response limit and would
+hand the agent the original content.
 
 ## Interceptors — the pre/post hook
 

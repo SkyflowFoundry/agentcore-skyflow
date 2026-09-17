@@ -456,7 +456,8 @@ uv run --with boto3 python -m unittest discover \
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
 | `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
-| `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths |
+| `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
+| `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
@@ -477,17 +478,18 @@ tokenizing those would break tool discovery.
 
 ## Known gaps
 
-- **One Skyflow call per eligible string.** Fields within a payload are
-  redacted in parallel (up to 8), but a wide payload still costs several calls.
-- **Streaming is untested.** The handler omits headers and status on streaming
-  events as the docs require, but this has not been exercised against a
-  streaming gateway. Leave streaming off initially.
-- **`counter` tokens are unused in practice.** Every shipped rule mints
-  `vault_token`s, which persist in the vault. Nothing prunes them.
-- **The gateway's interceptor deadline is unknown.** AWS documents no timeout
-  for an interceptor invocation. File polling is bounded by the Lambda's own
-  remaining time so it degrades predictably, but how long the gateway actually
-  waits has not been measured. A small text file completes in about 2.4s end to
-  end; a large PDF has not been tried.
-- **Files are processed one at a time.** `maxFiles` above 1 serialises the runs,
-  so the cap is really a statement about how much of the deadline to spend.
+1. **One Skyflow call per eligible string.** Fields within a payload are
+   redacted in parallel up to a limit of eight, so a wide payload still costs
+   several calls.
+2. **Files are processed one at a time.** A `maxFiles` above one serialises the
+   runs, so raising it multiplies the time a call takes.
+3. **Document size is capped at 512 KiB by the shipped policy.** Skyflow runs at
+   roughly five kilobytes per second so a larger document does not finish inside
+   a synchronous interceptor.
+4. **Only text formats keep a reversible token.** A PDF or an image is still
+   de-identified but it comes back with one-way counters.
+5. **Streaming is untested.** The handler omits headers and status on streaming
+   events as the documentation requires but nothing has exercised it against a
+   streaming gateway. Leave streaming off.
+6. **Nothing prunes vault tokens.** Every de-identification writes tokens that
+   persist in the vault.

@@ -214,6 +214,23 @@ agent.
 The proxy uses your local AWS credentials. It needs
 `bedrock-agentcore:InvokeGateway` on the gateway.
 
+## Using it from the AgentCore console
+
+The deployed runtime is named `Flow` and it appears in the Amazon Bedrock
+AgentCore console under Agent Runtime in `us-east-1`. Open it and use the test
+pane to send the same prompts.
+
+```
+Get a download link for samples/claim-note.txt
+```
+
+The console shows the agent's tool calls, so you can watch it call
+`s3___get_document` and see the URL it received. That URL points at a Skyflow
+bucket rather than yours, which is the whole demonstration.
+
+Traces appear under Observability once transaction search has indexed them,
+which takes about ten minutes after a deployment.
+
 ## What runs where
 
 1. `agentcore invoke` calls the deployed Flow runtime which discovers the
