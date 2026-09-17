@@ -9,7 +9,7 @@ decision in both directions.
 The interceptor is the part worth reading. Everything else in this repository
 exists to give it something real to sit in front of.
 
-## What this demonstrates
+## Capabilities
 
 1. **Tool arguments are de-identified before they leave AWS.** A search for a
    customer by name reaches the upstream server as `[NAME_AJbrIud]` and the
@@ -26,7 +26,7 @@ exists to give it something real to sit in front of.
    its gateway from an injected environment variable and signs each request with
    SigV4. Pointing it at a different endpoint takes one environment variable.
 
-## How the pieces fit
+## Architecture
 
 ```text
 Flow (agent runtime)
@@ -129,7 +129,7 @@ Step 3 grants the gateway's service role two things. The first is
 is permission to read the caller's configuration bundle because `tools/list`
 fails without it when the caller is a runtime.
 
-## Changing the redaction policy
+## Policy
 
 The policy lives at `gateway/interceptor/config/policy.json` and it is the source
 of truth. Publishing it takes two commands and no redeploy.
@@ -143,7 +143,7 @@ The Lambda picks up the change within its sixty second cache window. Validation
 runs the same parser the Lambda uses so a typo fails at your terminal rather than
 on a live call. CI runs the same validation on every pull request.
 
-## Verifying a deployment
+## Verification
 
 `scripts/mcp_call.py` speaks MCP to the gateway with SigV4 authentication.
 
@@ -162,7 +162,7 @@ rather than original values. The other two forms are never logged because the
 inbound request is raw user data and the outbound response has the real values
 restored.
 
-## Running the tests
+## Tests
 
 Every test runs offline. Fakes stand in for the Skyflow client and for both boto3
 clients so nothing reaches AWS or Skyflow.
@@ -184,7 +184,7 @@ CI runs four jobs on every push and pull request.
 4. A CDK typecheck and a credential-free synth that asserts the Lambda bundle
    still carries no third-party dependencies.
 
-## Where the detailed documentation lives
+## Documentation
 
 | Path | What it covers |
 | --- | --- |
@@ -193,7 +193,7 @@ CI runs four jobs on every push and pull request.
 | `app/Flow/README.md` | The agent runtime, its environment variables and how it discovers the gateway |
 | `AGENTS.md` | Context for AI coding assistants working in this repository |
 
-## Known gaps
+## Limitations
 
 1. **Each eligible string costs one Skyflow call.** Fields within a payload are
    processed in parallel up to a limit of eight so a wide payload still costs
@@ -209,7 +209,7 @@ CI runs four jobs on every push and pull request.
 5. **Nothing prunes vault tokens.** Every shipped rule mints tokens that persist
    in the vault.
 
-## Further reading
+## References
 
 1. [Amazon Bedrock AgentCore](https://aws.amazon.com/bedrock/agentcore/)
 2. [AgentCore CLI](https://github.com/aws/agentcore-cli)
