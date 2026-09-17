@@ -195,12 +195,48 @@ on the string rule, and a rule that does nothing still carries the default of
 `counter`. The S3 rule hit exactly that and asked Skyflow for counters while
 vault tokens were available.
 
-Vault tokens are not usable for files yet. Skyflow rejects `VAULT_TOKEN` on a
-file unless every entity also names a `destination` of the form `table.column`,
-and nothing in the policy model can express that today. The shipped S3 rule
-therefore sets `counter` explicitly rather than relying on the inherited
-default. See `notes/detect-v2-destination-report.md` if that file is present in
-your checkout.
+### Where a vault token stores the original
+
+A vault token has to put the original value somewhere. Skyflow rejects a
+vault-token file run with `Missing Destination for entity NAME in
+DetectConfigV2` unless every entity names a `destination`. The Detect v2 spec
+documents the field on `Detect_Entity` as a string described as "Target
+destination of the entity to be stored in vault". It does not state the format.
+The format is `table.column` and the API only tells you so by failing the run
+with `invalid tableColumn format: name`.
+
+```json
+{
+  "files": {
+    "action": "deidentify",
+    "tokenType": "vault_token",
+    "destinations": {
+      "default": "table1.{entity}_entity",
+      "ssn": "table1.ssn_secure"
+    }
+  }
+}
+```
+
+Each key is an entity name and each value is a `table.column` string. The key
+`default` supplies a template for any entity not named and `{entity}` is
+replaced with the entity name. A named entity wins over the template.
+
+The template cannot spell `ALL` because there is no `all` column, so an empty
+`entities` list needs an explicit `all` entry.
+
+Two things the API checks at different times, which is why the policy checks
+both up front:
+
+1. A missing destination fails at submit with HTTP 400.
+2. A malformed or nonexistent one submits with HTTP 200 and fails inside the
+   run, which reaches a caller as a fail-closed error much later.
+
+`put_policy.py --dry-run` rejects a rule that asks for vault tokens without
+covering every entity, and it rejects a value that is not `table.column`.
+
+Counter tokens persist nothing so they take no destination. A format that cannot
+take vault tokens downgrades to counters and drops the destination with it.
 
 ### Tool results wrap their payload in a text block
 

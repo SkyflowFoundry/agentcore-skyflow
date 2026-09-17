@@ -174,6 +174,20 @@ def parse_field_path(path: str) -> tuple:
     return tuple(segments)
 
 
+def _destinations(raw: Any, where: str) -> tuple[tuple[str, str], ...]:
+    """Parse the entity-to-`table.column` map into a stable ordered tuple."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise PolicyError(f"{where}.destinations must be an object")
+    pairs = []
+    for entity, value in raw.items():
+        if not isinstance(value, str) or not value.strip():
+            raise PolicyError(f"{where}.destinations[{entity!r}] must be a non-empty string")
+        pairs.append((str(entity).lower(), value.strip()))
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class FileRule:
     """What to do with file URLs a tool hands back.
@@ -205,6 +219,12 @@ class FileRule:
     #: Inline Detect configuration, forwarded to Skyflow as given. Empty means
     #: build a default from `entities`.
     configuration: dict | None = None
+    #: Where each entity's original value is stored when `token_type` resolves
+    #: to `vault_token`. Keys are entity names and values are `table.column`
+    #: strings. The key `default` supplies a template for any entity not named,
+    #: and `{entity}` inside a value is replaced with the entity name. Skyflow
+    #: rejects a vault-token file run outright unless every entity has one.
+    destinations: tuple[tuple[str, str], ...] = ()
     #: Which kind of token replaces a detected entity inside the file.
     #: `vault_token` leaves the original recoverable out of band by someone with
     #: vault permissions and `counter` does not. Empty means inherit from the
@@ -230,6 +250,16 @@ class FileRule:
             raise PolicyError(
                 f"files.tokenType must be one of {TOKEN_TYPES}, got {self.token_type!r}"
             )
+        for entity, value in self.destinations:
+            # Checked here rather than at first use because a malformed
+            # destination fails the run rather than the request, which surfaces
+            # as a fail-closed error hours later.
+            probe = value.replace("{entity}", "x")
+            table, _, column = probe.partition(".")
+            if not table or not column or "." in column:
+                raise PolicyError(
+                    f"files.destinations[{entity!r}] must be 'table.column', got {value!r}"
+                )
         for path in self.fields:
             # Parsed here rather than at first use: a typo should fail the
             # policy that carries it, not a customer's call hours later.
@@ -261,6 +291,20 @@ class FileRule:
         """The token type to request, falling back to the string rule's."""
         return self.token_type or fallback
 
+    def destination_for(self, entity: str) -> str | None:
+        """Where this entity's original value is stored, or None if unmapped."""
+        name = entity.lower()
+        mapping = dict(self.destinations)
+        value = mapping.get(name)
+        if value is None and name != "all":
+            # The `default` template substitutes the entity name into a column,
+            # which cannot work for ALL because there is no `all` column. ALL
+            # needs an explicit entry or nothing.
+            value = mapping.get("default")
+        if value is None:
+            return None
+        return value.replace("{entity}", name)
+
     def matches_url(self, value: str) -> bool:
         return any(fnmatchcase(value, pattern) for pattern in self.url_patterns)
 
@@ -281,6 +325,7 @@ class FileRule:
             max_files=int(raw.get("maxFiles", 1)),
             configuration=configuration,
             token_type=raw.get("tokenType", ""),
+            destinations=_destinations(raw.get("destinations"), where),
         )
 
 
@@ -472,6 +517,24 @@ class PolicySet:
                         f"{where}: {name} re-identifies but its partner direction mints "
                         f"'counter' tokens, which are one-way. Set tokenType to 'vault_token'."
                     )
+
+        for i, pol in enumerate(resolved):
+            where = "defaults" if i == 0 else f"overrides[{i - 1}]"
+            rule = pol.files
+            if not rule.is_active:
+                continue
+            for direction in rule.directions:
+                token_type = rule.token_type_for(getattr(pol, direction).token_type)
+                if token_type != "vault_token":
+                    continue
+                # An empty entity list means ALL, which no template can spell.
+                for entity in pol.entities or ("ALL",):
+                    if rule.destination_for(entity) is None:
+                        raise PolicyError(
+                            f"{where}: files.tokenType is 'vault_token' so entity "
+                            f"{entity!r} needs an entry in files.destinations. Add it "
+                            f"or a 'default' template such as 'table1.{{entity}}_entity'."
+                        )
 
         mints_anywhere = any(
             pol.request.mints_vault_tokens or pol.response.mints_vault_tokens for pol in resolved

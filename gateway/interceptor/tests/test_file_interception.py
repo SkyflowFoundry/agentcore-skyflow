@@ -406,6 +406,123 @@ class TokenTypeTestCase(unittest.TestCase):
         )
 
 
+class DestinationTestCase(unittest.TestCase):
+    """Vault tokens need somewhere to store the original.
+
+    Skyflow rejects a vault-token file run with `Missing Destination for entity
+    NAME in DetectConfigV2` unless every entity names a `table.column`.
+    """
+
+    def rule(self, destinations):
+        return FileRule.from_json(
+            {
+                "action": "deidentify",
+                "urlPatterns": ["*"],
+                "tokenType": "vault_token",
+                "destinations": destinations,
+            },
+            "files",
+        )
+
+    def test_a_named_entity_wins(self):
+        rule = self.rule({"default": "t.{entity}_entity", "ssn": "t.ssn_secure"})
+        self.assertEqual(rule.destination_for("ssn"), "t.ssn_secure")
+
+    def test_the_default_template_fills_in_the_entity(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        self.assertEqual(rule.destination_for("name"), "table1.name_entity")
+
+    def test_lookup_is_case_insensitive(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        self.assertEqual(rule.destination_for("EMAIL_ADDRESS"), "table1.email_address_entity")
+
+    def test_an_unmapped_entity_returns_none(self):
+        rule = self.rule({"ssn": "t.ssn_secure"})
+        self.assertIsNone(rule.destination_for("name"))
+
+    def test_a_rule_without_destinations_returns_none(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",))
+        self.assertIsNone(rule.destination_for("name"))
+
+    def test_a_value_without_a_column_is_rejected(self):
+        for bad in ("nodot", "table.", ".column", "a.b.c"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(PolicyError):
+                    self.rule({"name": bad})
+
+    def test_a_non_string_value_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            self.rule({"name": {"table": "t", "column": "c"}})
+
+    def test_the_configuration_carries_the_destination(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "vault_token", "txt", rule.destination_for)
+        entity = config["detect"]["entities"][0]
+        self.assertEqual(entity["deidentificationType"], "VAULT_TOKEN")
+        self.assertEqual(entity["destination"], "table1.name_entity")
+
+    def test_a_downgraded_format_carries_no_destination(self):
+        """A PDF cannot take vault tokens, so a destination would be meaningless."""
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "vault_token", "pdf", rule.destination_for)
+        entity = config["detect"]["entities"][0]
+        self.assertEqual(entity["deidentificationType"], "ENTITY_UNIQUE_COUNTER")
+        self.assertNotIn("destination", entity)
+
+    def test_counter_tokens_carry_no_destination(self):
+        rule = self.rule({"default": "table1.{entity}_entity"})
+        config = build_file_configuration(("name",), "counter", "txt", rule.destination_for)
+        self.assertNotIn("destination", config["detect"]["entities"][0])
+
+
+class DestinationCoverageTestCase(unittest.TestCase):
+    """A missing destination must fail the policy rather than a live call."""
+
+    def policy(self, files):
+        return {
+            "defaults": {
+                "request": {"action": "none"},
+                "response": {"action": "none"},
+                "entities": ["name", "ssn"],
+            },
+            "toolNameSeparator": "___",
+            "overrides": [{"servers": ["s3"], "tools": ["*"], "files": files}],
+        }
+
+    def test_an_uncovered_entity_is_rejected(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"name": "table1.name_entity"},
+        })
+        with self.assertRaises(PolicyError) as caught:
+            PolicySet.from_json(raw)
+        self.assertIn("ssn", str(caught.exception))
+
+    def test_a_default_template_covers_everything(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"default": "table1.{entity}_entity"},
+        })
+        PolicySet.from_json(raw)
+
+    def test_counter_tokens_need_no_destinations(self):
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "counter",
+        })
+        PolicySet.from_json(raw)
+
+    def test_an_empty_entity_list_needs_a_destination_for_all(self):
+        """An empty list means ALL, which no template can spell."""
+        raw = self.policy({
+            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "destinations": {"default": "table1.{entity}_entity"},
+        })
+        raw["defaults"]["entities"] = []
+        with self.assertRaises(PolicyError) as caught:
+            PolicySet.from_json(raw)
+        self.assertIn("ALL", str(caught.exception))
+
+
 class McpEnvelopeTestCase(unittest.TestCase):
     """A real MCP result carries its payload as a JSON string in a text block.
 
