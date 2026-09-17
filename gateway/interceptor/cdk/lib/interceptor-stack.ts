@@ -76,9 +76,11 @@ export class InterceptorStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(interceptorRoot, 'src'), {
         exclude: ['__pycache__', '*.pyc', '.pytest_cache'],
       }),
-      // Skyflow calls carry up to two retries with backoff, and a payload may
-      // hold several fields redacted in parallel.
-      timeout: cdk.Duration.seconds(30),
+      // A file de-identification is submitted and then polled until it
+      // finishes, so the ceiling is set by how long a document takes rather
+      // than by a single API call. The handler bounds its own polling by the
+      // remaining Lambda time, so this is an upper limit rather than a target.
+      timeout: cdk.Duration.seconds(120),
       memorySize: 512,
       logGroup,
       environment: {

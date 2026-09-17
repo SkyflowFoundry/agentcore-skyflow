@@ -14,6 +14,7 @@ per-field merge) — same semantics as the Context Forge `tool_overrides`.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from typing import Any
@@ -128,6 +129,144 @@ class Failure:
         return cls(on_error=raw.get("onError", "fail_closed"))
 
 
+#: Extension -> Detect `dataFormat`. A URL whose path has no recognised
+#: extension cannot be submitted, because dataFormat is how Skyflow decides
+#: which processor to run.
+FILE_FORMATS = frozenset({
+    "mp3", "wav", "pdf", "txt", "csv", "json", "jpg", "jpeg", "tif", "tiff",
+    "png", "bmp", "xls", "xlsx", "doc", "docx", "ppt", "pptx", "xml", "dcm",
+    "jsonl", "zip", "gif",
+})
+
+
+#: Marks `[*]` in a field path — every element of a list at this position.
+WILDCARD = "*"
+
+#: A path segment is either a key name or a bracketed index/wildcard:
+#: `content[*].url` -> "content", "[*]", "url".
+_PATH_SEGMENT = re.compile(r"[^.\[\]]+|\[(?:\*|\d+)\]")
+
+
+def parse_field_path(path: str) -> tuple:
+    """Turn `content[*].url` into ("content", WILDCARD, "url").
+
+    Paths are relative to the node being examined: the tool's arguments on a
+    request, the tool's result on a response. That matches how the rest of the
+    policy addresses payloads.
+    """
+    if not path or not path.strip():
+        raise ValueError("field path must not be empty")
+
+    segments: list = []
+    position = 0
+    for match in _PATH_SEGMENT.finditer(path):
+        if match.start() > position and path[position:match.start()] != ".":
+            raise ValueError(f"cannot parse field path {path!r}")
+        position = match.end()
+        token = match.group()
+        if token.startswith("["):
+            inner = token[1:-1]
+            segments.append(WILDCARD if inner == "*" else int(inner))
+        else:
+            segments.append(token)
+    if position != len(path) or not segments:
+        raise ValueError(f"cannot parse field path {path!r}")
+    return tuple(segments)
+
+
+@dataclass(frozen=True)
+class FileRule:
+    """What to do with file URLs a tool hands back.
+
+    Tools that deal in files return signed URLs, not bytes, so string redaction
+    never sees the contents. This rule instead swaps the URL for one pointing at
+    a de-identified copy, which is a one-way transform: the agent is not meant
+    to see the original at all.
+
+    `directions` exists because which side carries the file depends on the tool
+    — a download returns one in the response, an upload sends one in the
+    request.
+    """
+
+    action: str = "none"
+    directions: tuple[str, ...] = ("response",)
+    #: Globs matched against the whole URL. A value only counts as a file
+    #: reference if it matches, so an arbitrary link in prose is left alone.
+    url_patterns: tuple[str, ...] = ()
+    #: Where the file reference lives, relative to the tool's arguments on a
+    #: request or its result on a response — for example `url` or
+    #: `content[*].url`. When set, only these locations are examined and
+    #: `url_patterns` is no longer needed to find anything; it is then used only
+    #: to warn about references found elsewhere.
+    fields: tuple[str, ...] = ()
+    #: Cap on files processed per call. Each one is a separate Skyflow run, and
+    #: they are serialised inside a synchronous interceptor.
+    max_files: int = 1
+    #: Inline Detect configuration, forwarded to Skyflow as given. Empty means
+    #: build a default from `entities`.
+    configuration: dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in ("deidentify", "none"):
+            raise PolicyError(
+                f"files.action must be deidentify or none, got {self.action!r}"
+            )
+        for direction in self.directions:
+            if direction not in ("request", "response"):
+                raise PolicyError(
+                    f"files.directions must be request or response, got {direction!r}"
+                )
+        if self.max_files < 1:
+            raise PolicyError(f"files.maxFiles must be at least 1, got {self.max_files}")
+        for path in self.fields:
+            # Parsed here rather than at first use: a typo should fail the
+            # policy that carries it, not a customer's call hours later.
+            try:
+                parse_field_path(path)
+            except ValueError as exc:
+                raise PolicyError(f"files.fields: {exc}") from exc
+        if self.action == "deidentify" and not (self.fields or self.url_patterns):
+            # With neither, there is nothing to identify a file reference by:
+            # every string would be a candidate, which would either submit
+            # nonsense to Skyflow or silently do nothing.
+            raise PolicyError(
+                "files needs fields or urlPatterns when files.action is deidentify"
+            )
+
+    @property
+    def is_active(self) -> bool:
+        return self.action == "deidentify"
+
+    @property
+    def scans(self) -> bool:
+        """Whether references are found by scanning rather than by named field."""
+        return not self.fields
+
+    def applies_to(self, direction: str) -> bool:
+        return self.is_active and direction in self.directions
+
+    def matches_url(self, value: str) -> bool:
+        return any(fnmatchcase(value, pattern) for pattern in self.url_patterns)
+
+    @classmethod
+    def from_json(cls, raw: Any, where: str) -> "FileRule":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise PolicyError(f"{where} must be an object, got {type(raw).__name__}")
+        configuration = raw.get("configuration")
+        if configuration is not None and not isinstance(configuration, dict):
+            raise PolicyError(f"{where}.configuration must be an object")
+        return cls(
+            action=raw.get("action", "none"),
+            directions=tuple(raw.get("directions", ["response"])),
+            url_patterns=tuple(raw.get("urlPatterns", [])),
+            fields=tuple(raw.get("fields", [])),
+            max_files=int(raw.get("maxFiles", 1)),
+            configuration=configuration,
+        )
+
+
 def _bool_field(raw: dict, key: str, where: str) -> bool | None:
     """Read an optional boolean, rejecting anything truthy-but-not-a-bool.
 
@@ -151,6 +290,7 @@ class Policy:
     entities: tuple[str, ...] = tuple(DEFAULT_ENTITIES)
     scope: Scope = field(default_factory=Scope)
     failure: Failure = field(default_factory=Failure)
+    files: FileRule = field(default_factory=FileRule)
     #: Log the upstream-facing form of each payload: the request after
     #: de-identification and the response before re-identification. Those are
     #: the two snapshots that carry tokens rather than original values. Off by
@@ -186,6 +326,7 @@ class Override:
     entities: tuple[str, ...] | None = None
     scope: Scope | None = None
     failure: Failure | None = None
+    files: FileRule | None = None
     log_upstream_payloads: bool | None = None
 
     def matches(self, server: str, tool: str) -> bool:
@@ -207,6 +348,7 @@ class Override:
             entities=tuple(entities) if entities is not None else None,
             scope=Scope.from_json(raw["scope"], f"{where}.scope") if "scope" in raw else None,
             failure=Failure.from_json(raw["failure"], f"{where}.failure") if "failure" in raw else None,
+            files=FileRule.from_json(raw["files"], f"{where}.files") if "files" in raw else None,
             log_upstream_payloads=_bool_field(raw, "logUpstreamPayloads", where),
         )
 
@@ -235,6 +377,8 @@ class PolicySet:
                 updates["scope"] = ov.scope
             if ov.failure is not None:
                 updates["failure"] = ov.failure
+            if ov.files is not None:
+                updates["files"] = ov.files
             if ov.log_upstream_payloads is not None:
                 updates["log_upstream_payloads"] = ov.log_upstream_payloads
             return replace(self.defaults, **updates) if updates else self.defaults
@@ -270,6 +414,7 @@ class PolicySet:
             entities=tuple(entities),
             scope=Scope.from_json(defaults_raw.get("scope"), "defaults.scope"),
             failure=Failure.from_json(defaults_raw.get("failure"), "defaults.failure"),
+            files=FileRule.from_json(defaults_raw.get("files"), "defaults.files"),
             log_upstream_payloads=bool(_bool_field(defaults_raw, "logUpstreamPayloads", "defaults")),
         )
 
@@ -336,6 +481,8 @@ class PolicySet:
             updates["scope"] = ov.scope
         if ov.failure is not None:
             updates["failure"] = ov.failure
+        if ov.files is not None:
+            updates["files"] = ov.files
         if ov.log_upstream_payloads is not None:
             updates["log_upstream_payloads"] = ov.log_upstream_payloads
         return replace(self.defaults, **updates) if updates else self.defaults

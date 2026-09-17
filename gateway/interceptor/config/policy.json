@@ -67,6 +67,34 @@
         "action": "deidentify",
         "tokenType": "vault_token"
       }
+    },
+    {
+      "servers": [
+        "s3"
+      ],
+      "tools": [
+        "*"
+      ],
+      "request": {
+        "action": "none"
+      },
+      "response": {
+        "action": "none"
+      },
+      "files": {
+        "action": "deidentify",
+        "directions": [
+          "response"
+        ],
+        "fields": [
+          "url",
+          "content[*].url"
+        ],
+        "urlPatterns": [
+          "https://agentcore-skyflow-files-*.s3.amazonaws.com/*"
+        ],
+        "maxFiles": 2
+      }
     }
   ]
 }

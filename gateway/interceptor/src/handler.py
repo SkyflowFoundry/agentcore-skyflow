@@ -28,14 +28,16 @@ Behaviour worth knowing:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 
+import file_urls
 import payload as payload_utils
 import settings
 from policy import Policy, PolicySet
-from skyflow_client import SkyflowClient, SkyflowError
+from skyflow_client import SkyflowClient, SkyflowError, build_file_configuration
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -47,6 +49,10 @@ JSONRPC_INTERNAL_ERROR = -32603
 #: the point is to see the shape and the tokens, not to archive the body.
 MAX_LOGGED_PAYLOAD = 4000
 
+#: Seconds held back from the Lambda budget so a response can still be built
+#: after a file run is abandoned.
+FILE_RESERVE_SECONDS = 5.0
+
 
 # ---------------------------------------------------------------- entry point
 
@@ -56,8 +62,8 @@ def lambda_handler(event: dict, context) -> dict:
     if "mcp" in event:
         mcp = event.get("mcp") or {}
         if mcp.get("gatewayResponse"):
-            return _on_response(mcp)
-        return _on_request(mcp)
+            return _on_response(mcp, context)
+        return _on_request(mcp, context)
 
     if "http" in event:
         # AgentCore Runtime, passthrough and inference targets. Bodies are
@@ -73,7 +79,7 @@ def lambda_handler(event: dict, context) -> dict:
 # ------------------------------------------------------------- request path
 
 
-def _on_request(mcp: dict) -> dict:
+def _on_request(mcp: dict, context=None) -> dict:
     body = (mcp.get("gatewayRequest") or {}).get("body") or {}
 
     if body.get("method") != "tools/call":
@@ -104,11 +110,17 @@ def _on_request(mcp: dict) -> dict:
         server, tool, action, policy.request.token_type,
     )
 
-    if action == "none":
+    if action == "none" and not policy.files.applies_to("request"):
         return _pass_request(body)
 
     try:
-        transformed, count = _apply(arguments, policy, policy.request.action, policy.request.token_type)
+        arguments, swapped = _files_then(arguments, policy, "request", context)
+        if action == "none":
+            transformed, count = arguments, 0
+        else:
+            transformed, count = _apply(
+                arguments, policy, policy.request.action, policy.request.token_type, swapped
+            )
     except SkyflowError as exc:
         return _on_failure_request(body, policy, exc, server, tool)
     except Exception as exc:  # defensive: never leak an unhandled trace to the caller
@@ -135,7 +147,7 @@ def _on_failure_request(body: dict, policy: Policy, exc: Exception, server: str,
 # ------------------------------------------------------------ response path
 
 
-def _on_response(mcp: dict) -> dict:
+def _on_response(mcp: dict, context=None) -> dict:
     gateway_response = mcp.get("gatewayResponse") or {}
     body = gateway_response.get("body") or {}
     request_body = (mcp.get("gatewayRequest") or {}).get("body") or {}
@@ -169,7 +181,7 @@ def _on_response(mcp: dict) -> dict:
         server, tool, action, streaming,
     )
 
-    if action == "none":
+    if action == "none" and not policy.files.applies_to("response"):
         return _pass_response(gateway_response, streaming)
 
     # Before the transform, not after: this is the form the upstream server
@@ -179,7 +191,13 @@ def _on_response(mcp: dict) -> dict:
         _log_upstream("response", server, tool, result)
 
     try:
-        transformed, count = _apply(result, policy, policy.response.action, policy.response.token_type)
+        result, swapped = _files_then(result, policy, "response", context)
+        if action == "none":
+            transformed, count = result, 0
+        else:
+            transformed, count = _apply(
+                result, policy, policy.response.action, policy.response.token_type, swapped
+            )
     except SkyflowError as exc:
         return _on_failure_response(gateway_response, body, policy, exc, server, tool, streaming)
     except Exception as exc:
@@ -217,6 +235,89 @@ def _on_failure_response(
 # ----------------------------------------------------------------- transform
 
 
+def _files_then(node, policy: Policy, direction: str, context):
+    """Apply the file rule for this direction, if it applies at all."""
+    if not policy.files.applies_to(direction):
+        return node, ()
+    return _swap_file_urls(node, policy, direction, settings.build_client(), context)
+
+
+def _swap_file_urls(node, policy: Policy, direction: str, client, context):
+    """Replace file URLs with URLs to de-identified copies.
+
+    Returns `(new_node, swapped_paths)`. The paths are handed back so string
+    redaction can skip them: the replacement URL is freshly issued by Skyflow
+    and tokenizing it would destroy a working reference.
+
+    Each file is a separate Skyflow run and they are processed in order, so a
+    low `maxFiles` is the safeguard against blowing the interceptor's deadline.
+    """
+    rule = policy.files
+    if rule.scans:
+        matches = file_urls.collect_file_urls(node, rule)
+    else:
+        matches = file_urls.resolve_field_paths(node, rule.fields)
+        # Naming fields stops the scan, so a tool that changes its response
+        # shape would let files through unnoticed. Report what the named fields
+        # did not cover without acting on it.
+        file_urls.warn_unhandled_matches(node, rule, {path for path, _ in matches})
+
+    if not matches:
+        return node, ()
+
+    if len(matches) > rule.max_files:
+        # Truncating would hand the agent some original URLs alongside some
+        # redacted ones, which is worse than refusing.
+        raise SkyflowError(
+            f"{len(matches)} file URLs exceed files.maxFiles={rule.max_files}"
+        )
+
+    remaining = _remaining_seconds(context)
+    result_node = copy.deepcopy(node)
+    swapped: list[tuple] = []
+
+    for path, url in matches:
+        data_format = file_urls.data_format_for(url)
+        if data_format is None:
+            raise SkyflowError("file URL has no recognised extension; cannot pick a dataFormat")
+
+        configuration = rule.configuration or build_file_configuration(
+            policy.entities,
+            getattr(policy, direction).token_type,
+            data_format,
+        )
+        run_id = client.deidentify_file_url(url, data_format, configuration)
+        logger.info(
+            "file_submitted direction=%s format=%s run_id=%s", direction, data_format, run_id
+        )
+        run = client.wait_for_run(run_id, remaining, reserve_seconds=FILE_RESERVE_SECONDS)
+        if not run.succeeded:
+            raise SkyflowError(f"Skyflow file run {run_id} ended {run.status}: {run.message}")
+
+        document = run.first_document()
+        if document is None or not document.url:
+            raise SkyflowError(f"Skyflow file run {run_id} returned no document")
+
+        payload_utils.set_path(result_node, path, document.url)
+        swapped.append(path)
+        logger.info("file_swapped direction=%s run_id=%s", direction, run_id)
+
+    return result_node, tuple(swapped)
+
+
+def _remaining_seconds(context):
+    """How long the Lambda still has, as a callable.
+
+    The real ceiling is the gateway's interceptor deadline, which AWS does not
+    document, so the Lambda's own budget is the only bound available. A missing
+    context (direct invocation, tests) falls back to a fixed window.
+    """
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    if getter is None:
+        return lambda: 60.0
+    return lambda: getter() / 1000.0
+
+
 def _log_upstream(direction: str, server: str, tool: str, node) -> None:
     """Log the upstream-facing form of a payload.
 
@@ -230,7 +331,7 @@ def _log_upstream(direction: str, server: str, tool: str, node) -> None:
     logger.info("upstream_%s server=%s tool=%s payload=%s", direction, server, tool, rendered)
 
 
-def _apply(node, policy: Policy, action: str, token_type: str):
+def _apply(node, policy: Policy, action: str, token_type: str, skip_paths: tuple = ()):
     """Run one Skyflow action across every in-scope string in `node`."""
     client: SkyflowClient = settings.build_client()
 
@@ -248,7 +349,7 @@ def _apply(node, policy: Policy, action: str, token_type: str):
     else:
         raise ValueError(f"unsupported action {action!r}")
 
-    return payload_utils.transform_strings(node, policy.scope, transform)
+    return payload_utils.transform_strings(node, policy.scope, transform, skip_paths)
 
 
 # ------------------------------------------------------------ output helpers

@@ -58,6 +58,7 @@ def transform_strings(
     node: Any,
     scope: Scope,
     transform: Callable[[str], str],
+    skip_paths: tuple = (),
 ) -> tuple[Any, int]:
     """Return a copy of `node` with every eligible string passed through `transform`.
 
@@ -68,6 +69,11 @@ def transform_strings(
     that means fail-closed or fail-open.
     """
     targets = collect_strings(node, scope)
+    if skip_paths:
+        # A skipped path holds a value that must survive verbatim — a freshly
+        # issued file URL, say, which tokenizing would turn into a dead link.
+        skipped = set(skip_paths)
+        targets = [(path, value) for path, value in targets if path not in skipped]
     if not targets:
         return node, 0
 
