@@ -73,7 +73,7 @@
         "s3"
       ],
       "tools": [
-        "*"
+        "get_document"
       ],
       "request": {
         "action": "none"
@@ -87,13 +87,13 @@
           "response"
         ],
         "fields": [
-          "url",
-          "content[*].url"
+          "content[*].text.url"
         ],
         "urlPatterns": [
           "https://agentcore-skyflow-files-*.s3.amazonaws.com/*"
         ],
-        "maxFiles": 2
+        "maxFiles": 1,
+        "tokenType": "counter"
       }
     }
   ]

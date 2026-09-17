@@ -38,6 +38,7 @@ Flow (agent runtime)
 │        │                      de-identify arguments       │
 │        ▼                                                  │
 │   target: exa ──────────────► https://mcp.exa.ai/mcp      │
+│   target: s3  ──────────────► documents as presigned URLs │
 │        │                                                  │
 │   RESPONSE interceptor ─────► Skyflow Detect              │
 │        │                      re-identify results         │
@@ -65,6 +66,7 @@ agentcore/                  # repo root
 │   ├── mcp_client/         # gateway discovery, SigV4 signing, error diagnostics
 │   └── model/load.py       # Bedrock model selection
 ├── gateway/
+│   ├── targets/s3/         # documents in S3 exposed as MCP tools
 │   └── interceptor/
 │       ├── src/            # Lambda source: stdlib and boto3 only
 │       ├── config/         # policy.json is the source of truth for redaction rules

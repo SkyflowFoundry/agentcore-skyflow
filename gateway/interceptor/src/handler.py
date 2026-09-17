@@ -33,6 +33,7 @@ import json
 import logging
 import os
 
+import envelope
 import file_urls
 import payload as payload_utils
 import settings
@@ -191,6 +192,10 @@ def _on_response(mcp: dict, context=None) -> dict:
         _log_upstream("response", server, tool, result)
 
     try:
+        # An MCP tool result carries its payload as a JSON string inside a text
+        # content block. Decode it so field paths and URL patterns see the real
+        # structure, then re-encode before the result goes back to the caller.
+        result, decoded = envelope.decode_text_blocks(result)
         result, swapped = _files_then(result, policy, "response", context)
         if action == "none":
             transformed, count = result, 0
@@ -198,6 +203,7 @@ def _on_response(mcp: dict, context=None) -> dict:
             transformed, count = _apply(
                 result, policy, policy.response.action, policy.response.token_type, swapped
             )
+        transformed = envelope.encode_text_blocks(transformed, decoded)
     except SkyflowError as exc:
         return _on_failure_response(gateway_response, body, policy, exc, server, tool, streaming)
     except Exception as exc:
@@ -283,7 +289,7 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
 
         configuration = rule.configuration or build_file_configuration(
             policy.entities,
-            getattr(policy, direction).token_type,
+            rule.token_type_for(getattr(policy, direction).token_type),
             data_format,
         )
         run_id = client.deidentify_file_url(url, data_format, configuration)

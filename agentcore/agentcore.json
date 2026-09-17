@@ -45,6 +45,75 @@
           "outboundAuth": {
             "type": "NONE"
           }
+        },
+        {
+          "name": "s3",
+          "targetType": "lambda",
+          "compute": {
+            "host": "Lambda",
+            "implementation": {
+              "language": "Python",
+              "path": "gateway/targets/s3",
+              "handler": "handler.lambda_handler"
+            },
+            "pythonVersion": "PYTHON_3_13",
+            "timeout": 30,
+            "memorySize": 256,
+            "iamPolicy": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucket"
+                  ],
+                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-571930033416"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": "arn:aws:s3:::agentcore-skyflow-files-571930033416/*"
+                }
+              ]
+            }
+          },
+          "toolDefinitions": [
+            {
+              "name": "list_documents",
+              "description": "List the documents available in the document store. Returns keys and sizes but no file contents.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "prefix": {
+                    "type": "string",
+                    "description": "Only list documents whose key starts with this prefix, for example samples/"
+                  }
+                }
+              }
+            },
+            {
+              "name": "get_document",
+              "description": "Get a time-limited download URL for one document. Returns a URL rather than the file contents.",
+              "inputSchema": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "The document key, for example samples/claim-note.txt"
+                  },
+                  "expires_in": {
+                    "type": "integer",
+                    "description": "Seconds until the URL expires. Defaults to 900 and is capped at 3600."
+                  }
+                },
+                "required": [
+                  "key"
+                ]
+              }
+            }
+          ]
         }
       ]
     }

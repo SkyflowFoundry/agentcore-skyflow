@@ -9,6 +9,7 @@ Run: python3 gateway/interceptor/tests/test_file_interception.py
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -26,7 +27,13 @@ import file_urls  # noqa: E402
 import handler  # noqa: E402
 import settings  # noqa: E402
 from policy import FileRule, PolicyError, PolicySet, parse_field_path  # noqa: E402
-from skyflow_client import FileOutput, FileRunResult, RunTimeout, SkyflowError  # noqa: E402
+from skyflow_client import (  # noqa: E402
+    FileOutput,
+    FileRunResult,
+    RunTimeout,
+    SkyflowError,
+    build_file_configuration,
+)
 
 ORIGINAL = "https://bucket.s3.amazonaws.com/claims/invoice.pdf?X-Amz-Signature=abc"
 CLEAN = "https://skyflow.s3.amazonaws.com/out/invoice.pdf?X-Amz-Signature=zzz"
@@ -353,6 +360,114 @@ class RuleWithFieldsValidationTestCase(unittest.TestCase):
 
     def test_patterns_alone_still_scans(self):
         self.assertTrue(FileRule(action="deidentify", url_patterns=("*",)).scans)
+
+
+class TokenTypeTestCase(unittest.TestCase):
+    """A file rule names its own token type rather than borrowing one.
+
+    Before this field existed the file rule read the token type off the string
+    rule for the same direction. An override that set `response.action` to
+    `none` therefore got `counter` from the Rule default and quietly asked for
+    ENTITY_UNIQUE_COUNTER even where vault tokens were supported.
+    """
+
+    def test_it_defaults_to_inheriting(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",))
+        self.assertEqual(rule.token_type, "")
+        self.assertEqual(rule.token_type_for("counter"), "counter")
+        self.assertEqual(rule.token_type_for("vault_token"), "vault_token")
+
+    def test_naming_it_overrides_the_string_rule(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        self.assertEqual(rule.token_type_for("counter"), "vault_token")
+
+    def test_an_unknown_token_type_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify", url_patterns=("*",), token_type="magic")
+
+    def test_it_parses_from_json(self):
+        rule = FileRule.from_json(
+            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token"},
+            "files",
+        )
+        self.assertEqual(rule.token_type, "vault_token")
+
+    def test_a_vault_token_is_requested_for_a_supported_format(self):
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        config = build_file_configuration(("name",), rule.token_type_for("counter"), "txt")
+        self.assertEqual(config["detect"]["entities"][0]["deidentificationType"], "VAULT_TOKEN")
+
+    def test_an_unsupported_format_still_downgrades(self):
+        """Asking for VAULT_TOKEN on a PDF is rejected by the API."""
+        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        config = build_file_configuration(("name",), rule.token_type_for("counter"), "pdf")
+        self.assertEqual(
+            config["detect"]["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER"
+        )
+
+
+class McpEnvelopeTestCase(unittest.TestCase):
+    """A real MCP result carries its payload as a JSON string in a text block.
+
+    Without decoding, a file URL sits inside that string rather than at a field
+    path, so nothing matches and the agent receives the original document.
+    """
+
+    POLICY = {
+        "defaults": {
+            "request": {"action": "none"},
+            "response": {"action": "none"},
+            "scope": {"minLength": 4},
+            "failure": {"onError": "fail_closed"},
+            "entities": ["name"],
+        },
+        "toolNameSeparator": "___",
+        "overrides": [{
+            "servers": ["s3"], "tools": ["*"],
+            "files": {
+                "action": "deidentify",
+                "directions": ["response"],
+                "fields": ["content[*].text.url"],
+                "urlPatterns": PATTERNS,
+                "maxFiles": 1,
+            },
+        }],
+    }
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.POLICY)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+
+    def out(self, result):
+        event = response_event(result)
+        return handler.lambda_handler(event, None)["mcp"]["transformedGatewayResponse"]["body"]["result"]
+
+    def text_block(self, payload):
+        return {"isError": False, "content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    def test_a_url_inside_a_text_block_is_swapped(self):
+        result = self.out(self.text_block({"key": "claims/invoice.pdf", "url": ORIGINAL}))
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["url"], CLEAN)
+        self.assertEqual(payload["key"], "claims/invoice.pdf", "other fields survive")
+
+    def test_the_block_is_still_a_json_string_afterwards(self):
+        result = self.out(self.text_block({"url": ORIGINAL}))
+        self.assertIsInstance(result["content"][0]["text"], str)
+
+    def test_the_original_url_appears_nowhere_in_the_response(self):
+        result = self.out(self.text_block({"url": ORIGINAL, "note": "see attached"}))
+        self.assertNotIn(ORIGINAL, json.dumps(result))
+
+    def test_a_block_of_prose_is_passed_through(self):
+        result = self.out({"isError": False, "content": [{"type": "text", "text": "no files here"}]})
+        self.assertEqual(result["content"][0]["text"], "no files here")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "s3-documents-target"
+version = "0.1.0"
+description = "S3 documents exposed as MCP tools through AgentCore Gateway"
+requires-python = ">=3.10"
+# boto3 ships with the Lambda runtime and nothing else is needed, so this
+# target has no dependencies to bundle.
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

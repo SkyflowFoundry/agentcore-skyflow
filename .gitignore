@@ -16,3 +16,6 @@ __pycache__/
 
 # Node
 node_modules/
+
+# Working notes and issue reports. These name real infrastructure.
+notes/

@@ -22,6 +22,9 @@
               "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:571930033416:gateway/agentflow-skyflowgateway-k7lrzhryea",
               "gatewayUrl": "https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
               "targets": {
+                "s3": {
+                  "targetId": "5QSDXKNOH2"
+                },
                 "exa": {
                   "targetId": "NLBZGQ9MOJ"
                 }
@@ -37,7 +40,7 @@
           }
         },
         "stackName": "AgentCore-agentflow-dev",
-        "deployHash": "a1e5cf418f50c821"
+        "deployHash": "f82f4bd72e101cc1"
       }
     }
   }
