@@ -29,7 +29,7 @@ from mcp_client.endpoints import (  # noqa: E402
     signing_region,
 )
 
-GATEWAY_URL = "https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+GATEWAY_URL = "https://example-gateway-abc123.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
 # What a deployed runtime actually gets: the CDK stack sets this pair for every
 # gateway declared under agentCoreGateways in agentcore.json.

@@ -20,7 +20,7 @@ from mcp_client.auth import build_auth  # noqa: E402
 from mcp_client.endpoints import AUTH_AWS_IAM, AUTH_CUSTOM_JWT, AUTH_NONE, Endpoint  # noqa: E402
 from mcp_client.sigv4 import SigV4Auth  # noqa: E402
 
-GATEWAY_URL = "https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+GATEWAY_URL = "https://example-gateway-abc123.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
 
 class BearerTokenMixin(unittest.TestCase):

@@ -29,7 +29,7 @@
       "command": "uvx",
       "args": [
         "mcp-proxy-for-aws@latest",
-        "https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+        "${SKYFLOW_GATEWAY_URL}",
         "--service",
         "bedrock-agentcore"
       ]

@@ -6,6 +6,42 @@ nothing to build first.
 
 Run every command from the repository root.
 
+Two values differ per deployment. Export them once and every command below works
+as written.
+
+```bash
+export BUCKET="agentcore-skyflow-files-$(aws sts get-caller-identity --query Account --output text)"
+export SKYFLOW_GATEWAY_URL=$(aws cloudformation describe-stacks \
+  --stack-name AgentCore-agentflow-dev --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='GatewaySkyflowGatewayUrlOutput'].OutputValue" \
+  --output text)
+```
+
+## Deploying this in your own account
+
+Everything below assumes the stack is already deployed. If you are starting from
+a fresh clone in a different AWS account then four things need your values
+before `agentcore deploy` will work.
+
+1. `agentcore/aws-targets.json` names the account and region to deploy into.
+2. `gateway/interceptor/cdk/cdk.context.json` names your Skyflow vault. Copy
+   `cdk.context.json.example` and fill in `skyflowVaultUrl` and `skyflowVaultId`.
+   The file is gitignored because it names real infrastructure.
+3. Your Skyflow API key goes into Secrets Manager under `skyflow/detect-api-key`.
+4. The `destinations` map in `gateway/interceptor/config/policy.json` names the
+   vault table and columns that store the original values. It ships as
+   `table1.{entity}_entity` which matches a vault whose columns follow that
+   convention. Change it to match your schema or vault tokens will fail the run
+   with `<name> schema not found`.
+
+The document bucket needs no configuration. The S3 target derives
+`agentcore-skyflow-files-<account>` from its own function ARN. Set the SSM
+parameter `/agentcore/s3-target/bucket` to point it somewhere else.
+
+The full deploy order is in `gateway/interceptor/README.md` because the
+interceptor cannot be declared in `agentcore.json` and has to be attached after
+the gateway exists.
+
 ## The quickest check
 
 Ask the agent for a document.
@@ -18,7 +54,7 @@ The agent returns a URL. Look at the host.
 
 1. A host of `try-sb1-uw2-detect-input.s3.us-west-2.amazonaws.com` is a Skyflow
    bucket and means the swap worked.
-2. A host of `agentcore-skyflow-files-<account>.s3.amazonaws.com` is your own
+2. A host that starts with `agentcore-skyflow-files-` is your own
    bucket and means the interceptor did not fire. The agent is holding a link to
    the original document.
 
@@ -28,7 +64,7 @@ Compare what is stored against what the agent receives.
 
 ```bash
 # what is actually stored in your bucket
-aws s3 cp s3://agentcore-skyflow-files-571930033416/samples/claim-note.txt -
+aws s3 cp s3://$BUCKET/samples/claim-note.txt -
 ```
 
 ```
@@ -116,7 +152,7 @@ larger and you can tolerate the wait.
 
 ```bash
 echo "Patient: Maria Alvarez, mrn 44821, seen in Denver on 3 March." > /tmp/note.txt
-aws s3 cp /tmp/note.txt s3://agentcore-skyflow-files-571930033416/samples/note.txt
+aws s3 cp /tmp/note.txt s3://$BUCKET/samples/note.txt
 agentcore invoke --target dev "Get a download link for samples/note.txt"
 ```
 
@@ -201,13 +237,14 @@ stdio can talk to the gateway without implementing SigV4.
 
 ```bash
 uvx mcp-proxy-for-aws@latest \
-  https://agentflow-skyflowgateway-k7lrzhryea.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp \
+  "$SKYFLOW_GATEWAY_URL" \
   --service bedrock-agentcore
 ```
 
 This repository wires that up as an MCP server named `skyflow-gateway` in
-`.mcp.json`, so your coding assistant can list and call the gateway's tools
-directly. Every call still passes through the interceptor, which means a
+`.mcp.json`. It reads `SKYFLOW_GATEWAY_URL` from your environment so the config
+carries no one deployment's URL. Export it before starting your client and your
+coding assistant can list and call the gateway's tools directly. Every call still passes through the interceptor, which means a
 document you fetch that way comes back de-identified exactly as it does for the
 agent.
 
