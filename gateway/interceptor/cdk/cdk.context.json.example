@@ -1,4 +1,36 @@
 {
+  "_readme": [
+    "Copy this file to cdk.context.json and fill in your own vault.",
+    "cdk.context.json is gitignored because these values name real",
+    "infrastructure. They are not credentials. The Skyflow API key never",
+    "appears here and lives only in Secrets Manager.",
+    "Keys beginning with an underscore are ignored by CDK, so they are safe",
+    "to leave in place after you copy the file."
+  ],
+
+  "_skyflowVaultUrl": [
+    "Open your vault in the Skyflow console. The URL of the vault page is",
+    "https://<cluster>.vault.skyflowapis.com and <cluster> is a short",
+    "alphanumeric id unique to your account. Copy the whole origin with no",
+    "trailing slash and no path."
+  ],
   "skyflowVaultUrl": "https://<cluster>.vault.skyflowapis.com",
-  "skyflowVaultId": "<vault-id>"
+
+  "_skyflowVaultId": [
+    "Also in the Skyflow console on the vault page. It is a 32 character",
+    "hexadecimal string. The console labels it Vault ID."
+  ],
+  "skyflowVaultId": "<vault-id>",
+
+  "_nextStep": [
+    "Two more things need your values before a first deploy.",
+    "1. Store the Skyflow API key:",
+    "   aws secretsmanager create-secret --name skyflow/detect-api-key",
+    "     --secret-string '<SKYFLOW_API_KEY>' --region us-east-1",
+    "2. Point files.destinations in gateway/interceptor/config/policy.json at",
+    "   a table and columns that exist in your vault. It ships as",
+    "   table1.{entity}_entity. A table that does not exist fails the Skyflow",
+    "   run with '<name> schema not found' rather than failing validation,",
+    "   because only Skyflow knows your schema."
+  ]
 }
