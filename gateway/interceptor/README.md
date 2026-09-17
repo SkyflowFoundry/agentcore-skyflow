@@ -180,6 +180,27 @@ The de-identified copy comes back in a Skyflow-owned bucket, which is the point
 rather than a caveat: the file stays in an approved region while the agent
 asking for it may not be.
 
+### Tool results wrap their payload in a text block
+
+An MCP tool result does not hand back structured JSON. It hands back a JSON
+string inside a text content block:
+
+```json
+{"content": [{"type": "text", "text": "{\"key\": \"claim.txt\", \"url\": \"https://...\"}"}]}
+```
+
+String redaction survives that by accident because the whole blob is a string
+and Skyflow scans it either way. File handling does not, because swapping a URL
+needs the URL to be a field value rather than a substring of one.
+
+The interceptor therefore parses every JSON text block before the transforms run
+and re-serializes it afterwards. Field paths address the decoded structure, so
+the URL in the example above is at `content[*].text.url` rather than at `url`.
+
+A block that is prose rather than JSON is left alone. A block that parses to a
+bare number or string is also left alone because re-encoding it would turn a
+plain string into a quoted one.
+
 ### Configuring it
 
 Off unless a `files` block says otherwise. Put it in an override to scope it to

@@ -9,6 +9,7 @@ Run: python3 gateway/interceptor/tests/test_file_interception.py
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -353,6 +354,70 @@ class RuleWithFieldsValidationTestCase(unittest.TestCase):
 
     def test_patterns_alone_still_scans(self):
         self.assertTrue(FileRule(action="deidentify", url_patterns=("*",)).scans)
+
+
+class McpEnvelopeTestCase(unittest.TestCase):
+    """A real MCP result carries its payload as a JSON string in a text block.
+
+    Without decoding, a file URL sits inside that string rather than at a field
+    path, so nothing matches and the agent receives the original document.
+    """
+
+    POLICY = {
+        "defaults": {
+            "request": {"action": "none"},
+            "response": {"action": "none"},
+            "scope": {"minLength": 4},
+            "failure": {"onError": "fail_closed"},
+            "entities": ["name"],
+        },
+        "toolNameSeparator": "___",
+        "overrides": [{
+            "servers": ["s3"], "tools": ["*"],
+            "files": {
+                "action": "deidentify",
+                "directions": ["response"],
+                "fields": ["content[*].text.url"],
+                "urlPatterns": PATTERNS,
+                "maxFiles": 1,
+            },
+        }],
+    }
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.POLICY)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+
+    def out(self, result):
+        event = response_event(result)
+        return handler.lambda_handler(event, None)["mcp"]["transformedGatewayResponse"]["body"]["result"]
+
+    def text_block(self, payload):
+        return {"isError": False, "content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    def test_a_url_inside_a_text_block_is_swapped(self):
+        result = self.out(self.text_block({"key": "claims/invoice.pdf", "url": ORIGINAL}))
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["url"], CLEAN)
+        self.assertEqual(payload["key"], "claims/invoice.pdf", "other fields survive")
+
+    def test_the_block_is_still_a_json_string_afterwards(self):
+        result = self.out(self.text_block({"url": ORIGINAL}))
+        self.assertIsInstance(result["content"][0]["text"], str)
+
+    def test_the_original_url_appears_nowhere_in_the_response(self):
+        result = self.out(self.text_block({"url": ORIGINAL, "note": "see attached"}))
+        self.assertNotIn(ORIGINAL, json.dumps(result))
+
+    def test_a_block_of_prose_is_passed_through(self):
+        result = self.out({"isError": False, "content": [{"type": "text", "text": "no files here"}]})
+        self.assertEqual(result["content"][0]["text"], "no files here")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
