@@ -254,8 +254,23 @@ The proxy uses your local AWS credentials. It needs
 ## Using it from the AgentCore console
 
 The deployed runtime is named `Flow` and it appears in the Amazon Bedrock
-AgentCore console under Agent Runtime in `us-east-1`. Open it and use the test
-pane to send the same prompts.
+AgentCore console under Agent Runtime. This prints the console link for whatever
+is deployed now:
+
+```bash
+RUNTIME_ID=$(aws cloudformation describe-stacks \
+  --stack-name AgentCore-agentflow-dev --region us-east-1 \
+  --query "Stacks[0].Outputs[?contains(OutputKey, 'RuntimeIdOutput')].OutputValue" \
+  --output text)
+echo "https://us-east-1.console.aws.amazon.com/bedrock-agentcore/agents/$RUNTIME_ID?region=us-east-1"
+```
+
+The link has the shape
+`https://<region>.console.aws.amazon.com/bedrock-agentcore/agents/<runtime-id>?region=<region>`
+where the runtime id looks like `agentflow_Flow-XXXXXXXXXX`. The suffix is
+assigned at creation so it differs in every account.
+
+Open it and use the test pane to send the same prompts.
 
 ```
 Get a download link for samples/claim-note.txt
