@@ -1,0 +1,30 @@
+.chat {
+  width: 100%;
+  max-width: 900px;
+  margin: 24px auto;
+  padding: 0 16px;
+  box-sizing: border-box;
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 8px 0 16px;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -1,0 +1,15 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: #f2f3f3;
+  font-family: 'Open Sans', system-ui, -apple-system, sans-serif;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}

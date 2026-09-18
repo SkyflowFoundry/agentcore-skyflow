@@ -1,0 +1,28 @@
+# AWS Amplify Hosting build settings (Gen 2).
+#
+# Set the Amplify app's "app root" (monorepo root) to `ui` so this file and the
+# web app are found. The backend phase provisions Cognito (User Pool + Identity
+# Pool) and writes amplify_outputs.json; the frontend phase then builds the SPA.
+#
+# Required Amplify environment variable for the frontend build:
+#   VITE_FLOW_AGENT_RUNTIME_ARN  - the deployed Flow runtime ARN
+#   VITE_AGENT_REGION            - its region
+version: 1
+backend:
+  phases:
+    build:
+      commands:
+        - npm ci
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+frontend:
+  phases:
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
