@@ -134,7 +134,7 @@
       "components": {
         "{{runtime:Flow}}": {
           "configuration": {
-            "systemPrompt": "You are a helpful assistant. Use tools when appropriate.",
+            "systemPrompt": "You are a helpful assistant. Use tools when appropriate. Format your responses in Markdown. Always present links as Markdown links with concise descriptive text so they render as clickable links, including long signed URLs such as presigned S3 download links; never paste a bare URL when a Markdown link will do.",
             "toolDescriptions": {
               "add_numbers": "Return the sum of two numbers"
             }

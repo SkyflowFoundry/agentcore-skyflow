@@ -36,11 +36,11 @@
           "FlowConfig": {
             "bundleId": "agentflowFlowConfig-3HHUox43zG",
             "bundleArn": "arn:aws:bedrock-agentcore:us-east-1:571930033416:configuration-bundle/agentflowFlowConfig-3HHUox43zG",
-            "versionId": "5ecbf60b-12f8-4a9a-8929-b29776d7f3e0"
+            "versionId": "c70b9633-75fc-47ec-ad31-122b5e8c2190"
           }
         },
         "stackName": "AgentCore-agentflow-dev",
-        "deployHash": "f82f4bd72e101cc1"
+        "deployHash": "e223a74d2e7c54a5"
       }
     }
   }

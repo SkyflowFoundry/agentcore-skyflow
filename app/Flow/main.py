@@ -19,6 +19,10 @@ mcp_clients = get_mcp_clients()
 DEFAULT_SYSTEM_PROMPT = """
 You are a helpful assistant. Use tools when appropriate.
 
+Format your responses in Markdown. Always present links as Markdown links with
+concise descriptive text so they render as clickable links, including long
+signed URLs such as presigned S3 download links; never paste a bare URL when a
+Markdown link will do.
 """
 
 DEFAULT_TOOL_DESC = "Return the sum of two numbers"
