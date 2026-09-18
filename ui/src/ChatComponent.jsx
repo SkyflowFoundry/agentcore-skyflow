@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import ChatBubble from '@cloudscape-design/chat-components/chat-bubble';
 import Avatar from '@cloudscape-design/chat-components/avatar';
 import LoadingBar from '@cloudscape-design/chat-components/loading-bar';
@@ -109,7 +110,7 @@ export default function ChatComponent({ user }) {
             >
               {m.text ? (
                 <div className="markdown">
-                  <ReactMarkdown>{m.text}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
                 </div>
               ) : (
                 <LoadingBar variant="gen-ai" />
