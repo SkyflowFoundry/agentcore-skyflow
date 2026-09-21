@@ -27,7 +27,11 @@ It does three things:
    bundle — an IAM user running `scripts/mcp_call.py` — triggers no fetch, so
    the gateway looks healthy from every direction except a runtime.
 3. Calls `update-gateway` with `interceptorConfigurations`, preserving the
-   gateway's existing settings.
+   gateway's existing settings. `update-gateway` replaces the whole resource,
+   so every writable field that `get-gateway` returned is echoed back. The
+   list of writable fields comes from the service model rather than from a
+   hand-written tuple, because a field left out here — a Cedar policy engine,
+   say, or a WAF configuration — is silently detached from the gateway.
 
 Re-running is safe: role policies are replaced in place and the interceptor
 configuration is overwritten with the same values.
@@ -115,6 +119,36 @@ def grant_config_bundle_read(role_arn: str, bundle_arns: list[str]) -> None:
         print(f"    {arn.rsplit('/', 1)[-1]}")
 
 
+def writable_gateway_fields(control) -> set[str]:
+    """Every input field `update-gateway` accepts, from the installed service model.
+
+    Read from botocore rather than listed by hand so a field added to the API
+    later is preserved as soon as boto3 is upgraded, instead of being dropped
+    until someone notices a gateway lost its policy engine.
+    """
+    model = control.meta.service_model.operation_model("UpdateGateway")
+    return set(model.input_shape.members)
+
+
+def build_update(control, gateway: dict, interceptor_configurations: list[dict]) -> dict:
+    """The `update-gateway` call that changes only the interceptors.
+
+    `update-gateway` replaces the resource, so anything not echoed back resets
+    to its default. Copy every writable field the gateway currently has —
+    `policyEngineConfiguration`, `wafConfiguration`, `kmsKeyArn` and the rest —
+    and set the interceptors on top.
+    """
+    writable = writable_gateway_fields(control)
+    update = {
+        key: value
+        for key, value in gateway.items()
+        if key in writable and value not in (None, "", [], {})
+    }
+    update["gatewayIdentifier"] = gateway["gatewayId"]
+    update["interceptorConfigurations"] = interceptor_configurations
+    return update
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--gateway-name", required=True, help="deployed name, including the project prefix")
@@ -174,20 +208,12 @@ def main() -> None:
         }
     ]
 
-    # update_gateway replaces the resource, so echo back the fields it already
-    # has rather than letting them reset to defaults.
-    update: dict = {
-        "gatewayIdentifier": gateway_id,
-        "name": gateway["name"],
-        "roleArn": role_arn,
-        "protocolType": gateway.get("protocolType", "MCP"),
-        "authorizerType": gateway.get("authorizerType", "NONE"),
-        "interceptorConfigurations": interceptor_configurations,
-    }
-    for optional in ("description", "authorizerConfiguration", "protocolConfiguration",
-                     "exceptionLevel", "kmsKeyArn"):
-        if gateway.get(optional):
-            update[optional] = gateway[optional]
+    update = build_update(control, gateway, interceptor_configurations)
+    preserved = sorted(
+        key for key in update
+        if key not in ("gatewayIdentifier", "interceptorConfigurations")
+    )
+    print(f"  preserving: {', '.join(preserved)}")
 
     try:
         control.update_gateway(**update)

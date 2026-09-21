@@ -20,23 +20,28 @@ export SKYFLOW_GATEWAY_URL=$(aws cloudformation describe-stacks \
 ## Deploying this in your own account
 
 Everything below assumes the stack is already deployed. If you are starting from
-a fresh clone in a different AWS account then four things need your values
+a fresh clone in a different AWS account then five things need your values
 before `agentcore deploy` will work.
 
-1. `agentcore/aws-targets.json` names the account and region to deploy into.
+1. `agentcore/aws-targets.json` names the account and region to deploy into. It
+   ships with a placeholder account.
 2. `gateway/interceptor/cdk/cdk.context.json` names your Skyflow vault. Copy
    `cdk.context.json.example` and fill in `skyflowVaultUrl` and `skyflowVaultId`.
    The file is gitignored because it names real infrastructure.
 3. Your Skyflow API key goes into Secrets Manager under `skyflow/detect-api-key`.
-4. The `destinations` map in `gateway/interceptor/config/policy.json` names the
+4. The document bucket has to exist. `scripts/create_documents_bucket.py`
+   creates `agentcore-skyflow-files-<account>` with public access blocked and
+   `--upload-samples` puts the sample documents in it. Nothing else creates it.
+5. The `destinations` map in `gateway/interceptor/config/policy.json` names the
    vault table and columns that store the original values. It ships as
    `table1.{entity}_entity` which matches a vault whose columns follow that
    convention. Change it to match your schema or vault tokens will fail the run
    with `<name> schema not found`.
 
-The document bucket needs no configuration. The S3 target derives
-`agentcore-skyflow-files-<account>` from its own function ARN. Set the SSM
-parameter `/agentcore/s3-target/bucket` to point it somewhere else.
+The S3 target derives the bucket name `agentcore-skyflow-files-<account>` from
+its own function ARN, so the default name needs no configuration. Set the SSM
+parameter `/agentcore/s3-target/bucket` to point it somewhere else, and change
+`files.urlPatterns` in the policy to match.
 
 The full deploy order is in `gateway/interceptor/README.md` because the
 interceptor cannot be declared in `agentcore.json` and has to be attached after
@@ -52,8 +57,10 @@ agentcore invoke --target dev "Get a download link for samples/claim-note.txt an
 
 The agent returns a URL. Look at the host.
 
-1. A host of `try-sb1-uw2-detect-input.s3.us-west-2.amazonaws.com` is a Skyflow
-   bucket and means the swap worked.
+1. A host you do not own is a Skyflow bucket and means the swap worked. Skyflow
+   returns the de-identified copy from a bucket in its own account, so the host
+   depends on the vault's environment; a trial vault returned
+   `try-sb1-uw2-detect-input.s3.us-west-2.amazonaws.com`.
 2. A host that starts with `agentcore-skyflow-files-` is your own
    bucket and means the interceptor did not fire. The agent is holding a link to
    the original document.
@@ -220,11 +227,16 @@ A failure returns this rather than a document:
 
 That is the policy failing closed on purpose because returning the original
 would leak the data the interceptor exists to protect. The reason is in the
-interceptor log group.
+interceptor log group, whose name is a stack output.
 
 ```bash
+LOG_GROUP=$(aws cloudformation describe-stacks \
+  --stack-name SkyflowInterceptorStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='InterceptorLogGroupName'].OutputValue" \
+  --output text)
+
 aws logs filter-log-events \
-  --log-group-name SkyflowInterceptorStack-InterceptorLogsB7A4CDFF-hDwhIMMQrqT4 \
+  --log-group-name "$LOG_GROUP" \
   --region us-east-1 \
   --start-time $(python3 -c "import time; print(int((time.time()-600)*1000))") \
   --query 'events[].message' --output text | tr '\t' '\n' | grep -i fail

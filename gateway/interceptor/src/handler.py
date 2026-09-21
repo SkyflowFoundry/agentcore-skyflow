@@ -115,12 +115,13 @@ def _on_request(mcp: dict, context=None) -> dict:
         return _pass_request(body)
 
     try:
-        arguments, swapped = _files_then(arguments, policy, "request", context)
+        arguments, swapped, replacements = _files_then(arguments, policy, "request", context)
         if action == "none":
             transformed, count = arguments, 0
         else:
             transformed, count = _apply(
-                arguments, policy, policy.request.action, policy.request.token_type, swapped
+                arguments, policy, policy.request.action, policy.request.token_type,
+                swapped, replacements,
             )
     except SkyflowError as exc:
         return _on_failure_request(body, policy, exc, server, tool)
@@ -192,18 +193,25 @@ def _on_response(mcp: dict, context=None) -> dict:
         _log_upstream("response", server, tool, result)
 
     try:
-        # An MCP tool result carries its payload as a JSON string inside a text
-        # content block. Decode it so field paths and URL patterns see the real
-        # structure, then re-encode before the result goes back to the caller.
-        result, decoded = envelope.decode_text_blocks(result)
-        result, swapped = _files_then(result, policy, "response", context)
+        swapped, replacements = (), ()
+        if policy.files.applies_to("response"):
+            # An MCP tool result carries its payload as a JSON string inside a
+            # text content block. The file swap needs the real structure, so
+            # decode around it and re-encode straight after. String redaction
+            # then sees each block as the one string the agent will read,
+            # rather than a scatter of short fields that `scope` would skip.
+            result, decoded = envelope.decode_text_blocks(result)
+            result, swapped, replacements = _swap_file_urls(
+                result, policy, "response", settings.build_client(), context
+            )
+            result = envelope.encode_text_blocks(result, decoded)
         if action == "none":
             transformed, count = result, 0
         else:
             transformed, count = _apply(
-                result, policy, policy.response.action, policy.response.token_type, swapped
+                result, policy, policy.response.action, policy.response.token_type,
+                swapped, replacements,
             )
-        transformed = envelope.encode_text_blocks(transformed, decoded)
     except SkyflowError as exc:
         return _on_failure_response(gateway_response, body, policy, exc, server, tool, streaming)
     except Exception as exc:
@@ -244,16 +252,18 @@ def _on_failure_response(
 def _files_then(node, policy: Policy, direction: str, context):
     """Apply the file rule for this direction, if it applies at all."""
     if not policy.files.applies_to(direction):
-        return node, ()
+        return node, (), ()
     return _swap_file_urls(node, policy, direction, settings.build_client(), context)
 
 
 def _swap_file_urls(node, policy: Policy, direction: str, client, context):
     """Replace file URLs with URLs to de-identified copies.
 
-    Returns `(new_node, swapped_paths)`. The paths are handed back so string
-    redaction can skip them: the replacement URL is freshly issued by Skyflow
-    and tokenizing it would destroy a working reference.
+    Returns `(new_node, swapped_paths, replacement_urls)`. Both are handed back
+    so string redaction can leave the replacements alone: the URL is freshly
+    issued by Skyflow and tokenizing it would destroy a working reference. The
+    paths cover a URL that sits at its own field; the values cover one that has
+    been re-serialized into an MCP text block, where no path can reach it.
 
     Each file is a separate Skyflow run and they are processed in order, so a
     low `maxFiles` is the safeguard against blowing the interceptor's deadline.
@@ -269,7 +279,7 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
         file_urls.warn_unhandled_matches(node, rule, {path for path, _ in matches})
 
     if not matches:
-        return node, ()
+        return node, (), ()
 
     if len(matches) > rule.max_files:
         # Truncating would hand the agent some original URLs alongside some
@@ -281,6 +291,7 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
     remaining = _remaining_seconds(context)
     result_node = copy.deepcopy(node)
     swapped: list[tuple] = []
+    replacements: list[str] = []
 
     for path, url in matches:
         data_format = file_urls.data_format_for(url)
@@ -317,9 +328,10 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
 
         payload_utils.set_path(result_node, path, document.url)
         swapped.append(path)
+        replacements.append(document.url)
         logger.info("file_swapped direction=%s run_id=%s", direction, run_id)
 
-    return result_node, tuple(swapped)
+    return result_node, tuple(swapped), tuple(replacements)
 
 
 def _remaining_seconds(context):
@@ -348,8 +360,21 @@ def _log_upstream(direction: str, server: str, tool: str, node) -> None:
     logger.info("upstream_%s server=%s tool=%s payload=%s", direction, server, tool, rendered)
 
 
-def _apply(node, policy: Policy, action: str, token_type: str, skip_paths: tuple = ()):
-    """Run one Skyflow action across every in-scope string in `node`."""
+def _apply(
+    node,
+    policy: Policy,
+    action: str,
+    token_type: str,
+    skip_paths: tuple = (),
+    protected_values: tuple = (),
+):
+    """Run one Skyflow action across every in-scope string in `node`.
+
+    `skip_paths` are left out entirely and `protected_values` are masked out
+    of any string that contains them before it goes to Skyflow, then restored.
+    Both exist for the same reason: a file URL freshly issued by Skyflow must
+    reach the agent byte for byte.
+    """
     client: SkyflowClient = settings.build_client()
 
     if action == "deidentify":
@@ -366,7 +391,57 @@ def _apply(node, policy: Policy, action: str, token_type: str, skip_paths: tuple
     else:
         raise ValueError(f"unsupported action {action!r}")
 
+    if protected_values:
+        transform = _protecting(transform, protected_values)
+
     return payload_utils.transform_strings(node, policy.scope, transform, skip_paths)
+
+
+#: Stands in for a protected value while its surrounding text is at Skyflow.
+#: Deliberately unlike anything Detect classifies: no letters that read as a
+#: word, no digits that read as an identifier beyond the index.
+PROTECTED_PLACEHOLDER = "__PROTECTED_URL_{index}__"
+
+
+def _protecting(transform, values: tuple):
+    """Wrap `transform` so the given values pass through it untouched.
+
+    A swapped file URL that has been re-serialized into an MCP text block is a
+    substring of the string being transformed, not a value of its own, so it
+    cannot be skipped by path. Each occurrence is replaced with a placeholder
+    before the call and put back afterwards. If a placeholder does not come
+    back exactly as it went in, the call fails closed: a link that has been
+    tokenized is a dead link, and handing one to the agent quietly is worse
+    than refusing.
+    """
+    # Longest first, so a URL that is a prefix of another cannot mask part of it.
+    ordered = sorted(set(values), key=len, reverse=True)
+
+    def wrapped(text: str) -> str:
+        if text in ordered:
+            return text
+        present = [value for value in ordered if value in text]
+        if not present:
+            return transform(text)
+
+        masked = text
+        placeholders: dict[str, str] = {}
+        for index, value in enumerate(present):
+            placeholder = PROTECTED_PLACEHOLDER.format(index=index)
+            placeholders[placeholder] = value
+            masked = masked.replace(value, placeholder)
+
+        result = transform(masked)
+        for placeholder, value in placeholders.items():
+            if result.count(placeholder) != masked.count(placeholder):
+                raise SkyflowError(
+                    "a swapped file URL did not survive string redaction intact; "
+                    "refusing to return a broken link"
+                )
+            result = result.replace(placeholder, value)
+        return result
+
+    return wrapped
 
 
 # ------------------------------------------------------------ output helpers

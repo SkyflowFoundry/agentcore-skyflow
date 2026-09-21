@@ -5,15 +5,17 @@ JSON *string* inside a text content block:
 
     {"content": [{"type": "text", "text": "{\\"url\\": \\"https://...\\"}"}]}
 
-String redaction survives that by accident because the whole blob is a string
-and Skyflow scans it either way. File handling does not, because swapping a
-file URL requires the URL to be a field value rather than a substring of one.
-Without this module a policy field path such as `content[*].text.url` can never
-match and a URL pattern never matches either, so a presigned URL reaches the
-agent untouched.
+String redaction is fine with that: the whole blob is one string and Skyflow
+scans it as such. File handling is not, because swapping a file URL requires
+the URL to be a field value rather than a substring of one. Without this module
+a policy field path such as `content[*].text.url` can never match and a URL
+pattern never matches either, so a presigned URL reaches the agent untouched.
 
-Decoding happens before the transforms and encoding happens after, so the paths
-the transforms hand back stay valid for the whole turn.
+The handler therefore decodes only around the file swap and re-encodes before
+string redaction runs, so redaction still sees each block as the one string the
+agent will read. Decoding it for redaction too would split the block into
+fields, and `scope` rules written for prose (a minimum length, excluded keys)
+would then skip short values such as a name or a phone number.
 """
 
 from __future__ import annotations
@@ -78,5 +80,8 @@ def encode_text_blocks(node: Any, paths: tuple[Path, ...]) -> Any:
             target = target[step]
         value = target[path[-1]]
         if isinstance(value, (dict, list)):
-            target[path[-1]] = json.dumps(value)
+            # ensure_ascii off: the default would turn "Café" into "Caf\u00e9"
+            # in the text the model reads. The JSON is equivalent either way,
+            # but the agent sees the string, not the parsed value.
+            target[path[-1]] = json.dumps(value, ensure_ascii=False)
     return result

@@ -702,6 +702,67 @@ class McpEnvelopeTestCase(unittest.TestCase):
         result = self.out({"isError": False, "content": [{"type": "text", "text": "no files here"}]})
         self.assertEqual(result["content"][0]["text"], "no files here")
 
+    def test_non_ascii_survives_the_swap(self):
+        original = json.dumps({"url": ORIGINAL, "title": "Café Müller"}, ensure_ascii=False)
+        result = self.out({"isError": False, "content": [{"type": "text", "text": original}]})
+        self.assertIn("Café Müller", result["content"][0]["text"])
+        self.assertNotIn("\\u00e9", result["content"][0]["text"])
+
+
+class TextBlockStringInteractionTestCase(unittest.TestCase):
+    """A swapped URL that lives inside a text block still has to survive
+    string redaction, and the block still has to be redacted as one string."""
+
+    POLICY = {
+        **McpEnvelopeTestCase.POLICY,
+        "defaults": {**McpEnvelopeTestCase.POLICY["defaults"],
+                     "response": {"action": "deidentify", "tokenType": "counter"}},
+    }
+
+    def setUp(self):
+        self.client = FakeFileClient()
+        self._load, self._build = settings.load_policy, settings.build_client
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.POLICY)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._load, self._build
+
+    def body(self, payload):
+        event = response_event({"isError": False,
+                                "content": [{"type": "text", "text": json.dumps(payload)}]})
+        return handler.lambda_handler(event, None)["mcp"]["transformedGatewayResponse"]["body"]
+
+    def test_the_replacement_url_survives_inside_the_block(self):
+        seen = []
+        real = self.client.deidentify
+        def spy(text, *args, **kwargs):
+            seen.append(text)
+            return real(text, *args, **kwargs)
+        self.client.deidentify = spy
+
+        text = self.body({"url": ORIGINAL, "note": "Jane Doe called"})["result"]["content"][0]["text"]
+
+        self.assertIn(CLEAN, text, "the swapped link reaches the agent byte for byte")
+        self.assertNotIn(ORIGINAL, text)
+        self.assertTrue(text.startswith("TOK(") and text.endswith(")"), "the block was redacted as one string")
+        # The test scope's minLength of 4 also makes the block's "text" type
+        # marker eligible, so look at the call that carried the payload.
+        block_calls = [call for call in seen if "Jane Doe called" in call]
+        self.assertEqual(len(block_calls), 1, "the whole block went in one call")
+        for call in seen:
+            self.assertNotIn(CLEAN, call, "the fresh URL never goes to Skyflow")
+            self.assertNotIn(ORIGINAL, call, "the original URL is gone before redaction runs")
+
+    def test_a_mangled_placeholder_fails_closed(self):
+        """If Skyflow did not hand the placeholder back intact, the URL cannot
+        be restored, and a broken link must not be returned as if it worked."""
+        self.client.deidentify = lambda text, *a, **k: type(
+            "R", (), {"processed_text": text.replace("__PROTECTED_URL_0__", "[URL_1]"), "entities": []})()
+        body = self.body({"url": ORIGINAL, "note": "Jane Doe called"})
+        self.assertIn("error", body)
+        self.assertNotIn("result", body)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -88,15 +88,29 @@ agentcore/                  # repo root
 
 The interceptor cannot be declared in `agentcore.json` because the AgentCore CLI
 has no field for it. That forces a three step order and every step depends on the
-one before it.
+one before it. Two one-time steps come first.
 
-**Step 0 stores the Skyflow API key.** You only do this once.
+**Step 0a points the project at your account.** The committed
+`agentcore/aws-targets.json` carries a placeholder account. Replace it with your
+own account ID; the region must be one where AgentCore is available.
+
+```bash
+# agentcore/aws-targets.json
+[{"name": "dev", "account": "<YOUR_ACCOUNT_ID>", "region": "us-east-1"}]
+```
+
+**Step 0b stores the Skyflow API key and creates the document bucket.** The
+`s3` target reads documents from `agentcore-skyflow-files-<account>` and nothing
+else creates that bucket. Both commands are safe to re-run.
 
 ```bash
 aws secretsmanager create-secret \
   --name skyflow/detect-api-key \
   --secret-string '<SKYFLOW_API_KEY>' \
   --region us-east-1
+
+uv run --with boto3 python scripts/create_documents_bucket.py \
+  --region us-east-1 --upload-samples
 ```
 
 **Step 1 creates the gateway and its targets.**
@@ -125,7 +139,9 @@ python3 scripts/attach_interceptor.py \
 ```
 
 The deployed gateway name carries the project name as a prefix so `SkyflowGateway`
-becomes `agentflow-SkyflowGateway`.
+becomes `agentflow-SkyflowGateway`. Step 1 also writes
+`agentcore/.cli/deployed-state.json`, which step 3 and the helper scripts read.
+It is not committed because it names one deployment.
 
 Step 3 grants the gateway's service role two things. The first is
 `lambda:InvokeFunction` on the interceptor so the gateway can call it. The second

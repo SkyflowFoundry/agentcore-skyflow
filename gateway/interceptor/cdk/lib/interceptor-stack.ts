@@ -116,6 +116,11 @@ export class InterceptorStack extends cdk.Stack {
       description: 'SSM parameter holding the redaction policy',
     });
 
+    new cdk.CfnOutput(this, 'InterceptorLogGroupName', {
+      value: logGroup.logGroupName,
+      description: 'CloudWatch log group to read when a call fails closed',
+    });
+
     cdk.Tags.of(this).add('agentcore:component', 'skyflow-interceptor');
   }
 }

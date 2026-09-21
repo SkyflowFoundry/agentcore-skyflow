@@ -24,7 +24,9 @@ import boto3
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "gateway" / "interceptor" / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from create_documents_bucket import ensure_bucket  # noqa: E402
 from skyflow_client import SkyflowClient, build_file_configuration  # noqa: E402
 
 SECRET_NAME = "skyflow/detect-api-key"
@@ -50,31 +52,6 @@ def load_api_key(session: boto3.Session, secret_name: str) -> str:
     if isinstance(parsed, str):
         return parsed.strip()
     return stored.strip()
-
-
-def ensure_bucket(s3, bucket: str, region: str) -> None:
-    try:
-        s3.head_bucket(Bucket=bucket)
-        print(f"  bucket {bucket} exists")
-        return
-    except Exception:
-        pass
-    kwargs = {"Bucket": bucket}
-    if region != "us-east-1":
-        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-    s3.create_bucket(**kwargs)
-    # Nothing here should ever be public: the whole point is that access is by
-    # presigned URL only.
-    s3.put_public_access_block(
-        Bucket=bucket,
-        PublicAccessBlockConfiguration={
-            "BlockPublicAcls": True,
-            "IgnorePublicAcls": True,
-            "BlockPublicPolicy": True,
-            "RestrictPublicBuckets": True,
-        },
-    )
-    print(f"  created bucket {bucket} (public access blocked)")
 
 
 CDK_CONTEXT = (
