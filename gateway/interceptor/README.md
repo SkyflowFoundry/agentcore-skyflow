@@ -422,6 +422,23 @@ What is never logged, whatever the settings:
 - **Anything with `action: none`.** With no transform there is no tokenized
   form to show, so `logUpstreamPayloads` logs nothing for that direction.
 
+Two things sit outside the interceptor's control and are worth knowing:
+
+- **Headers never travel inside a body.** In both interceptor payload shapes
+  the caller's headers arrive only under `gatewayRequest.headers`, and only
+  when `passRequestHeaders` is on. The base64 `body` of the `http` shape is
+  the HTTP body alone, and the `rawGatewayRequest.body` of the `mcp` shape is
+  the unparsed request body. The one place header values do land in a body is
+  an AWS signature-mismatch error, which echoes the canonical request the
+  service computed, signed header values included. The agent's
+  `mcp_client/diagnostics.py` masks those before logging the body.
+- **The gateway's own application logs carry payloads.** With AgentCore
+  Observability application logging enabled on the gateway, its log stream
+  records tool calls with their `responseBody` verbatim. That is the gateway's
+  log group rather than the interceptor's, and it is written regardless of any
+  setting here. Leave gateway application logs off in production, or treat that
+  log group with the same care as the vault.
+
 ## Seeing what the upstream server actually received
 
 `logUpstreamPayloads` logs the two snapshots that carry tokens rather than
