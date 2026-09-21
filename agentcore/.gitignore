@@ -5,11 +5,12 @@
 cdk/cdk.out/
 cdk/node_modules/
 
-# CLI Internals
+# CLI Internals, including deployed-state.json. The CLI template commits the
+# state file so a team can share one deployment; this repository is handed to
+# other accounts, and the file names one deployment's runtime, gateway URL and
+# bundle ARNs. `agentcore deploy` regenerates it, and every script that reads
+# it says so when it is missing.
 .cli/*
 
 # Ephemeral Staging
 .cache/*
-
-# Exception: Commit the State
-!.cli/deployed-state.json

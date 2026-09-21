@@ -14,6 +14,7 @@ Environment variables (set by the CDK stack):
 | `SKYFLOW_VAULT_URL` | Vault host, e.g. https://abcd.vault.skyflowapis.com |
 | `SKYFLOW_VAULT_ID` | Vault ID |
 | `POLICY_CACHE_TTL_SECONDS` | Policy cache lifetime in seconds, default 60 |
+| `LOG_LEVEL` | Interceptor log level, default INFO. The AWS SDK loggers stay at INFO or above regardless; see `logsafe` |
 """
 
 from __future__ import annotations

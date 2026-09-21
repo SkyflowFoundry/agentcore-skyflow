@@ -80,6 +80,15 @@ class EncodeTests(unittest.TestCase):
         encoded = envelope.encode_text_blocks(decoded, paths)
         self.assertEqual(json.loads(encoded["content"][0]["text"]), original)
 
+    def test_non_ascii_is_not_escaped_on_the_way_back(self):
+        """The agent reads the string, not the parsed JSON, so `Caf\\u00e9`
+        would be what the model sees."""
+        original = json.dumps({"title": "Café Müller — résumé"}, ensure_ascii=False)
+        decoded, paths = envelope.decode_text_blocks(block(original))
+        encoded = envelope.encode_text_blocks(decoded, paths)
+        self.assertEqual(encoded["content"][0]["text"], original)
+        self.assertNotIn("\\u00e9", encoded["content"][0]["text"])
+
     def test_a_swapped_value_survives_the_round_trip(self):
         decoded, paths = envelope.decode_text_blocks(block(json.dumps({"url": URL})))
         decoded["content"][0]["text"]["url"] = "https://clean/doc.txt"

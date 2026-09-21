@@ -30,7 +30,10 @@ interceptor/
 │   ├── handler.py          # entry point; dispatches REQUEST vs RESPONSE
 │   ├── policy.py           # policy model, matching, validation
 │   ├── payload.py          # find and rewrite eligible strings
-│   ├── skyflow_client.py   # Detect string endpoints, retry/backoff
+│   ├── envelope.py         # decode MCP text blocks around the file swap
+│   ├── file_urls.py        # find file references and name their format
+│   ├── logsafe.py          # keep credentials out of the log group
+│   ├── skyflow_client.py   # Detect string and file endpoints, retry/backoff
 │   └── settings.py         # SSM policy + Secrets Manager key, both cached
 ├── config/policy.json      # the redaction policy — source of truth
 ├── cdk/                    # standalone CDK app (Lambda + SSM parameter)
@@ -82,8 +85,8 @@ round-trips and is therefore verifiable end to end.
 
 **Shield the model** — `response: deidentify`, `request: reidentify`. The tool
 sees real data; the model context never does. Useful when results carry PII the
-agent has no need to read — the shipped policy applies this to Exa's `crawling`
-and `company_research` tools, whose results are scraped web content.
+agent has no need to read — the shipped policy applies this to Exa's
+`web_fetch_exa` tool, whose result is scraped web content.
 
 ### Validation rule
 
@@ -94,13 +97,18 @@ Lambda if it somehow gets there.
 
 ## Deploy
 
-One-time: store the long-lived Skyflow API key.
+One-time: set your account in `agentcore/aws-targets.json`, store the
+long-lived Skyflow API key, and create the document bucket the `s3` target
+reads from. Nothing else creates the bucket.
 
 ```bash
 aws secretsmanager create-secret \
   --name skyflow/detect-api-key \
   --secret-string '<SKYFLOW_API_KEY>' \
   --region us-east-1
+
+uv run --with boto3 python scripts/create_documents_bucket.py \
+  --region us-east-1 --upload-samples
 ```
 
 Then:
@@ -295,17 +303,28 @@ string inside a text content block:
 {"content": [{"type": "text", "text": "{\"key\": \"claim.txt\", \"url\": \"https://...\"}"}]}
 ```
 
-String redaction survives that by accident because the whole blob is a string
-and Skyflow scans it either way. File handling does not, because swapping a URL
-needs the URL to be a field value rather than a substring of one.
+String redaction is fine with that: the whole blob is one string, Skyflow scans
+it as such, and the block costs one call. File handling is not, because swapping
+a URL needs the URL to be a field value rather than a substring of one.
 
-The interceptor therefore parses every JSON text block before the transforms run
-and re-serializes it afterwards. Field paths address the decoded structure, so
-the URL in the example above is at `content[*].text.url` rather than at `url`.
+The interceptor therefore parses each JSON text block only around the file swap,
+and only when a file rule applies to the direction. Field paths address the
+decoded structure, so the URL in the example above is at `content[*].text.url`
+rather than at `url`. The block is re-serialized before string redaction runs,
+so redaction still sees the one string the agent will read. Decoding it for
+redaction too would split the block into fields, and a `scope` written for prose
+would then skip a seven-character name or a phone number as too short, or skip
+a `url` value that carries a name.
+
+The freshly issued URL inside a re-serialized block is masked with a placeholder
+while the block is at Skyflow and put back afterwards. If the placeholder does
+not come back intact the call fails closed rather than return a dead link.
 
 A block that is prose rather than JSON is left alone. A block that parses to a
 bare number or string is also left alone because re-encoding it would turn a
-plain string into a quoted one.
+plain string into a quoted one. Non-ASCII text is re-serialized as it was,
+not as `\uXXXX` escapes, because the model reads the string rather than the
+parsed value.
 
 ### Configuring it
 
@@ -352,7 +371,9 @@ policy that depends on it.
 - **A named field that is absent is not an error.** Tools legitimately return
   responses with no attachment.
 - **A swapped URL is excluded from string redaction.** Tokenizing a freshly
-  issued signed URL would produce a dead link.
+  issued signed URL would produce a dead link. A URL at its own field is
+  skipped by path; one inside a re-serialized text block is masked and
+  restored, and the call fails closed if the mask does not survive.
 - **The format comes from the extension in the URL path**, ignoring query
   parameters, since a presigned URL carries its signature after the path. An
   unrecognised extension fails the call: `dataFormat` is how Skyflow picks a
@@ -363,6 +384,60 @@ policy that depends on it.
 - **Polling is bounded by the Lambda's remaining time**, because the gateway's
   own interceptor deadline is not documented. A run that outlives the budget
   fails closed.
+
+## Logging
+
+Everything the interceptor writes goes to its CloudWatch log group, named by the
+`InterceptorLogGroupName` stack output, with one week of retention. There are
+three settings that change what lands there, and one guarantee that holds under
+every combination of them.
+
+| Setting | Where it is set | What it changes |
+| --- | --- | --- |
+| `LOG_LEVEL` | Lambda environment variable; not set by the stack, so `INFO` | How much the interceptor's own code logs. `INFO` is one line per decision: which tool, which action, how many fields changed, which file run. `WARNING` and above are failures only. `DEBUG` adds nothing today and is reserved for future diagnostics. |
+| `logUpstreamPayloads` | Policy, per default or per override; live within the cache TTL | Adds the two tokenized payload snapshots described in the next section, capped at 4000 characters. Ships `false`. |
+| `passRequestHeaders` | `scripts/attach_interceptor.py --pass-request-headers`; gateway-side | Whether the caller's HTTP headers arrive in the event at all. Ships off. It changes what the Lambda receives, not what it logs. |
+
+What is never logged, whatever the settings:
+
+- **The Skyflow API key and AWS credentials.** `LOG_LEVEL` applies to the
+  interceptor's loggers only. The AWS SDK loggers are held at `INFO` or above,
+  because botocore at `DEBUG` prints every response body and every SigV4
+  signing step, and the response body of `GetSecretValue` is the Skyflow API
+  key. `logsafe.configure_logging` enforces this and a test pins it.
+- **The caller's Authorization header.** With `passRequestHeaders` on, the
+  event carries it. The handler blanks `Authorization`, `Cookie`, `X-Api-Key`,
+  `X-Amz-Security-Token` and any header whose name mentions a token, secret or
+  credential before doing anything else, so no later log line can print one.
+  The interceptor never reads headers, and the gateway forwards its own copy
+  upstream, so nothing is lost.
+- **Credential fields inside a logged payload.** The shipped `scope.excludeKeys`
+  keeps `api_key` and `authorization` out of tokenization so a tool that needs
+  them still works. Before an upstream snapshot is serialized, those keys, any
+  key containing `token`, `secret`, `password` or `credential`, and any value
+  shaped like `Bearer …`, `Basic …` or a SigV4 signature are replaced with
+  `<redacted>`. The payload sent upstream is untouched; only the log copy is.
+- **Skyflow error bodies.** A failed Detect call logs its status code and path.
+  The body can echo the submitted text, which is the data being protected.
+- **Anything with `action: none`.** With no transform there is no tokenized
+  form to show, so `logUpstreamPayloads` logs nothing for that direction.
+
+Two things sit outside the interceptor's control and are worth knowing:
+
+- **Headers never travel inside a body.** In both interceptor payload shapes
+  the caller's headers arrive only under `gatewayRequest.headers`, and only
+  when `passRequestHeaders` is on. The base64 `body` of the `http` shape is
+  the HTTP body alone, and the `rawGatewayRequest.body` of the `mcp` shape is
+  the unparsed request body. The one place header values do land in a body is
+  an AWS signature-mismatch error, which echoes the canonical request the
+  service computed, signed header values included. The agent's
+  `mcp_client/diagnostics.py` masks those before logging the body.
+- **The gateway's own application logs carry payloads.** With AgentCore
+  Observability application logging enabled on the gateway, its log stream
+  records tool calls with their `responseBody` verbatim. That is the gateway's
+  log group rather than the interceptor's, and it is written regardless of any
+  setting here. Leave gateway application logs off in production, or treat that
+  log group with the same care as the vault.
 
 ## Seeing what the upstream server actually received
 
@@ -438,8 +513,10 @@ aws lambda invoke --region us-east-1 --function-name <fn> \
   --cli-binary-format raw-in-base64-out --payload file://event.json out.json
 ```
 
-The interceptor deliberately never logs payloads, so CloudWatch shows which
-action ran and how many fields changed, but not their contents.
+With `logUpstreamPayloads` off, which is how the policy ships, the interceptor
+logs no payloads at all: CloudWatch shows which action ran and how many fields
+changed, but not their contents. Turn it on per tool while debugging and turn it
+back off, for the reasons given in the section above.
 
 ## Iterating on policy
 
@@ -469,6 +546,7 @@ uv run --with boto3 python -m unittest discover \
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
+| `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential masking in logged payloads, header scrubbing on entry |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
 

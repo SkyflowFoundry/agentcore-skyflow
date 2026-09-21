@@ -34,7 +34,7 @@
     "failure": {
       "onError": "fail_closed"
     },
-    "logUpstreamPayloads": true
+    "logUpstreamPayloads": false
   },
   "toolNameSeparator": "___",
   "overrides": [

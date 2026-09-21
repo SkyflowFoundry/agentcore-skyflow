@@ -184,6 +184,18 @@ class LoggedContentTestCase(unittest.TestCase):
             handler.lambda_handler(self.request_event(arguments={"query": SECRET}), None)
         self.assertFalse([l for l in logs.output if "upstream_" in l])
 
+    def test_credential_fields_are_masked_in_the_logged_payload(self):
+        """scope.excludeKeys keeps api_key and friends out of tokenization so
+        the tool still works; the log must not then print them verbatim."""
+        arguments = {"query": SECRET, "api_key": "k-live-123", "headers": {"Authorization": "Bearer tok-456"}}
+        with self.assertLogs(level="INFO") as logs:
+            handler.lambda_handler(self.request_event(arguments=arguments), None)
+        line = next(l for l in logs.output if "upstream_request" in l)
+        self.assertNotIn("k-live-123", line)
+        self.assertNotIn("tok-456", line)
+        self.assertIn("<redacted>", line)
+        self.assertIn(TOKENIZED, line, "the tokenized query is still there to read")
+
     def test_a_long_payload_is_truncated(self):
         long_value = "y" * (handler.MAX_LOGGED_PAYLOAD * 2)
         with self.assertLogs(level="INFO") as logs:

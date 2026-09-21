@@ -1,8 +1,8 @@
 [
   {
     "name": "dev",
-    "description": "Personal exploration target for AgentCore features",
-    "account": "571930033416",
+    "description": "Replace account with your own 12-digit AWS account ID before deploying",
+    "account": "000000000000",
     "region": "us-east-1"
   }
 ]

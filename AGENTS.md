@@ -63,7 +63,9 @@ projects; add resources to the existing config instead.
 | Gateway target | `agentcore add gateway-target` | `gateway/targets/<name>/` for code-backed targets |
 | Evaluator | `agentcore add evaluator` | `evaluators/` |
 
-Deployment target is named `dev` (account `571930033416`, `us-east-1`) in `agentcore/aws-targets.json`.
+Deployment target is named `dev` in `agentcore/aws-targets.json`. The committed `account` is a
+placeholder; set it to the account you deploy into. `agentcore/.cli/deployed-state.json` is written
+by `agentcore deploy` and is not committed, because it names one deployment's resources.
 
 ### Agent runtime environment variables
 

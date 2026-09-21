@@ -200,6 +200,57 @@ class InterceptorTestCase(unittest.TestCase):
         self.assertEqual(restored, original)
 
 
+class TextBlockRedactionTestCase(unittest.TestCase):
+    """A JSON text block is redacted as the one string the agent reads.
+
+    Decoding it into fields would hand each field to `scope` separately, and
+    rules written for prose (a minimum length, excluded keys) would then let
+    short values such as a name or a phone number straight through.
+    """
+
+    SHIELD_THE_MODEL = {
+        "defaults": {
+            "request": {"action": "none"},
+            "response": {"action": "deidentify", "tokenType": "vault_token"},
+            "entities": ["name", "phone_number"],
+            "scope": {"minLength": 8, "excludeKeys": ["url", "type"]},
+            "failure": {"onError": "fail_closed"},
+        },
+        "toolNameSeparator": "___",
+    }
+
+    response_event = staticmethod(InterceptorTestCase.response_event)
+
+    def setUp(self):
+        self.client = FakeClient()
+        self._real_load, self._real_build = settings.load_policy, settings.build_client
+        settings.load_policy = lambda force=False: PolicySet.from_json(self.SHIELD_THE_MODEL)
+        settings.build_client = lambda: self.client
+
+    def tearDown(self):
+        settings.load_policy, settings.build_client = self._real_load, self._real_build
+
+    def test_a_json_text_block_costs_one_call_and_misses_nothing(self):
+        import json
+        payload = {"results": [{"author": "Bob Lee", "phone": "5550133",
+                                "url": "https://example.com/bob-lee", "text": "Bob Lee called."}]}
+        block = json.dumps(payload)
+        result = {"content": [{"type": "text", "text": block}]}
+        out = handler.lambda_handler(self.response_event(result=result), None)
+        text = out["mcp"]["transformedGatewayResponse"]["body"]["result"]["content"][0]["text"]
+
+        self.assertEqual(self.client.deidentify_calls, [block], "the whole block, in one call")
+        self.assertEqual(text, f"TOK({block})")
+        self.assertNotIn("Bob Lee", text.replace(f"TOK({block})", ""),
+                         "nothing outside the single tokenized string")
+
+    def test_non_ascii_text_reaches_the_agent_unescaped(self):
+        result = {"content": [{"type": "text", "text": "Café Müller — résumé"}]}
+        out = handler.lambda_handler(self.response_event(result=result), None)
+        text = out["mcp"]["transformedGatewayResponse"]["body"]["result"]["content"][0]["text"]
+        self.assertEqual(text, "TOK(Café Müller — résumé)")
+
+
 class PolicyTestCase(unittest.TestCase):
     def test_counter_tokens_with_reidentify_is_rejected(self):
         broken = {
