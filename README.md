@@ -162,6 +162,14 @@ The Lambda picks up the change within its sixty second cache window. Validation
 runs the same parser the Lambda uses so a typo fails at your terminal rather than
 on a live call. CI runs the same validation on every pull request.
 
+## Logging
+
+The interceptor logs one line per decision at `INFO` and never logs a
+credential: the Skyflow API key, AWS signatures, a caller's Authorization header
+and credential-shaped fields inside a payload are all kept out of CloudWatch
+regardless of `LOG_LEVEL` or `logUpstreamPayloads`. The settings and the
+guarantees are laid out in `gateway/interceptor/README.md` under Logging.
+
 ## Verification
 
 `scripts/mcp_call.py` speaks MCP to the gateway with SigV4 authentication.

@@ -32,6 +32,7 @@ interceptor/
 │   ├── payload.py          # find and rewrite eligible strings
 │   ├── envelope.py         # decode MCP text blocks around the file swap
 │   ├── file_urls.py        # find file references and name their format
+│   ├── logsafe.py          # keep credentials out of the log group
 │   ├── skyflow_client.py   # Detect string and file endpoints, retry/backoff
 │   └── settings.py         # SSM policy + Secrets Manager key, both cached
 ├── config/policy.json      # the redaction policy — source of truth
@@ -384,6 +385,43 @@ policy that depends on it.
   own interceptor deadline is not documented. A run that outlives the budget
   fails closed.
 
+## Logging
+
+Everything the interceptor writes goes to its CloudWatch log group, named by the
+`InterceptorLogGroupName` stack output, with one week of retention. There are
+three settings that change what lands there, and one guarantee that holds under
+every combination of them.
+
+| Setting | Where it is set | What it changes |
+| --- | --- | --- |
+| `LOG_LEVEL` | Lambda environment variable; not set by the stack, so `INFO` | How much the interceptor's own code logs. `INFO` is one line per decision: which tool, which action, how many fields changed, which file run. `WARNING` and above are failures only. `DEBUG` adds nothing today and is reserved for future diagnostics. |
+| `logUpstreamPayloads` | Policy, per default or per override; live within the cache TTL | Adds the two tokenized payload snapshots described in the next section, capped at 4000 characters. Ships `false`. |
+| `passRequestHeaders` | `scripts/attach_interceptor.py --pass-request-headers`; gateway-side | Whether the caller's HTTP headers arrive in the event at all. Ships off. It changes what the Lambda receives, not what it logs. |
+
+What is never logged, whatever the settings:
+
+- **The Skyflow API key and AWS credentials.** `LOG_LEVEL` applies to the
+  interceptor's loggers only. The AWS SDK loggers are held at `INFO` or above,
+  because botocore at `DEBUG` prints every response body and every SigV4
+  signing step, and the response body of `GetSecretValue` is the Skyflow API
+  key. `logsafe.configure_logging` enforces this and a test pins it.
+- **The caller's Authorization header.** With `passRequestHeaders` on, the
+  event carries it. The handler blanks `Authorization`, `Cookie`, `X-Api-Key`,
+  `X-Amz-Security-Token` and any header whose name mentions a token, secret or
+  credential before doing anything else, so no later log line can print one.
+  The interceptor never reads headers, and the gateway forwards its own copy
+  upstream, so nothing is lost.
+- **Credential fields inside a logged payload.** The shipped `scope.excludeKeys`
+  keeps `api_key` and `authorization` out of tokenization so a tool that needs
+  them still works. Before an upstream snapshot is serialized, those keys, any
+  key containing `token`, `secret`, `password` or `credential`, and any value
+  shaped like `Bearer …`, `Basic …` or a SigV4 signature are replaced with
+  `<redacted>`. The payload sent upstream is untouched; only the log copy is.
+- **Skyflow error bodies.** A failed Detect call logs its status code and path.
+  The body can echo the submitted text, which is the data being protected.
+- **Anything with `action: none`.** With no transform there is no tokenized
+  form to show, so `logUpstreamPayloads` logs nothing for that direction.
+
 ## Seeing what the upstream server actually received
 
 `logUpstreamPayloads` logs the two snapshots that carry tokens rather than
@@ -491,6 +529,7 @@ uv run --with boto3 python -m unittest discover \
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
+| `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential masking in logged payloads, header scrubbing on entry |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
 

@@ -24,6 +24,16 @@ Behaviour worth knowing:
 - With response streaming enabled the RESPONSE interceptor fires once per
   JSON-RPC event. Each event is transformed independently; only the first may
   set headers or status code, so this function never returns them.
+
+Logging (see `logsafe` for the guards):
+
+- `LOG_LEVEL` sets how much this code logs. The AWS SDK loggers are held at
+  INFO or above whatever it says, because botocore at DEBUG prints the
+  `GetSecretValue` response body, which is the Skyflow API key.
+- `logUpstreamPayloads` in the policy logs the tokenized payload snapshots,
+  with credential-bearing fields masked first.
+- Credential headers are blanked from the event on entry, so nothing that
+  later logs the event can print a caller's token.
 """
 
 from __future__ import annotations
@@ -31,17 +41,17 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
 
 import envelope
 import file_urls
+import logsafe
 import payload as payload_utils
 import settings
 from policy import Policy, PolicySet
 from skyflow_client import SkyflowClient, SkyflowError, build_file_configuration
 
 logger = logging.getLogger()
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+logsafe.configure_logging()
 
 OUTPUT_VERSION = "1.0"
 JSONRPC_INTERNAL_ERROR = -32603
@@ -60,6 +70,10 @@ FILE_RESERVE_SECONDS = 5.0
 
 def lambda_handler(event: dict, context) -> dict:
     """Dispatch on payload shape, then on interception point."""
+    # First, before anything can log it: with `passRequestHeaders` on, the
+    # event carries the caller's Authorization header, which nothing here needs.
+    logsafe.scrub_event(event)
+
     if "mcp" in event:
         mcp = event.get("mcp") or {}
         if mcp.get("gatewayResponse"):
@@ -351,10 +365,12 @@ def _log_upstream(direction: str, server: str, tool: str, node) -> None:
     """Log the upstream-facing form of a payload.
 
     Callers must gate this on `Policy.should_log_upstream`, which is what knows
-    whether the payload is the tokenized side. This function only serializes.
+    whether the payload is the tokenized side. This function masks credential
+    fields (which `scope.excludeKeys` keeps out of tokenization on purpose) and
+    serializes; it changes nothing about the payload itself.
     """
     try:
-        rendered = json.dumps(node, default=str)[:MAX_LOGGED_PAYLOAD]
+        rendered = json.dumps(logsafe.redact_for_log(node), default=str)[:MAX_LOGGED_PAYLOAD]
     except Exception:  # noqa: BLE001 - a diagnostic must not break the call
         rendered = "<unserializable>"
     logger.info("upstream_%s server=%s tool=%s payload=%s", direction, server, tool, rendered)

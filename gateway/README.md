@@ -72,7 +72,9 @@ Other behaviour worth knowing:
 - Lambda synchronous invocation caps request and response at 6 MB combined.
   `payloadFilter` can drop `RESPONSE_BODY`, but only for the `http` shape.
 - Headers are withheld unless `passRequestHeaders` is true. Leave it off unless
-  needed — headers carry bearer tokens.
+  needed — headers carry bearer tokens. The Skyflow interceptor blanks
+  credential headers from the event on entry either way, so turning it on
+  cannot put a caller's token in its log group.
 - The gateway may retry an interceptor, so handlers must be idempotent.
 
 ## Targets — where tools come from
