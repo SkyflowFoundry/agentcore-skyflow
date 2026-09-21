@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow sample/test tokens used in documentation and tests"
+
+# Suppress findings in test fixtures, which intentionally contain fake
+# secret-like values (e.g. the secret-safety hook and interceptor tests).
+# The regex matches any path segment ending in "tests/", so it covers both
+# tests/ at the repo root and gateway/interceptor/tests/.
+paths = [
+  '''tests/''',
+]
