@@ -281,6 +281,12 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
 
     Each file is a separate Skyflow run and they are processed in order, so a
     low `maxFiles` is the safeguard against blowing the interceptor's deadline.
+
+    Every URL must pass `files.urlPatterns` before anything contacts it: the
+    size probe fetches it from inside AWS and Skyflow fetches it from its own
+    network, so a URL a tool invented must never reach either. A named field
+    holding a URL no pattern allows fails the call rather than being skipped,
+    because skipping would hand the agent the original document.
     """
     rule = policy.files
     if rule.scans:
@@ -308,6 +314,13 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
     replacements: list[str] = []
 
     for path, url in matches:
+        if not rule.matches_url(url):
+            # Only the host: the rest of a presigned URL is its signature.
+            raise SkyflowError(
+                f"file URL at {_render_path(path)} is not allowed by files.urlPatterns "
+                f"(host {file_urls.host_of(url)!r})"
+            )
+
         data_format = file_urls.data_format_for(url)
         if data_format is None:
             raise SkyflowError("file URL has no recognised extension; cannot pick a dataFormat")
@@ -315,7 +328,10 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
         if rule.max_file_bytes:
             # Asking costs about a second. Submitting a document that cannot
             # finish costs minutes and ends in the same refusal.
-            size = file_urls.content_length(url)
+            try:
+                size = file_urls.content_length(url)
+            except file_urls.UnsafeFileUrl as exc:
+                raise SkyflowError(f"refused to probe file URL: {exc}") from exc
             if size is not None and size > rule.max_file_bytes:
                 raise SkyflowError(
                     f"document is {size} bytes which exceeds files.maxFileBytes="
@@ -346,6 +362,10 @@ def _swap_file_urls(node, policy: Policy, direction: str, client, context):
         logger.info("file_swapped direction=%s run_id=%s", direction, run_id)
 
     return result_node, tuple(swapped), tuple(replacements)
+
+
+def _render_path(path: tuple) -> str:
+    return ".".join(str(segment) for segment in path) or "<root>"
 
 
 def _remaining_seconds(context):
