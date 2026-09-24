@@ -59,7 +59,9 @@ This catches people out. The interceptor receives one of two shapes:
 To front an external MCP server, prefer **`mcpServer`** over `passthrough`.
 Both reach the same upstream, but `passthrough` delivers the `http` shape —
 base64 bodies with no MCP framing, so there is no tool name or arguments to
-match a policy against.
+match a policy against. The interceptor blocks `http`-shaped calls unless the
+policy sets `httpPayloads.action` to `passthrough`; see
+`interceptor/README.md`.
 
 Other behaviour worth knowing:
 

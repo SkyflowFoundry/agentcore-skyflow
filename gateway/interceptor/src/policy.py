@@ -22,6 +22,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 ACTIONS = ("deidentify", "reidentify", "none")
+#: What to do with an `http`-shaped interceptor event (AgentCore Runtime,
+#: passthrough and inference targets). Its body carries no MCP framing, so the
+#: interceptor cannot redact it; the only choices are to refuse it or to let it
+#: through uninspected.
+HTTP_PAYLOAD_ACTIONS = ("block", "passthrough")
 TOKEN_TYPES = ("counter", "vault_token")
 
 DEFAULT_ENTITIES = [
@@ -433,6 +438,11 @@ class PolicySet:
     defaults: Policy = field(default_factory=Policy)
     overrides: tuple[Override, ...] = ()
     tool_name_separator: str = "___"
+    #: `httpPayloads.action`. Gateway-wide rather than per tool: an HTTP
+    #: response event carries no request, so there is no target name to match
+    #: an override against on the way back. Blocking is the default because a
+    #: target the interceptor cannot inspect must not look protected.
+    http_payloads: str = "block"
 
     def resolve(self, server: str, tool: str) -> Policy:
         """Return effective policy for a tool, applying the first matching override."""
@@ -496,10 +506,20 @@ class PolicySet:
             raise PolicyError("overrides must be an array")
         overrides = tuple(Override.from_json(o, i) for i, o in enumerate(overrides_raw))
 
+        http_raw = raw.get("httpPayloads", {})
+        if not isinstance(http_raw, dict):
+            raise PolicyError("httpPayloads must be an object")
+        http_payloads = http_raw.get("action", "block")
+        if http_payloads not in HTTP_PAYLOAD_ACTIONS:
+            raise PolicyError(
+                f"httpPayloads.action must be one of {HTTP_PAYLOAD_ACTIONS}, got {http_payloads!r}"
+            )
+
         policy_set = cls(
             defaults=defaults,
             overrides=overrides,
             tool_name_separator=raw.get("toolNameSeparator", "___"),
+            http_payloads=http_payloads,
         )
         policy_set.validate()
         return policy_set

@@ -37,6 +37,9 @@
     "logUpstreamPayloads": false
   },
   "toolNameSeparator": "___",
+  "httpPayloads": {
+    "action": "block"
+  },
   "overrides": [
     {
       "servers": [
