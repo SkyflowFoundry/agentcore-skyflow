@@ -15,6 +15,7 @@ Environment variables (set by the CDK stack):
 | `SKYFLOW_VAULT_ID` | Vault ID |
 | `POLICY_CACHE_TTL_SECONDS` | Policy cache lifetime in seconds, default 60 |
 | `LOG_LEVEL` | Interceptor log level, default INFO. The AWS SDK loggers stay at INFO or above regardless; see `logsafe` |
+| `ALLOW_UPSTREAM_PAYLOAD_LOGGING` | `true` to let the policy's `logUpstreamPayloads` take effect. Unset, the flag is ignored |
 """
 
 from __future__ import annotations
@@ -113,6 +114,18 @@ def load_api_key() -> str:
         _api_key_cache = stored.strip()
 
     return _api_key_cache
+
+
+def upstream_payload_logging_allowed() -> bool:
+    """Whether the policy's `logUpstreamPayloads` may take effect at all.
+
+    The policy lives in SSM and changes without a deploy, so on its own the
+    flag lets anyone who can write one parameter start copying payloads into
+    CloudWatch. This env var is set by the stack, so turning payload logging on
+    takes a deploy as well as a policy edit. Read on every call so a test, or a
+    console edit to the function, applies at once.
+    """
+    return os.environ.get("ALLOW_UPSTREAM_PAYLOAD_LOGGING", "").strip().lower() == "true"
 
 
 def build_client() -> SkyflowClient:

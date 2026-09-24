@@ -389,13 +389,14 @@ policy that depends on it.
 
 Everything the interceptor writes goes to its CloudWatch log group, named by the
 `InterceptorLogGroupName` stack output, with one week of retention. There are
-three settings that change what lands there, and one guarantee that holds under
+four settings that change what lands there, and one guarantee that holds under
 every combination of them.
 
 | Setting | Where it is set | What it changes |
 | --- | --- | --- |
 | `LOG_LEVEL` | Lambda environment variable; not set by the stack, so `INFO` | How much the interceptor's own code logs. `INFO` is one line per decision: which tool, which action, how many fields changed, which file run. `WARNING` and above are failures only. `DEBUG` adds nothing today and is reserved for future diagnostics. |
-| `logUpstreamPayloads` | Policy, per default or per override; live within the cache TTL | Adds the two tokenized payload snapshots described in the next section, capped at 4000 characters. Ships `false`. |
+| `logUpstreamPayloads` | Policy, per default or per override; live within the cache TTL | Adds the two tokenized payload snapshots described in the next section, capped at 4000 characters. Ships `false`, and has no effect unless the next setting is also on. |
+| `ALLOW_UPSTREAM_PAYLOAD_LOGGING` | Lambda environment variable, set by the stack from `cdk deploy -c allowUpstreamPayloadLogging=true`; defaults to `false` | Whether `logUpstreamPayloads` is honoured at all. The policy lives in SSM and changes without a deploy, so this keeps payload logging a deployed decision rather than a parameter edit. While it is off and a policy asks for payload logging, the Lambda logs one `upstream_payload_logging_refused` warning per execution environment. |
 | `passRequestHeaders` | `scripts/attach_interceptor.py --pass-request-headers`; gateway-side | Whether the caller's HTTP headers arrive in the event at all. Ships off. It changes what the Lambda receives, not what it logs. |
 
 What is never logged, whatever the settings:
@@ -417,6 +418,17 @@ What is never logged, whatever the settings:
   key containing `token`, `secret`, `password` or `credential`, and any value
   shaped like `Bearer …`, `Basic …` or a SigV4 signature are replaced with
   `<redacted>`. The payload sent upstream is untouched; only the log copy is.
+- **The upstream side of a transform that restores or receives originals.**
+  A response with `action: deidentify` is the upstream returning real data
+  for the interceptor to redact, and a request with `action: reidentify`
+  sends real data upstream. Neither direction has a tokenized upstream form,
+  so `logUpstreamPayloads` logs nothing for it.
+- **PII with a recognisable shape.** As a backstop for values detection
+  missed, strings in a logged snapshot have email addresses, SSNs, Luhn-valid
+  card numbers and 10 to 15 digit phone numbers replaced with
+  `<redacted:email>`, `<redacted:ssn>`, `<redacted:card>` and
+  `<redacted:phone>`. Shapes are all it knows: names, addresses and dates of
+  birth that detection missed are not caught.
 - **Skyflow error bodies.** A failed Detect call logs its status code and path.
   The body can echo the submitted text, which is the data being protected.
 - **Anything with `action: none`.** With no transform there is no tokenized
@@ -452,7 +464,20 @@ The other two forms are never logged, and that is the whole safety argument:
 the inbound request is raw user data, and the outbound response has the
 original values restored.
 
-It is a policy field, so it flips without a redeploy:
+That holds only for those two pairings of direction and action, so they are
+the only ones logged. A tool whose response is `deidentify`, such as
+`web_fetch_exa`, gets its original content back from the upstream server;
+there is no tokenized snapshot of it, so its response logs nothing. The same
+goes for a request whose action is `reidentify`.
+
+Turning it on takes two steps. The stack has to allow it, which is a deploy:
+
+```bash
+cd gateway/interceptor/cdk
+npx cdk deploy -c allowUpstreamPayloadLogging=true
+```
+
+Then the policy field chooses which tools, and flips without a redeploy:
 
 ```bash
 # gateway/interceptor/config/policy.json
@@ -488,7 +513,8 @@ Two limits worth stating plainly:
 - **Tokenized is not the same as safe.** The payload is only as redacted as
   detection was complete. Anything Skyflow did not recognize is in the log in
   the clear, so this is a debugging aid rather than a guarantee.
-- **Nothing is logged when the action is `none`.** With no transform the
+- **Nothing is logged unless the upstream side carries tokens.** With
+  `action: none`, a `deidentify` response or a `reidentify` request, the
   "upstream" payload *is* the original, so logging it would write user data to
   CloudWatch. `Policy.should_log_upstream` enforces that, not the caller.
 
@@ -516,7 +542,8 @@ aws lambda invoke --region us-east-1 --function-name <fn> \
 With `logUpstreamPayloads` off, which is how the policy ships, the interceptor
 logs no payloads at all: CloudWatch shows which action ran and how many fields
 changed, but not their contents. Turn it on per tool while debugging and turn it
-back off, for the reasons given in the section above.
+back off, and redeploy without `allowUpstreamPayloadLogging` when you are done,
+for the reasons given in the section above.
 
 ## Iterating on policy
 
@@ -545,8 +572,8 @@ uv run --with boto3 python -m unittest discover \
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
-| `test_upstream_logging.py` | Which payload snapshots may be logged, and which must never be |
-| `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential masking in logged payloads, header scrubbing on entry |
+| `test_upstream_logging.py` | Which payload snapshots may be logged for each direction and action, and which must never be; the deploy-time gate |
+| `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential and PII-shape masking in logged payloads, header scrubbing on entry |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
 

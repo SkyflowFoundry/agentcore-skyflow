@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -103,6 +104,60 @@ class RedactForLogTestCase(unittest.TestCase):
     def test_scalars_pass_through(self):
         self.assertEqual(logsafe.redact_for_log("plain text"), "plain text")
         self.assertEqual(logsafe.redact_for_log(42), 42)
+
+
+class MaskPiiTestCase(unittest.TestCase):
+    """The backstop for PII-shaped values that detection missed."""
+
+    MASKED = {
+        "mail jane.doe@example.co.uk now": "mail <redacted:email> now",
+        "a.b+c@sub.example.com": "<redacted:email>",
+        "ssn 123-45-6789.": "ssn <redacted:ssn>.",
+        "card 4111 1111 1111 1111 x": "card <redacted:card> x",
+        "card 4111-1111-1111-1111": "card <redacted:card>",
+        "call (415) 555-2671 today": "call <redacted:phone> today",
+        "call +1 415-555-2671": "call <redacted:phone>",
+        "+44 20 7946 0958": "<redacted:phone>",
+    }
+
+    #: Things a debug log needs to keep readable, including Skyflow's own tokens.
+    KEPT = (
+        "[NAME_AJbrIud] [EMAIL_ADDRESS_nJFlbfH] [PHONE_NUMBER_VVwjCfV]",
+        "3f2a9c1e-8b4d-4e2f-9a1b-7c6d5e4f3a2b",
+        "2026-09-24T10:00:00Z",
+        "on 2026-09-24 at 10:00",
+        "v1.2.3 (build 45)",
+        "year 2026 count 42",
+    )
+
+    def test_shapes_are_masked(self):
+        for text, expected in self.MASKED.items():
+            with self.subTest(text):
+                self.assertEqual(logsafe.mask_pii(text), expected)
+
+    def test_ordinary_text_and_tokens_are_kept(self):
+        for text in self.KEPT:
+            with self.subTest(text):
+                self.assertEqual(logsafe.mask_pii(text), text)
+
+    def test_a_card_length_number_failing_luhn_is_not_called_a_card(self):
+        self.assertNotIn("<redacted:card>", logsafe.mask_pii("ref 4111 1111 1111 1112"))
+
+    def test_redact_for_log_applies_it_to_every_string(self):
+        node = {"query": "jane@example.com", "hits": [{"text": "call 415-555-2671"}], "n": 5}
+        out = logsafe.redact_for_log(node)
+        self.assertEqual(out["query"], "<redacted:email>")
+        self.assertEqual(out["hits"][0]["text"], "call <redacted:phone>")
+        self.assertEqual(out["n"], 5)
+
+    def test_long_adversarial_runs_stay_linear(self):
+        """A payload can be tens of kilobytes; an unanchored pattern here was
+        quadratic and took seconds on 50k characters."""
+        for text in ("a" * 50000, "1" * 50000 + "x", "(1-" * 17000 + "x", "a." * 25000, "a@b." * 12000):
+            with self.subTest(text[:6]):
+                started = time.monotonic()
+                logsafe.mask_pii(text)
+                self.assertLess(time.monotonic() - started, 1.0)
 
 
 class ScrubEventTestCase(unittest.TestCase):

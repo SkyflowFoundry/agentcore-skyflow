@@ -70,6 +70,8 @@ function resolveEnv(): { account: string; region: string } {
  *   skyflowSecretName Secrets Manager secret name (default skyflow/detect-api-key)
  *   target            aws-targets.json entry to deploy into (default: first)
  *   account / region  override aws-targets.json entirely
+ *   allowUpstreamPayloadLogging  true to let the policy's logUpstreamPayloads
+ *                     take effect (default false: the flag is ignored)
  */
 function required(name: string): string {
   const value = app.node.tryGetContext(name);
@@ -87,4 +89,6 @@ new InterceptorStack(app, 'SkyflowInterceptorStack', {
   skyflowVaultId: required('skyflowVaultId'),
   skyflowSecretName: app.node.tryGetContext('skyflowSecretName') ?? 'skyflow/detect-api-key',
   policyCacheTtlSeconds: Number(app.node.tryGetContext('policyCacheTtlSeconds') ?? 60),
+  // Context arrives as the string "true" from -c, or a boolean from cdk.json.
+  allowUpstreamPayloadLogging: String(app.node.tryGetContext('allowUpstreamPayloadLogging') ?? false) === 'true',
 });

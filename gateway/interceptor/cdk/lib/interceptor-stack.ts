@@ -20,6 +20,12 @@ export interface InterceptorStackProps extends cdk.StackProps {
   readonly skyflowSecretName: string;
   /** Seconds the Lambda caches the policy before re-reading SSM. */
   readonly policyCacheTtlSeconds?: number;
+  /**
+   * Let the policy's `logUpstreamPayloads` take effect. Off by default, in
+   * which case the Lambda ignores that flag: the policy changes without a
+   * deploy, so this keeps payload logging a deliberate, deployed decision.
+   */
+  readonly allowUpstreamPayloadLogging?: boolean;
 }
 
 /**
@@ -95,6 +101,7 @@ export class InterceptorStack extends cdk.Stack {
         SKYFLOW_VAULT_URL: props.skyflowVaultUrl,
         SKYFLOW_VAULT_ID: props.skyflowVaultId,
         POLICY_CACHE_TTL_SECONDS: String(props.policyCacheTtlSeconds ?? 60),
+        ALLOW_UPSTREAM_PAYLOAD_LOGGING: String(props.allowUpstreamPayloadLogging ?? false),
       },
     });
 
