@@ -39,6 +39,8 @@ from skyflow_client import (  # noqa: E402
 ORIGINAL = "https://bucket.s3.amazonaws.com/claims/invoice.pdf?X-Amz-Signature=abc"
 CLEAN = "https://skyflow.s3.amazonaws.com/out/invoice.pdf?X-Amz-Signature=zzz"
 PATTERNS = ["https://bucket.s3.amazonaws.com/*"]
+#: The same allowlist as a FileRule argument. Every active rule needs one.
+ALLOWED = tuple(PATTERNS)
 
 POLICY = {
     "defaults": {
@@ -207,22 +209,22 @@ class RuleValidationTestCase(unittest.TestCase):
 
     def test_an_unknown_action_is_rejected(self):
         with self.assertRaises(PolicyError):
-            FileRule(action="redact", url_patterns=("*",))
+            FileRule(action="redact", url_patterns=ALLOWED)
 
     def test_an_unknown_direction_is_rejected(self):
         with self.assertRaises(PolicyError):
-            FileRule(action="deidentify", directions=("sideways",), url_patterns=("*",))
+            FileRule(action="deidentify", directions=("sideways",), url_patterns=ALLOWED)
 
     def test_max_files_must_be_positive(self):
         with self.assertRaises(PolicyError):
-            FileRule(action="deidentify", url_patterns=("*",), max_files=0)
+            FileRule(action="deidentify", url_patterns=ALLOWED, max_files=0)
 
     def test_inactive_by_default(self):
         self.assertFalse(FileRule().is_active)
         self.assertFalse(FileRule().applies_to("response"))
 
     def test_direction_is_respected(self):
-        rule = FileRule(action="deidentify", directions=("request",), url_patterns=("*",))
+        rule = FileRule(action="deidentify", directions=("request",), url_patterns=ALLOWED)
         self.assertTrue(rule.applies_to("request"))
         self.assertFalse(rule.applies_to("response"))
 
@@ -267,7 +269,8 @@ class NamedFieldsTestCase(unittest.TestCase):
         return handler.lambda_handler(event, None)["mcp"]["transformedGatewayResponse"]["body"]["result"]
 
     def test_only_the_named_field_is_touched(self):
-        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
         elsewhere = ORIGINAL.replace("invoice", "other")
         result = self.out(response_event({"url": ORIGINAL, "backup": elsewhere}))
         self.assertEqual(result["url"], CLEAN)
@@ -275,21 +278,41 @@ class NamedFieldsTestCase(unittest.TestCase):
 
     def test_a_list_path_covers_every_element(self):
         self.use({"action": "deidentify", "directions": ["response"],
-                  "fields": ["content[*].url"], "maxFiles": 3})
+                  "fields": ["content[*].url"], "urlPatterns": PATTERNS, "maxFiles": 3})
         event = response_event({"content": [{"url": ORIGINAL}, {"url": ORIGINAL}, {"type": "text"}]})
         result = self.out(event)
         self.assertEqual([c.get("url") for c in result["content"]], [CLEAN, CLEAN, None])
 
     def test_a_named_field_that_is_absent_is_not_an_error(self):
         """Tools legitimately return responses with no attachment."""
-        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
         result = self.out(response_event({"content": [{"type": "text", "text": "nothing here"}]}))
         self.assertEqual(result["content"][0]["text"], "nothing here")
         self.assertEqual(self.client.submitted, [])
 
-    def test_patterns_are_not_required_once_fields_are_named(self):
-        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
-        self.assertEqual(self.out(response_event({"url": ORIGINAL}))["url"], CLEAN)
+    def test_patterns_are_required_even_when_fields_are_named(self):
+        """SC-16092: fields say where to look, not what is safe to fetch."""
+        with self.assertRaises(PolicyError):
+            self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
+            settings.load_policy()
+
+    def test_a_named_field_holding_a_url_no_pattern_allows_fails_closed(self):
+        """Skipping it would hand the agent the original; fetching it is the SSRF."""
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
+        for url in (
+            "https://attacker.example.com/redirect-to-metadata.pdf",
+            "https://169.254.169.254/latest/meta-data/x.pdf",
+            "file:///proc/self/environ.pdf",
+        ):
+            with self.subTest(url):
+                self.client.submitted.clear()
+                body = handler.lambda_handler(response_event({"url": url}), None)[
+                    "mcp"]["transformedGatewayResponse"]["body"]
+                self.assertIn("error", body)
+                self.assertNotIn(url, json.dumps(body))
+                self.assertEqual(self.client.submitted, [], "nothing reaches Skyflow")
 
     def test_a_reference_outside_the_named_fields_is_warned_about(self):
         self.use({"action": "deidentify", "directions": ["response"],
@@ -307,11 +330,16 @@ class NamedFieldsTestCase(unittest.TestCase):
         with self.assertNoLogs("file_urls", level="WARNING"):
             self.out(response_event({"url": ORIGINAL}))
 
-    def test_no_warning_is_possible_without_patterns(self):
-        """Nothing to compare against, so the check is skipped rather than guessed."""
-        self.use({"action": "deidentify", "directions": ["response"], "fields": ["url"]})
-        with self.assertNoLogs("file_urls", level="WARNING"):
-            self.out(response_event({"url": ORIGINAL, "extra": ORIGINAL}))
+    def test_the_refusal_names_the_host_but_not_the_signed_url(self):
+        """The rest of a presigned URL is its signature."""
+        self.use({"action": "deidentify", "directions": ["response"],
+                  "fields": ["url"], "urlPatterns": PATTERNS})
+        url = "https://attacker.example.com/doc.pdf?X-Amz-Signature=sekrit"
+        with self.assertLogs(level="ERROR") as logs:
+            handler.lambda_handler(response_event({"url": url}), None)
+        joined = "\n".join(logs.output)
+        self.assertIn("attacker.example.com", joined)
+        self.assertNotIn("sekrit", joined)
 
 
 class FieldPathTestCase(unittest.TestCase):
@@ -355,12 +383,15 @@ class RuleWithFieldsValidationTestCase(unittest.TestCase):
         with self.assertRaises(PolicyError):
             FileRule(action="deidentify")
 
-    def test_fields_alone_is_accepted(self):
-        rule = FileRule(action="deidentify", fields=("url",))
-        self.assertFalse(rule.scans)
+    def test_fields_alone_is_rejected(self):
+        with self.assertRaises(PolicyError):
+            FileRule(action="deidentify", fields=("url",))
+
+    def test_fields_with_patterns_does_not_scan(self):
+        self.assertFalse(FileRule(action="deidentify", fields=("url",), url_patterns=ALLOWED).scans)
 
     def test_patterns_alone_still_scans(self):
-        self.assertTrue(FileRule(action="deidentify", url_patterns=("*",)).scans)
+        self.assertTrue(FileRule(action="deidentify", url_patterns=ALLOWED).scans)
 
 
 class TokenTypeTestCase(unittest.TestCase):
@@ -373,34 +404,34 @@ class TokenTypeTestCase(unittest.TestCase):
     """
 
     def test_it_defaults_to_inheriting(self):
-        rule = FileRule(action="deidentify", url_patterns=("*",))
+        rule = FileRule(action="deidentify", url_patterns=ALLOWED)
         self.assertEqual(rule.token_type, "")
         self.assertEqual(rule.token_type_for("counter"), "counter")
         self.assertEqual(rule.token_type_for("vault_token"), "vault_token")
 
     def test_naming_it_overrides_the_string_rule(self):
-        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        rule = FileRule(action="deidentify", url_patterns=ALLOWED, token_type="vault_token")
         self.assertEqual(rule.token_type_for("counter"), "vault_token")
 
     def test_an_unknown_token_type_is_rejected(self):
         with self.assertRaises(PolicyError):
-            FileRule(action="deidentify", url_patterns=("*",), token_type="magic")
+            FileRule(action="deidentify", url_patterns=ALLOWED, token_type="magic")
 
     def test_it_parses_from_json(self):
         rule = FileRule.from_json(
-            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token"},
+            {"action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "vault_token"},
             "files",
         )
         self.assertEqual(rule.token_type, "vault_token")
 
     def test_a_vault_token_is_requested_for_a_supported_format(self):
-        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        rule = FileRule(action="deidentify", url_patterns=ALLOWED, token_type="vault_token")
         config = build_file_configuration(("name",), rule.token_type_for("counter"), "txt")
         self.assertEqual(config["detect"]["entities"][0]["deidentificationType"], "VAULT_TOKEN")
 
     def test_an_unsupported_format_still_downgrades(self):
         """Asking for VAULT_TOKEN on a PDF is rejected by the API."""
-        rule = FileRule(action="deidentify", url_patterns=("*",), token_type="vault_token")
+        rule = FileRule(action="deidentify", url_patterns=ALLOWED, token_type="vault_token")
         config = build_file_configuration(("name",), rule.token_type_for("counter"), "pdf")
         self.assertEqual(
             config["detect"]["entities"][0]["deidentificationType"], "ENTITY_UNIQUE_COUNTER"
@@ -418,7 +449,7 @@ class DestinationTestCase(unittest.TestCase):
         return FileRule.from_json(
             {
                 "action": "deidentify",
-                "urlPatterns": ["*"],
+                "urlPatterns": PATTERNS,
                 "tokenType": "vault_token",
                 "destinations": destinations,
             },
@@ -442,7 +473,7 @@ class DestinationTestCase(unittest.TestCase):
         self.assertIsNone(rule.destination_for("name"))
 
     def test_a_rule_without_destinations_returns_none(self):
-        rule = FileRule(action="deidentify", url_patterns=("*",))
+        rule = FileRule(action="deidentify", url_patterns=ALLOWED)
         self.assertIsNone(rule.destination_for("name"))
 
     def test_a_value_without_a_column_is_rejected(self):
@@ -492,7 +523,7 @@ class DestinationCoverageTestCase(unittest.TestCase):
 
     def test_an_uncovered_entity_is_rejected(self):
         raw = self.policy({
-            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "vault_token",
             "destinations": {"name": "table1.name_entity"},
         })
         with self.assertRaises(PolicyError) as caught:
@@ -501,21 +532,21 @@ class DestinationCoverageTestCase(unittest.TestCase):
 
     def test_a_default_template_covers_everything(self):
         raw = self.policy({
-            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "vault_token",
             "destinations": {"default": "table1.{entity}_entity"},
         })
         PolicySet.from_json(raw)
 
     def test_counter_tokens_need_no_destinations(self):
         raw = self.policy({
-            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "counter",
+            "action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "counter",
         })
         PolicySet.from_json(raw)
 
     def test_an_empty_entity_list_needs_a_destination_for_all(self):
         """An empty list means ALL, which no template can spell."""
         raw = self.policy({
-            "action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            "action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "vault_token",
             "destinations": {"default": "table1.{entity}_entity"},
         })
         raw["defaults"]["entities"] = []
@@ -534,7 +565,7 @@ class FormatCoverageTestCase(unittest.TestCase):
 
     def config(self, data_format):
         rule = FileRule.from_json(
-            {"action": "deidentify", "urlPatterns": ["*"], "tokenType": "vault_token",
+            {"action": "deidentify", "urlPatterns": PATTERNS, "tokenType": "vault_token",
              "destinations": {"default": "table1.{entity}_entity"}},
             "files",
         )
@@ -637,7 +668,7 @@ class SizeLimitTestCase(unittest.TestCase):
 
     def test_a_negative_limit_is_rejected(self):
         with self.assertRaises(PolicyError):
-            FileRule(action="deidentify", url_patterns=("*",), max_file_bytes=-1)
+            FileRule(action="deidentify", url_patterns=ALLOWED, max_file_bytes=-1)
 
 
 class McpEnvelopeTestCase(unittest.TestCase):

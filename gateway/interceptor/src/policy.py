@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,91 @@ def parse_field_path(path: str) -> tuple:
     return tuple(segments)
 
 
+#: Anything outside printable ASCII, and the backslash. URL parsers disagree
+#: about all of these (a backslash reads as a path separator to some and as
+#: part of the authority to others), so a URL or pattern carrying one is
+#: refused rather than interpreted.
+_UNSAFE_URL_CHARS = re.compile(r"[^\x21-\x7e]|\\")
+
+#: One DNS label of a host pattern, where `*` stands for part of a label.
+_HOST_LABEL = re.compile(r"[a-z0-9*-]+")
+
+
+@dataclass(frozen=True)
+class UrlPattern:
+    """One `files.urlPatterns` entry, parsed into the parts that are matched.
+
+    A whole-URL glob cannot be an allowlist: `*` matches dots and slashes, so
+    `https://files-*.s3.amazonaws.com/*` also matches
+    `https://files-x.evil.com/.s3.amazonaws.com/a.pdf`, whose host is
+    `files-x.evil.com`. Matching the host and the path separately, with a host
+    `*` confined to one label, closes that.
+    """
+
+    source: str
+    host: re.Pattern
+    path: str
+
+    @classmethod
+    def parse(cls, pattern: Any) -> "UrlPattern":
+        if not isinstance(pattern, str) or not pattern:
+            raise PolicyError("files.urlPatterns entries must be non-empty strings")
+        if _UNSAFE_URL_CHARS.search(pattern):
+            raise PolicyError(f"files.urlPatterns entry {pattern!r} has whitespace, a backslash or non-ASCII")
+        parts = urlsplit(pattern)
+        if parts.scheme != "https" or not pattern.startswith("https://"):
+            raise PolicyError(f"files.urlPatterns entry {pattern!r} must start with https://")
+        if parts.query or parts.fragment or "?" in pattern or "#" in pattern:
+            raise PolicyError(
+                f"files.urlPatterns entry {pattern!r} must not have a query or fragment; "
+                "they are ignored when matching, since a presigned URL's query changes every time"
+            )
+        if "@" in parts.netloc or ":" in parts.netloc:
+            raise PolicyError(f"files.urlPatterns entry {pattern!r} must not name a user or a port")
+
+        labels = parts.netloc.lower().split(".")
+        if len(labels) < 2 or not all(_HOST_LABEL.fullmatch(label) for label in labels):
+            raise PolicyError(f"files.urlPatterns entry {pattern!r} has an invalid host")
+        if any("*" in label for label in labels[-2:]):
+            # `*.com` would allow every host under a TLD, and `*` alone every
+            # host at all. The domain that owns the files has to be named.
+            raise PolicyError(
+                f"files.urlPatterns entry {pattern!r} must name its last two host labels "
+                "without a wildcard, for example *.s3.amazonaws.com"
+            )
+        host = re.compile(
+            r"\.".join(re.escape(label).replace(r"\*", "[a-z0-9-]*") for label in labels)
+        )
+        return cls(source=pattern, host=host, path=parts.path or "/*")
+
+    def matches(self, host: str, path: str) -> bool:
+        return bool(self.host.fullmatch(host)) and fnmatchcase(path, self.path)
+
+
+def split_file_url(value: Any) -> tuple[str, str] | None:
+    """`(host, path)` of a URL that is safe to compare against a pattern, else None.
+
+    Only `https`, on the default port, with no user info and nothing a parser
+    could read two ways. Anything else is not a file reference this
+    interceptor will fetch or hand to Skyflow, whatever the patterns say.
+    """
+    if not isinstance(value, str) or _UNSAFE_URL_CHARS.search(value):
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or not value[:8].lower() == "https://":
+        return None
+    if not parts.netloc or "@" in parts.netloc or port not in (None, 443):
+        return None
+    host = parts.hostname or ""
+    if not host or host.endswith("."):
+        return None
+    return host, parts.path or "/"
+
+
 def _destinations(raw: Any, where: str) -> tuple[tuple[str, str], ...]:
     """Parse the entity-to-`table.column` map into a stable ordered tuple."""
     if raw is None:
@@ -204,14 +290,17 @@ class FileRule:
 
     action: str = "none"
     directions: tuple[str, ...] = ("response",)
-    #: Globs matched against the whole URL. A value only counts as a file
-    #: reference if it matches, so an arbitrary link in prose is left alone.
+    #: The allowlist of places a file may come from, as `https://host/path`
+    #: globs (see `UrlPattern`). Required whenever the rule is active: every
+    #: URL is checked against it before the interceptor fetches it or hands it
+    #: to Skyflow, however it was found. When `fields` is absent the patterns
+    #: also find the references, so an arbitrary link in prose is left alone.
     url_patterns: tuple[str, ...] = ()
     #: Where the file reference lives, relative to the tool's arguments on a
     #: request or its result on a response — for example `url` or
-    #: `content[*].url`. When set, only these locations are examined and
-    #: `url_patterns` is no longer needed to find anything; it is then used only
-    #: to warn about references found elsewhere.
+    #: `content[*].url`. When set, only these locations are examined, and a
+    #: URL there that no pattern allows fails the call. Matches found elsewhere
+    #: are only warned about.
     fields: tuple[str, ...] = ()
     #: Cap on files processed per call. Each one is a separate Skyflow run, and
     #: they are serialised inside a synchronous interceptor.
@@ -239,6 +328,8 @@ class FileRule:
     #: `action: none` on the string rule would otherwise silently inherit the
     #: default of `counter`.
     token_type: str = ""
+    #: `url_patterns`, parsed. Built in `__post_init__`, not passed in.
+    compiled_patterns: tuple[UrlPattern, ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.action not in ("deidentify", "none"):
@@ -277,13 +368,17 @@ class FileRule:
                 parse_field_path(path)
             except ValueError as exc:
                 raise PolicyError(f"files.fields: {exc}") from exc
-        if self.action == "deidentify" and not (self.fields or self.url_patterns):
-            # With neither, there is nothing to identify a file reference by:
-            # every string would be a candidate, which would either submit
-            # nonsense to Skyflow or silently do nothing.
+        if self.action == "deidentify" and not self.url_patterns:
+            # The patterns are the only thing standing between a tool's
+            # response and a request the interceptor makes from inside AWS.
+            # Named fields say where to look, not what is safe to fetch.
             raise PolicyError(
-                "files needs fields or urlPatterns when files.action is deidentify"
+                "files.urlPatterns is required when files.action is deidentify: "
+                "it is the allowlist of hosts a file may be fetched from"
             )
+        object.__setattr__(
+            self, "compiled_patterns", tuple(UrlPattern.parse(p) for p in self.url_patterns)
+        )
 
     @property
     def is_active(self) -> bool:
@@ -316,7 +411,12 @@ class FileRule:
         return value.replace("{entity}", name)
 
     def matches_url(self, value: str) -> bool:
-        return any(fnmatchcase(value, pattern) for pattern in self.url_patterns)
+        """Whether `value` is a safe `https` URL that a pattern allows."""
+        split = split_file_url(value)
+        if split is None:
+            return False
+        host, path = split
+        return any(pattern.matches(host, path) for pattern in self.compiled_patterns)
 
     @classmethod
     def from_json(cls, raw: Any, where: str) -> "FileRule":

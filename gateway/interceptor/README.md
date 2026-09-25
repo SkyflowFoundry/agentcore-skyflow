@@ -350,7 +350,7 @@ one server or tool, or in `defaults` to cover everything.
 | --- | --- |
 | `directions` | Which side carries the file. A download returns one in the response; an upload sends one in the request. |
 | `fields` | Where the reference is, relative to the tool's arguments or its result. `content[*].url` covers a list. Naming fields stops the scan. |
-| `urlPatterns` | Globs matched against whole strings. Used to find references when `fields` is absent, and to warn about strays when it is not. |
+| `urlPatterns` | **Required.** The allowlist of places a file may come from, as `https://host/path` globs. Every URL is checked against it before the interceptor fetches it or hands it to Skyflow. Also finds references when `fields` is absent, and flags strays when it is not. |
 | `maxFiles` | Cap per call. Each file is a separate run and they are processed in order. |
 | `configuration` | Inline Detect configuration, forwarded as given with `vaultId` injected. Anything the Detect API accepts works here without a code change. |
 
@@ -360,14 +360,36 @@ policy that depends on it.
 
 ### Behaviour worth knowing
 
-- **A rule needs `fields` or `urlPatterns`.** With neither, every string is a
-  candidate reference.
+- **A rule needs `urlPatterns`, even with `fields`.** Named fields say where to
+  look, not what is safe to fetch. The size probe requests the URL from inside
+  AWS and Skyflow fetches it from its own network, so the patterns are the
+  only thing between a tool's response and those requests.
+- **A pattern is matched part by part, not as one glob.** It must be
+  `https://`, with no port, user, query or fragment. In the host, `*` stands
+  for part of one label and cannot cross a dot, so
+  `https://files-*.s3.amazonaws.com/*` does not match
+  `https://files-x.evil.com/.s3.amazonaws.com/a.pdf`. The last two host
+  labels must be literal, so `*.com` or `*` alone are refused when the policy
+  loads. The path is a glob that may cross `/`. The query string is not
+  matched, because a presigned URL's changes on every call.
+- **A URL no pattern allows fails the call.** In a named field it blocks the
+  call under `fail_closed`, because skipping it would hand the agent the
+  original document. When scanning, a string that fails the patterns is just
+  not a file reference. Either way it is never fetched or submitted. Only the
+  host goes in the log line, since the rest of a presigned URL is its
+  signature.
+- **The size probe is HTTPS-only, follows no redirects, and only connects to
+  public addresses.** The address check is on the socket's actual peer, after
+  DNS and before TLS, so loopback, link-local (including 169.254.169.254),
+  private ranges and DNS rebinding are all refused, and the call fails
+  closed. A redirect ends the probe with the size unknown. It does not follow
+  the `Location`.
 - **Exceeding `maxFiles` fails the call** rather than processing the first few.
   A partial swap hands back some originals alongside some redacted copies.
 - **Named fields still get a stray check.** The rest of the response is matched
   against `urlPatterns` and anything found is logged, not acted on, so a tool
   that changes its response shape shows up rather than passing files through
-  silently. Skipped when the rule has no patterns.
+  silently.
 - **A named field that is absent is not an error.** Tools legitimately return
   responses with no attachment.
 - **A swapped URL is excluded from string redaction.** Tokenizing a freshly
@@ -570,6 +592,7 @@ uv run --with boto3 python -m unittest discover \
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
 | `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
+| `test_file_url_safety.py` | The file URL allowlist (SC-16092): pattern parsing, wildcard confinement, parser-confusion URLs, non-public addresses, no redirects or non-HTTPS handlers in the probe |
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged for each direction and action, and which must never be; the deploy-time gate |
