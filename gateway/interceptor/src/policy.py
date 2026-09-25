@@ -374,18 +374,36 @@ class Policy:
     def is_noop(self) -> bool:
         return self.request.action == "none" and self.response.action == "none"
 
-    def should_log_upstream(self, action: str) -> bool:
+    def should_log_upstream(self, direction: str) -> bool:
         """Whether the upstream-facing payload for this direction may be logged.
 
-        Only when something was actually de-identified. With `action: none`
-        nothing is tokenized, so the "upstream" payload is the original one and
-        logging it would write user data to CloudWatch.
+        Only when the upstream side is the tokenized side, which depends on the
+        direction as well as the action:
+
+        - request + `deidentify`: the payload sent upstream carries tokens.
+        - response + `reidentify`: the payload the upstream returned carries
+          tokens.
+
+        Every other combination puts original values on the upstream side. A
+        response with `deidentify` is the upstream returning real data for the
+        interceptor to redact; a request with `reidentify` is tokens being
+        restored before they go upstream; `none` transforms nothing. Logging
+        any of those would write user data to CloudWatch.
+
+        The action is read from the policy rather than passed in, so a caller
+        cannot pair a direction with the wrong one.
 
         Even when it returns True this is a debugging aid, not a guarantee: the
         payload is only as redacted as detection was complete, and anything
         Skyflow did not recognize is still there in the clear.
         """
-        return self.log_upstream_payloads and action in ("deidentify", "reidentify")
+        if not self.log_upstream_payloads:
+            return False
+        if direction == "request":
+            return self.request.action == "deidentify"
+        if direction == "response":
+            return self.response.action == "reidentify"
+        raise ValueError(f"unknown direction {direction!r}")
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,10 @@ a guard here:
    fields such as `api_key` and `authorization` out of tokenization so a tool
    that needs them still works. Logged verbatim, those would be credentials in
    the clear. `redact_for_log` masks them by key and by shape before anything
-   is serialized.
+   is serialized. It also masks values shaped like an email address, an SSN, a
+   card number or a phone number, as a backstop for anything detection missed.
+   That backstop cannot recognise a name or an address; what keeps those out
+   is logging only the tokenized side (`Policy.should_log_upstream`).
 3. `passRequestHeaders`. When it is on, the gateway hands the caller's headers,
    Authorization included, to the interceptor inside the event. Nothing here
    reads them, so `scrub_event` blanks the credential-bearing ones on entry;
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from fnmatch import fnmatchcase
 from typing import Any
 
@@ -65,6 +69,62 @@ SENSITIVE_KEY_PATTERNS = (
 CREDENTIAL_VALUE_PREFIXES = ("bearer ", "basic ", "aws4-hmac-sha256 ", "digest ")
 
 
+#: PII with a recognisable shape, masked inside any logged string. Order
+#: matters: a card number would otherwise be claimed by the phone pattern.
+#: Over-matching is accepted here too, so a long run of digits that is not a
+#: phone number is masked all the same.
+#:
+#: Each pattern may only start at the beginning of a run (the lookbehinds) and
+#: every repetition is bounded. Without both, a long run of letters or digits
+#: in a payload is retried from every position and costs quadratic time.
+EMAIL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}"
+    r"@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}(?![A-Za-z0-9-])"
+)
+SSN_PATTERN = re.compile(r"(?<![\w-])\d{3}[- ]\d{2}[- ]\d{4}(?![\w-])")
+CARD_PATTERN = re.compile(r"(?<![\w-])\d(?:[ -]?\d){12,18}(?![\w-])")
+#: A candidate only: `_mask_phone` then insists on 10 to 15 digits, the range
+#: E.164 allows once a country or area code is included.
+PHONE_PATTERN = re.compile(r"(?<![\w+(-])\+?[\d(](?:[\d ().-]{0,30}\d)?(?![\w-])")
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _mask_card(match: re.Match) -> str:
+    digits = re.sub(r"\D", "", match.group(0))
+    # Luhn keeps an order number or a timestamp from reading as a card; the
+    # phone pattern after this still masks it if it is long enough.
+    return "<redacted:card>" if _luhn_valid(digits) else match.group(0)
+
+
+def _mask_phone(match: re.Match) -> str:
+    candidate = match.group(0)
+    digits = sum(char.isdigit() for char in candidate)
+    return "<redacted:phone>" if 10 <= digits <= 15 else candidate
+
+
+def mask_pii(text: str) -> str:
+    """Mask substrings of `text` shaped like an email, SSN, card or phone number.
+
+    A backstop, not a detector: it only knows shapes, so a name, a street
+    address or a date of birth goes through untouched.
+    """
+    text = EMAIL_PATTERN.sub("<redacted:email>", text)
+    text = SSN_PATTERN.sub("<redacted:ssn>", text)
+    text = CARD_PATTERN.sub(_mask_card, text)
+    return PHONE_PATTERN.sub(_mask_phone, text)
+
+
 def configure_logging(level_name: str | None = None) -> int:
     """Apply `LOG_LEVEL` to the interceptor without letting the SDKs follow.
 
@@ -95,12 +155,14 @@ def looks_like_credential(value: Any) -> bool:
 
 
 def redact_for_log(node: Any) -> Any:
-    """Return a copy of `node` with credential-bearing values masked.
+    """Return a copy of `node` with credential-bearing and PII-shaped values masked.
 
     Masks by key (`api_key`, `authorization`, anything containing `token`,
     `secret`, `password` or `credential`) and by shape (`Bearer …`, `Basic …`,
     a SigV4 `Authorization` value) so a credential under an unexpected key is
-    still caught. Only for logging: the payload itself is never changed.
+    still caught. Any other string has emails, SSNs, card numbers and phone
+    numbers masked within it (`mask_pii`). Only for logging: the payload itself
+    is never changed.
     """
     if isinstance(node, dict):
         return {
@@ -111,6 +173,8 @@ def redact_for_log(node: Any) -> Any:
         return [redact_for_log(item) for item in node]
     if looks_like_credential(node):
         return REDACTED
+    if isinstance(node, str):
+        return mask_pii(node)
     return node
 
 

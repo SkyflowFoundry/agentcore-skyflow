@@ -183,11 +183,14 @@ uv run --with boto3 --with 'botocore[crt]' python scripts/mcp_call.py tools/call
 ```
 
 To see what the upstream server actually received you can turn on
-`logUpstreamPayloads` in the policy. It logs the request after de-identification
-and the response before re-identification. Those two snapshots carry tokens
-rather than original values. The other two forms are never logged because the
-inbound request is raw user data and the outbound response has the real values
-restored.
+`logUpstreamPayloads` in the policy, once the interceptor stack has been
+deployed with `-c allowUpstreamPayloadLogging=true`. It logs the request after
+de-identification and the response before re-identification. Those two
+snapshots carry tokens rather than original values. The other two forms are
+never logged because the inbound request is raw user data and the outbound
+response has the real values restored. A tool whose response is
+de-identified, such as `web_fetch_exa`, logs no response at all, because
+its upstream side holds the original content.
 
 ## Tests
 

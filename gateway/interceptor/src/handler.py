@@ -31,7 +31,9 @@ Logging (see `logsafe` for the guards):
   INFO or above whatever it says, because botocore at DEBUG prints the
   `GetSecretValue` response body, which is the Skyflow API key.
 - `logUpstreamPayloads` in the policy logs the tokenized payload snapshots,
-  with credential-bearing fields masked first.
+  with credential-bearing fields and PII-shaped values masked first. It only
+  takes effect when the stack also sets `ALLOW_UPSTREAM_PAYLOAD_LOGGING=true`,
+  and only for the directions whose upstream side carries tokens.
 - Credential headers are blanked from the event on entry, so nothing that
   later logs the event can print a caller's token.
 """
@@ -144,7 +146,9 @@ def _on_request(mcp: dict, context=None) -> dict:
         return _on_failure_request(body, policy, exc, server, tool)
 
     logger.info("request_transformed server=%s tool=%s fields=%d", server, tool, count)
-    if policy.should_log_upstream(action):
+    # After the transform: with `deidentify` this is what goes upstream, and it
+    # carries tokens. `should_log_upstream` refuses every other action.
+    if _may_log_upstream(policy, "request", server, tool):
         _log_upstream("request", server, tool, transformed)
 
     new_body = dict(body)
@@ -200,10 +204,12 @@ def _on_response(mcp: dict, context=None) -> dict:
     if action == "none" and not policy.files.applies_to("response"):
         return _pass_response(gateway_response, streaming)
 
-    # Before the transform, not after: this is the form the upstream server
-    # returned, still carrying tokens. The transformed version has the original
-    # values back in it and must never reach a log.
-    if policy.should_log_upstream(action):
+    # Before the transform, not after: with `reidentify` this is the form the
+    # upstream server returned, still carrying tokens, and the transformed
+    # version has the original values back in it. With `deidentify` it is the
+    # other way round: the upstream returned the original values, so there is
+    # no safe snapshot to log and `should_log_upstream` says no.
+    if _may_log_upstream(policy, "response", server, tool):
         _log_upstream("response", server, tool, result)
 
     try:
@@ -361,13 +367,36 @@ def _remaining_seconds(context):
     return lambda: getter() / 1000.0
 
 
+#: Set once the "policy asks for payload logging but the stack forbids it"
+#: warning has been logged, so a busy tool does not repeat it on every call.
+_payload_logging_refusal_logged = False
+
+
+def _may_log_upstream(policy: Policy, direction: str, server: str, tool: str) -> bool:
+    """Both gates on upstream payload logging: the stack's, then the policy's."""
+    global _payload_logging_refusal_logged
+
+    if not policy.should_log_upstream(direction):
+        return False
+    if settings.upstream_payload_logging_allowed():
+        return True
+    if not _payload_logging_refusal_logged:
+        logger.warning(
+            "upstream_payload_logging_refused server=%s tool=%s reason=%s",
+            server, tool, "logUpstreamPayloads is on but ALLOW_UPSTREAM_PAYLOAD_LOGGING is not true",
+        )
+        _payload_logging_refusal_logged = True
+    return False
+
+
 def _log_upstream(direction: str, server: str, tool: str, node) -> None:
     """Log the upstream-facing form of a payload.
 
-    Callers must gate this on `Policy.should_log_upstream`, which is what knows
-    whether the payload is the tokenized side. This function masks credential
-    fields (which `scope.excludeKeys` keeps out of tokenization on purpose) and
-    serializes; it changes nothing about the payload itself.
+    Callers must gate this on `_may_log_upstream`, whose policy half is what
+    knows whether the payload is the tokenized side. This function masks
+    credential fields (which `scope.excludeKeys` keeps out of tokenization on
+    purpose) and PII-shaped values that detection missed, then serializes; it
+    changes nothing about the payload itself.
     """
     try:
         rendered = json.dumps(logsafe.redact_for_log(node), default=str)[:MAX_LOGGED_PAYLOAD]
