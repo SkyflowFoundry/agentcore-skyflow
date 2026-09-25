@@ -184,9 +184,13 @@ class InterceptorTestCase(unittest.TestCase):
 
     # -- payload shapes --------------------------------------------------
 
-    def test_http_payload_passes_through(self):
+    def test_http_payload_is_blocked_by_default(self):
+        """SC-16091: an HTTP-shaped event cannot be redacted, so it is refused.
+
+        Passing it through was the old behaviour; see test_http_payloads.py.
+        """
         out = handler.lambda_handler({"http": {"gatewayRequest": {"body": "eyJhIjoxfQ=="}}}, None)
-        self.assertEqual(out, {"interceptorOutputVersion": "1.0", "http": {}})
+        self.assertEqual(out["http"]["transformedGatewayResponse"]["statusCode"], 403)
 
     def test_round_trip_request_then_response(self):
         original = "contact Jane Doe jane@example.com"

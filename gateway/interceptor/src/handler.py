@@ -11,8 +11,11 @@ Payload shapes (see gateway-interceptors-types in the AgentCore docs):
 - MCP targets   -> `event["mcp"]`, bodies are parsed JSON-RPC objects.
 - HTTP targets  -> `event["http"]`, bodies are base64-encoded strings. This
   covers AgentCore Runtime targets, `passthrough` targets, and inference
-  targets. Not handled here: prefer an `mcpServer` target so tool calls arrive
-  as parsed MCP. HTTP events pass through untouched.
+  targets. They carry no tool identity and no MCP framing, so nothing here can
+  redact them. They are blocked unless the policy sets
+  `httpPayloads.action: passthrough`, which lets them through uninspected and
+  says so at WARNING on every call. Prefer an `mcpServer` target so tool calls
+  arrive as parsed MCP.
 
 Behaviour worth knowing:
 
@@ -40,6 +43,7 @@ Logging (see `logsafe` for the guards):
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
@@ -83,14 +87,76 @@ def lambda_handler(event: dict, context) -> dict:
         return _on_request(mcp, context)
 
     if "http" in event:
-        # AgentCore Runtime, passthrough and inference targets. Bodies are
-        # base64 and carry no MCP framing, so there is no tool identity to
-        # match policy against. Pass through rather than guess.
-        logger.info("http_payload_passthrough")
-        return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
+        return _on_http(event.get("http") or {})
 
     logger.warning("unknown_payload_shape keys=%s", sorted(event.keys()))
     return {"interceptorOutputVersion": OUTPUT_VERSION, "mcp": {}}
+
+
+# ---------------------------------------------------------------- http shape
+
+
+def _on_http(http: dict) -> dict:
+    """Block or pass an HTTP-shaped event, as `httpPayloads.action` says.
+
+    AgentCore Runtime, passthrough and inference targets. Bodies are base64 and
+    carry no MCP framing, so there is no tool call to find and nothing to
+    redact. Passing them through silently would make a target the interceptor
+    never inspects look exactly like a protected one, so the default is to
+    refuse, and an explicit passthrough is logged at WARNING on every call.
+    """
+    direction = "response" if http.get("gatewayResponse") else "request"
+    target = _http_target(http)
+
+    try:
+        action = settings.load_policy().http_payloads
+    except Exception:
+        logger.exception("policy_load_failed direction=%s shape=http", direction)
+        return _http_blocked("Interceptor policy unavailable")
+
+    if action == "passthrough":
+        logger.warning(
+            "http_payload_passthrough direction=%s target=%s reason=%s",
+            direction, target, "httpPayloads.action is passthrough; body not inspected",
+        )
+        return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
+
+    logger.warning("http_payload_blocked direction=%s target=%s", direction, target)
+    return _http_blocked(
+        "This gateway target is not protected by the Skyflow interceptor, so the call "
+        "was blocked. Use an MCP target, or set httpPayloads.action to passthrough."
+    )
+
+
+def _http_target(http: dict) -> str:
+    """The target name from an HTTP request path, for a log line.
+
+    Only the first segment (`/my-target/invocations` gives `my-target`): the
+    rest of a passthrough path is the caller's, and could carry user data. A
+    response event has no request in it, so its target is unknown.
+    """
+    path = (http.get("gatewayRequest") or {}).get("path") or ""
+    return path.lstrip("/").split("/", 1)[0] or "<unknown>"
+
+
+def _http_blocked(message: str) -> dict:
+    """Answer an HTTP-shaped event with a 403 instead of the target's traffic.
+
+    On a request this short-circuits: the gateway returns it without calling
+    the target, and does not run the RESPONSE interceptor. On a response it
+    replaces what the target returned.
+    """
+    body = json.dumps({"error": {"code": "SENSITIVE_DATA_UNINSPECTED", "message": message}})
+    return {
+        "interceptorOutputVersion": OUTPUT_VERSION,
+        "http": {
+            "transformedGatewayResponse": {
+                "statusCode": 403,
+                "contentType": "application/json",
+                "body": base64.b64encode(body.encode()).decode(),
+            }
+        },
+    }
 
 
 # ------------------------------------------------------------- request path

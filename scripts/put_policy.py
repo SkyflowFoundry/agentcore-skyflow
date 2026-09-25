@@ -34,6 +34,7 @@ def describe(policy_set: PolicySet) -> None:
           f"response={d.response.action}/{d.response.token_type} "
           f"onError={d.failure.on_error}")
     print(f"  entities: {', '.join(d.entities)}")
+    print(f"  http payloads: {policy_set.http_payloads}")
     for i, ov in enumerate(policy_set.overrides):
         resolved = policy_set.resolve_override(ov)
         print(f"  override[{i}]: servers={list(ov.servers)} tools={list(ov.tools)} "

@@ -61,6 +61,7 @@ redeploying the function.
     "failure":  { "onError": "fail_closed" }
   },
   "toolNameSeparator": "___",
+  "httpPayloads": { "action": "block" },
   "overrides": [
     { "servers": ["exa"], "tools": ["get_code_context*"],
       "request": { "action": "none" }, "response": { "action": "none" } }
@@ -76,6 +77,7 @@ redeploying the function.
 | `scope` | Which strings are eligible: key globs plus a minimum length |
 | `failure.onError` | `fail_closed` blocks the call; `fail_open` passes the original through |
 | `overrides` | `servers` **and** `tools` fnmatch globs; first match wins; whole sub-blocks replace |
+| `httpPayloads.action` | `block` (default) or `passthrough`, for HTTP-shaped targets the interceptor cannot redact. Gateway-wide; see below |
 
 ### The two directions
 
@@ -87,6 +89,27 @@ round-trips and is therefore verifiable end to end.
 sees real data; the model context never does. Useful when results carry PII the
 agent has no need to read — the shipped policy applies this to Exa's
 `web_fetch_exa` tool, whose result is scraped web content.
+
+### HTTP-shaped targets are blocked
+
+AgentCore Runtime, `passthrough` and inference targets reach the interceptor as
+`event["http"]`: a base64 body with no MCP framing, so there is no tool call to
+match a policy against and nothing to redact. The interceptor therefore
+refuses them by default. A request is answered with a 403 whose error code is
+`SENSITIVE_DATA_UNINSPECTED`, before the target is called, and a response is
+replaced with the same. Each refusal logs `http_payload_blocked` at WARNING
+with the target name (the first path segment only).
+
+To accept that such a target is not protected, set
+`"httpPayloads": {"action": "passthrough"}`. Its traffic then goes through
+untouched, and every call logs `http_payload_passthrough` at WARNING so the
+gap stays visible. The stack turns both log lines into the
+`SkyflowInterceptor/HttpPayloadBlocked` and `HttpPayloadPassthrough` metrics
+for alarming.
+
+The setting is gateway-wide rather than per tool. An HTTP response event
+carries no request, so on the way back there is no target name to match an
+override against, and a per-target rule could only be half enforced.
 
 ### Validation rule
 
@@ -586,6 +609,7 @@ uv run --with boto3 python -m unittest discover \
 
 | Suite | Covers |
 | --- | --- |
+| `test_http_payloads.py` | HTTP-shaped events (SC-16091): blocked by default on both directions, explicit passthrough, WARNING logs without bodies or full paths, policy parsing |
 | `test_handler.py` | Dispatch, direction routing, overrides, fail-closed/open, streaming, round trip |
 | `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |

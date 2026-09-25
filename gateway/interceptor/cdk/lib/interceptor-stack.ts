@@ -105,6 +105,22 @@ export class InterceptorStack extends cdk.Stack {
       },
     });
 
+    // One data point per HTTP-shaped event, so an HTTP target being blocked,
+    // or let through uninspected, shows up as a metric that can be alarmed on
+    // rather than only as a log line.
+    for (const [id, term] of [
+      ['HttpPayloadBlocked', 'http_payload_blocked'],
+      ['HttpPayloadPassthrough', 'http_payload_passthrough'],
+    ]) {
+      new logs.MetricFilter(this, `${id}Metric`, {
+        logGroup,
+        metricNamespace: 'SkyflowInterceptor',
+        metricName: id,
+        filterPattern: logs.FilterPattern.literal(`"${term}"`),
+        metricValue: '1',
+      });
+    }
+
     this.policyParameter.grantRead(this.interceptorFunction);
     skyflowSecret.grantRead(this.interceptorFunction);
 
