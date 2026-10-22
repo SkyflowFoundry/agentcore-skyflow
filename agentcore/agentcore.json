@@ -108,7 +108,7 @@
                 "properties": {
                   "key": {
                     "type": "string",
-                    "description": "The document key, for example samples/claim-note.txt"
+                    "description": "The document key, for example samples/dispute-case-note.txt"
                   },
                   "expires_in": {
                     "type": "integer",

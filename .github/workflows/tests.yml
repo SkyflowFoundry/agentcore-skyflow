@@ -42,6 +42,14 @@ jobs:
         # policy that would fail at runtime fails the build instead.
         run: python3 scripts/put_policy.py --dry-run
 
+      - name: Validate every demo policy state
+        # The recording runbook switches the live policy with these; each is
+        # derived from the shipped policy, so a change there could break one.
+        run: |
+          for state in show-upstream-search one-way-documents reset; do
+            python3 scripts/demo_policy.py "$state" --dry-run
+          done
+
   flow:
     name: Flow agent unit tests
     runs-on: ubuntu-latest
