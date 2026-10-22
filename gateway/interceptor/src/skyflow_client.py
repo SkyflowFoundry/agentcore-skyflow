@@ -325,12 +325,15 @@ class SkyflowClient:
 
         while attempt < attempts:
             attempt += 1
+            # Captured per attempt: string fields are transformed in parallel
+            # on one client, so another thread may swap the key mid-flight.
+            used_key = self._api_key
             req = urllib.request.Request(
                 url,
                 data=payload,
                 method=method,
                 headers={
-                    "Authorization": f"Bearer {self._api_key}",
+                    "Authorization": f"Bearer {used_key}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
@@ -345,7 +348,9 @@ class SkyflowClient:
                     key_refreshed = True
                     exc.close()
                     fresh = self._refresh_api_key()
-                    if fresh and fresh != self._api_key:
+                    # Compared with the key this request sent, not the shared
+                    # attribute, which a parallel call may already have updated.
+                    if fresh and fresh != used_key:
                         self._api_key = fresh
                         attempt -= 1
                         continue

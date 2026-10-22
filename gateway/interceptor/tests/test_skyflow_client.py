@@ -204,6 +204,20 @@ class KeyRotationTestCase(unittest.TestCase):
                 c.deidentify("x", ["name"])
         self.assertEqual(calls, [1])
 
+    def test_a_key_another_call_already_refreshed_is_still_retried(self):
+        """Fields are transformed in parallel on one client. If another call
+        swapped the key while this one was in flight, the refreshed key differs
+        from the one this request sent, and it must retry rather than give up."""
+        c = client(refresh_api_key=lambda: "new-key")
+
+        def first_call(request, timeout):
+            c._api_key = "new-key"  # a parallel call got there first
+            raise http_error(401)
+
+        calls = iter([first_call, lambda request, timeout: response({"processed_text": "ok"})])
+        with mock.patch("urllib.request.urlopen", side_effect=lambda request, timeout: next(calls)(request, timeout)):
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+
     def test_without_a_refresher_a_401_fails_as_before(self):
         with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)]):
             with self.assertRaisesRegex(SkyflowError, "status 401"):
