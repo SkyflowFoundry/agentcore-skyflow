@@ -171,5 +171,79 @@ class ErrorDisclosureTestCase(unittest.TestCase):
         )
 
 
+class KeyRotationTestCase(unittest.TestCase):
+    """A 401 re-reads the key once, so a rotated secret does not mean an outage."""
+
+    def test_a_401_refreshes_the_key_and_retries(self):
+        refreshed = []
+        c = client(refresh_api_key=lambda: refreshed.append(1) or "new-key")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http_error(401), response({"processed_text": "ok"})]) as urlopen:
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+        self.assertEqual(refreshed, [1])
+        self.assertEqual(urlopen.call_args_list[1][0][0].get_header("Authorization"), "Bearer new-key")
+
+    def test_the_refresh_does_not_spend_a_retry(self):
+        c = client(max_retries=0, refresh_api_key=lambda: "new-key")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http_error(401), response({"processed_text": "ok"})]):
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+
+    def test_an_unchanged_key_fails_without_looping(self):
+        c = client(refresh_api_key=lambda: "test-key")
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)]) as urlopen:
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                c.deidentify("x", ["name"])
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_a_second_401_is_not_refreshed_again(self):
+        calls = []
+        c = client(refresh_api_key=lambda: calls.append(1) or f"key-{len(calls)}")
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401), http_error(401)]):
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                c.deidentify("x", ["name"])
+        self.assertEqual(calls, [1])
+
+    def test_without_a_refresher_a_401_fails_as_before(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)]):
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                client().deidentify("x", ["name"])
+
+
+class FileErrorDetailTestCase(unittest.TestCase):
+    """File endpoint errors are readable; string endpoint errors stay opaque."""
+
+    SIGNED = "https://bucket.s3.amazonaws.com/doc.txt?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA"
+
+    def test_a_file_submit_error_carries_the_reason(self):
+        body = '{"error":{"message":"Missing Destination for entity NAME in DetectConfigV2"}}'
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        self.assertIn("Missing Destination for entity NAME", str(caught.exception))
+
+    def test_a_url_in_the_body_is_cut_to_its_host(self):
+        body = f'{{"error":"could not fetch {self.SIGNED}"}}'
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        message = str(caught.exception)
+        self.assertIn("bucket.s3.amazonaws.com", message)
+        self.assertNotIn("deadbeef", message)
+        self.assertNotIn("AKIA", message)
+
+    def test_a_long_body_is_capped(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, "x" * 5000)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        self.assertLess(len(str(caught.exception)), 400)
+
+    def test_a_string_endpoint_body_is_still_withheld(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, "Jane Doe was here")]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify("Jane Doe was here", ["name"])
+        self.assertNotIn("Jane", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

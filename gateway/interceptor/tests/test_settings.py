@@ -33,10 +33,23 @@ class FakeSsm:
     def __init__(self, value):
         self.value = value
         self.calls = 0
+        self.error: Exception | None = None
 
     def get_parameter(self, Name):  # noqa: N803 - boto3 casing
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         return {"Parameter": {"Value": self.value}}
+
+
+class Clock:
+    """Stands in for time.monotonic so cache ages are exact."""
+
+    def __init__(self, now: float = 1000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class FakeSecrets:
@@ -55,6 +68,7 @@ class SettingsTestCase(unittest.TestCase):
         # each test starts from a cold one.
         settings._policy_cache = None
         settings._api_key_cache = None
+        settings._api_key_refreshed_at = None
 
 
 class PolicyCacheTestCase(SettingsTestCase):
@@ -104,6 +118,82 @@ class PolicyCacheTestCase(SettingsTestCase):
                 settings.load_policy()
 
 
+class StalePolicyTestCase(SettingsTestCase):
+    """A failed refresh keeps the last good policy serving, for a while.
+
+    Without this, one SSM throttle or one bad publish blocks every tool call
+    on every warm Lambda until someone fixes it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.clock = Clock()
+        self.ssm = FakeSsm(json.dumps(POLICY))
+        patches = [
+            mock.patch.object(settings.time, "monotonic", self.clock),
+            mock.patch.object(settings, "_ssm_client", return_value=self.ssm),
+            mock.patch.dict(os.environ, {"POLICY_CACHE_TTL_SECONDS": "60", "POLICY_MAX_STALE_SECONDS": "600"}),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.good = settings.load_policy()
+
+    def expire(self, seconds: float = 61):
+        self.clock.now += seconds
+
+    def test_an_ssm_failure_serves_the_last_good_policy(self):
+        self.expire()
+        self.ssm.error = RuntimeError("ThrottlingException")
+        with self.assertLogs(settings.logger, level="WARNING") as logs:
+            self.assertIs(settings.load_policy(), self.good)
+        self.assertIn("action=serving_last_good", logs.output[0])
+
+    def test_a_bad_publish_serves_the_last_good_policy(self):
+        self.expire()
+        self.ssm.value = "{not json"
+        with self.assertLogs(settings.logger, level="WARNING"):
+            self.assertIs(settings.load_policy(), self.good)
+
+    def test_a_failing_ssm_is_not_asked_on_every_call(self):
+        self.expire()
+        self.ssm.error = RuntimeError("ThrottlingException")
+        with self.assertLogs(settings.logger, level="WARNING"):
+            settings.load_policy()
+        calls = self.ssm.calls
+        self.clock.now += settings.POLICY_RETRY_SECONDS - 1
+        settings.load_policy()
+        self.assertEqual(self.ssm.calls, calls, "no retry inside the retry window")
+        self.clock.now += 2
+        with self.assertLogs(settings.logger, level="WARNING"):
+            settings.load_policy()
+        self.assertEqual(self.ssm.calls, calls + 1, "retries once the window passes")
+
+    def test_recovery_replaces_the_stale_policy(self):
+        self.expire()
+        self.ssm.error = RuntimeError("ThrottlingException")
+        with self.assertLogs(settings.logger, level="WARNING"):
+            settings.load_policy()
+        self.ssm.error = None
+        self.ssm.value = json.dumps({"defaults": {"request": {"action": "none"}}})
+        self.clock.now += settings.POLICY_RETRY_SECONDS + 1
+        self.assertEqual(settings.load_policy().resolve("x", "y").request.action, "none")
+
+    def test_too_stale_fails_closed(self):
+        self.ssm.error = RuntimeError("ThrottlingException")
+        self.expire(601)
+        with self.assertLogs(settings.logger, level="ERROR") as logs:
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+        self.assertIn("action=fail_closed", logs.output[0])
+
+    def test_nothing_cached_still_raises(self):
+        settings._policy_cache = None
+        self.ssm.error = RuntimeError("ThrottlingException")
+        with self.assertRaises(RuntimeError):
+            settings.load_policy()
+
+
 class ApiKeyTestCase(SettingsTestCase):
     def test_bare_string_secret(self):
         with mock.patch.object(settings, "_secrets_client", return_value=FakeSecrets("  sky-abc123  ")):
@@ -137,6 +227,37 @@ class ApiKeyTestCase(SettingsTestCase):
         self.assertEqual(fake.calls, 1, "the key is long lived; fetch it once")
 
 
+class ApiKeyRefreshTestCase(SettingsTestCase):
+    def test_refresh_rereads_the_secret(self):
+        fake = FakeSecrets("sky-old")
+        with mock.patch.object(settings, "_secrets_client", return_value=fake):
+            settings.load_api_key()
+            fake.stored = "sky-new"
+            with self.assertLogs(settings.logger, level="WARNING") as logs:
+                self.assertEqual(settings.refresh_api_key(), "sky-new")
+        self.assertIn("changed=True", logs.output[0])
+        self.assertEqual(settings.load_api_key(), "sky-new", "the new key is cached")
+
+    def test_refresh_is_rate_limited(self):
+        """A key that is wrong rather than rotated must not turn every call
+        into a Secrets Manager read."""
+        fake = FakeSecrets("sky-old")
+        clock = Clock()
+        with mock.patch.object(settings, "_secrets_client", return_value=fake), \
+                mock.patch.object(settings.time, "monotonic", clock):
+            settings.load_api_key()
+            with self.assertLogs(settings.logger, level="WARNING"):
+                settings.refresh_api_key()
+            reads = fake.calls
+            clock.now += settings.API_KEY_REFRESH_INTERVAL_SECONDS - 1
+            settings.refresh_api_key()
+            self.assertEqual(fake.calls, reads)
+            clock.now += 2
+            with self.assertLogs(settings.logger, level="WARNING"):
+                settings.refresh_api_key()
+            self.assertEqual(fake.calls, reads + 1)
+
+
 class ClientConstructionTestCase(SettingsTestCase):
     def test_build_client_wires_env_and_key(self):
         with mock.patch.object(settings, "_secrets_client", return_value=FakeSecrets("sky-abc123")):
@@ -144,6 +265,18 @@ class ClientConstructionTestCase(SettingsTestCase):
         self.assertEqual(client._vault_url, "https://test.vault.skyflowapis.com")
         self.assertEqual(client._vault_id, "vault123")
         self.assertEqual(client._api_key, "sky-abc123")
+        self.assertIs(client._refresh_api_key, settings.refresh_api_key)
+
+    def test_timeout_comes_from_the_environment(self):
+        with mock.patch.object(settings, "_secrets_client", return_value=FakeSecrets("k")), \
+                mock.patch.dict(os.environ, {"SKYFLOW_TIMEOUT_SECONDS": "12.5"}):
+            self.assertEqual(settings.build_client()._timeout, 12.5)
+
+    def test_timeout_defaults_to_five_seconds(self):
+        with mock.patch.object(settings, "_secrets_client", return_value=FakeSecrets("k")), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKYFLOW_TIMEOUT_SECONDS", None)
+            self.assertEqual(settings.build_client()._timeout, 5.0)
 
     def test_boto_clients_are_not_built_at_import(self):
         """Building a client at import resolves credentials eagerly and makes

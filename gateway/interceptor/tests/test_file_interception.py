@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -793,6 +794,18 @@ class TextBlockStringInteractionTestCase(unittest.TestCase):
         body = self.body({"url": ORIGINAL, "note": "Jane Doe called"})
         self.assertIn("error", body)
         self.assertNotIn("result", body)
+
+
+class NoContextDeadlineTestCase(unittest.TestCase):
+    """Without a Lambda context the polling budget must still run out."""
+
+    def test_the_budget_shrinks_and_reaches_zero(self):
+        now = [500.0]
+        with mock.patch.object(handler.time, "monotonic", lambda: now[0]):
+            remaining = handler._remaining_seconds(None)
+            self.assertAlmostEqual(remaining(), handler.NO_CONTEXT_BUDGET_SECONDS)
+            now[0] += handler.NO_CONTEXT_BUDGET_SECONDS + 1
+            self.assertLess(remaining(), 0)
 
 
 if __name__ == "__main__":

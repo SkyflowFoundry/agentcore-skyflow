@@ -26,6 +26,14 @@ export interface InterceptorStackProps extends cdk.StackProps {
    * deploy, so this keeps payload logging a deliberate, deployed decision.
    */
   readonly allowUpstreamPayloadLogging?: boolean;
+  /**
+   * Seconds the last good policy keeps serving while SSM cannot be read or
+   * holds a policy that does not parse. After that the interceptor fails
+   * closed. Default 3600.
+   */
+  readonly policyMaxStaleSeconds?: number;
+  /** Per-request timeout for Skyflow calls, in seconds. Default 5. */
+  readonly skyflowTimeoutSeconds?: number;
 }
 
 /**
@@ -102,6 +110,8 @@ export class InterceptorStack extends cdk.Stack {
         SKYFLOW_VAULT_ID: props.skyflowVaultId,
         POLICY_CACHE_TTL_SECONDS: String(props.policyCacheTtlSeconds ?? 60),
         ALLOW_UPSTREAM_PAYLOAD_LOGGING: String(props.allowUpstreamPayloadLogging ?? false),
+        POLICY_MAX_STALE_SECONDS: String(props.policyMaxStaleSeconds ?? 3600),
+        SKYFLOW_TIMEOUT_SECONDS: String(props.skyflowTimeoutSeconds ?? 5),
       },
     });
 

@@ -111,6 +111,27 @@ The setting is gateway-wide rather than per tool. An HTTP response event
 carries no request, so on the way back there is no target name to match an
 override against, and a per-target rule could only be half enforced.
 
+### When SSM or Skyflow misbehaves
+
+- **A failed policy refresh serves the last good policy.** If SSM throttles, or
+  someone publishes a policy that does not parse, the Lambda keeps using the
+  policy it last loaded and logs `policy_refresh_failed ...
+  action=serving_last_good`. It asks SSM again after ten seconds rather than on
+  every call. After `POLICY_MAX_STALE_SECONDS` (default one hour, CDK context
+  `policyMaxStaleSeconds`) it stops and fails closed. A cold Lambda with no
+  policy at all always fails closed.
+- **A rotated API key is picked up on the first 401.** The client re-reads the
+  secret once and retries. A key that is simply wrong is re-read at most once
+  every thirty seconds, so a bad key cannot turn every call into a Secrets
+  Manager read.
+- **File endpoint errors are readable.** A Detect v2 error such as `Missing
+  Destination for entity NAME` reaches the log, with any URL in it cut to its
+  host because a presigned URL's query string is a credential. String endpoint
+  errors stay opaque because their bodies can echo the submitted text.
+- **The Skyflow timeout is configurable.** `SKYFLOW_TIMEOUT_SECONDS`, default
+  five, CDK context `skyflowTimeoutSeconds`. Raise it if large fetched pages
+  fail closed on a slow vault.
+
 ### Validation rule
 
 Re-identify only resolves **vault tokens**. Counter tokens cannot be reversed,
@@ -614,7 +635,7 @@ uv run --with boto3 python -m unittest discover \
 | `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
-| `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
+| `test_settings.py` | Policy cache TTL, serving the last good policy, API key parsing and refresh, lazy boto3 construction |
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
 | `test_file_url_safety.py` | The file URL allowlist (SC-16092): pattern parsing, wildcard confinement, parser-confusion URLs, non-public addresses, no redirects or non-HTTPS handlers in the probe |
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |

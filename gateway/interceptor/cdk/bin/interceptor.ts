@@ -72,6 +72,9 @@ function resolveEnv(): { account: string; region: string } {
  *   account / region  override aws-targets.json entirely
  *   allowUpstreamPayloadLogging  true to let the policy's logUpstreamPayloads
  *                     take effect (default false: the flag is ignored)
+ *   policyMaxStaleSeconds  how long the last good policy serves while SSM
+ *                     cannot be read (default 3600)
+ *   skyflowTimeoutSeconds  per-request Skyflow timeout (default 5)
  */
 function required(name: string): string {
   const value = app.node.tryGetContext(name);
@@ -91,4 +94,6 @@ new InterceptorStack(app, 'SkyflowInterceptorStack', {
   policyCacheTtlSeconds: Number(app.node.tryGetContext('policyCacheTtlSeconds') ?? 60),
   // Context arrives as the string "true" from -c, or a boolean from cdk.json.
   allowUpstreamPayloadLogging: String(app.node.tryGetContext('allowUpstreamPayloadLogging') ?? false) === 'true',
+  policyMaxStaleSeconds: Number(app.node.tryGetContext('policyMaxStaleSeconds') ?? 3600),
+  skyflowTimeoutSeconds: Number(app.node.tryGetContext('skyflowTimeoutSeconds') ?? 5),
 });
