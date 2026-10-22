@@ -78,6 +78,9 @@ function resolveEnv(): { account: string; region: string } {
  *   policyParameterName  SSM parameter for the policy
  *                     (default /agentcore/interceptor/skyflow-policy)
  *   policyParameterTier  standard (4 KB, default) or advanced (8 KB)
+ *   logRetentionDays  days to keep interceptor logs (default 30)
+ *   metricNamespace   CloudWatch namespace for metrics (default SkyflowInterceptor)
+ *   alarmTopicArn     SNS topic the alarms notify (default: none)
  *   stackName         CloudFormation stack name (default SkyflowInterceptorStack);
  *                     set it, with policyParameterName, for a second deployment
  *                     in the same account and region
@@ -109,4 +112,7 @@ new InterceptorStack(app, app.node.tryGetContext('stackName') ?? 'SkyflowInterce
   skyflowTimeoutSeconds: Number(app.node.tryGetContext('skyflowTimeoutSeconds') ?? 5),
   policyParameterName: app.node.tryGetContext('policyParameterName'),
   policyParameterTier: tier,
+  logRetentionDays: Number(app.node.tryGetContext('logRetentionDays') ?? 30),
+  metricNamespace: app.node.tryGetContext('metricNamespace'),
+  alarmTopicArn: app.node.tryGetContext('alarmTopicArn'),
 });

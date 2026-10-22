@@ -1,9 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 
@@ -42,7 +45,35 @@ export interface InterceptorStackProps extends cdk.StackProps {
   readonly policyParameterName?: string;
   /** `standard` (4 KB, the default) or `advanced` (8 KB, billed). */
   readonly policyParameterTier?: 'standard' | 'advanced';
+  /** Days to keep the interceptor's logs. Default 30. */
+  readonly logRetentionDays?: number;
+  /**
+   * CloudWatch namespace for the interceptor's metrics. Default
+   * SkyflowInterceptor. Give a second deployment in the same account its own,
+   * or its alarms will count the first one's failures too.
+   */
+  readonly metricNamespace?: string;
+  /** SNS topic the alarms notify. Without one they still change state. */
+  readonly alarmTopicArn?: string;
 }
+
+/**
+ * Log terms that become metrics. Each name is the metric, each list the log
+ * terms that count towards it. The handler and settings modules emit these
+ * terms, and tests in gateway/interceptor/tests pin them.
+ */
+const METRICS: Array<[string, string[], string | null]> = [
+  // [metric, log terms, alarm description or null for no alarm]
+  ['FailClosed', ['request_fail_closed', 'response_fail_closed'],
+    'A tool call was blocked because de-identification could not complete.'],
+  ['FailOpen', ['request_fail_open', 'response_fail_open'],
+    'A tool call went through unprotected because a fail_open rule hit an error.'],
+  ['PolicyUnavailable', ['policy_load_failed', 'policy_refresh_failed'],
+    'The interceptor could not read its policy from SSM and is serving a stale one or failing closed.'],
+  ['HttpPayloadBlocked', ['http_payload_blocked'], null],
+  ['HttpPayloadPassthrough', ['http_payload_passthrough'],
+    'An HTTP-shaped target was let through uninspected.'],
+];
 
 /**
  * Skyflow de-identify/re-identify interceptor for an AgentCore Gateway.
@@ -98,8 +129,12 @@ export class InterceptorStack extends cdk.Stack {
       props.skyflowSecretName,
     );
 
+    const retentionDays = props.logRetentionDays ?? 30;
+    if (!(Object.values(logs.RetentionDays) as number[]).includes(retentionDays)) {
+      throw new Error(`logRetentionDays ${retentionDays} is not a retention CloudWatch Logs accepts`);
+    }
     const logGroup = new logs.LogGroup(this, 'InterceptorLogs', {
-      retention: logs.RetentionDays.ONE_WEEK,
+      retention: retentionDays as logs.RetentionDays,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
@@ -122,6 +157,9 @@ export class InterceptorStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(300),
       memorySize: 512,
       logGroup,
+      // Active tracing records each interceptor invocation, with its Skyflow
+      // calls as time spent, in X-Ray and CloudWatch Application Signals.
+      tracing: lambda.Tracing.ACTIVE,
       environment: {
         POLICY_PARAMETER_NAME: this.policyParameter.parameterName,
         SKYFLOW_SECRET_ARN: skyflowSecret.secretArn,
@@ -134,20 +172,36 @@ export class InterceptorStack extends cdk.Stack {
       },
     });
 
-    // One data point per HTTP-shaped event, so an HTTP target being blocked,
-    // or let through uninspected, shows up as a metric that can be alarmed on
-    // rather than only as a log line.
-    for (const [id, term] of [
-      ['HttpPayloadBlocked', 'http_payload_blocked'],
-      ['HttpPayloadPassthrough', 'http_payload_passthrough'],
-    ]) {
-      new logs.MetricFilter(this, `${id}Metric`, {
+    // One data point per decision worth watching, so a blocked call, an
+    // unprotected one or a missing policy shows up as a metric that can be
+    // alarmed on rather than only as a log line.
+    const namespace = props.metricNamespace ?? 'SkyflowInterceptor';
+    const alarmTopic = props.alarmTopicArn
+      ? sns.Topic.fromTopicArn(this, 'AlarmTopic', props.alarmTopicArn)
+      : undefined;
+    for (const [name, terms, alarmDescription] of METRICS) {
+      const filter = new logs.MetricFilter(this, `${name}Metric`, {
         logGroup,
-        metricNamespace: 'SkyflowInterceptor',
-        metricName: id,
-        filterPattern: logs.FilterPattern.literal(`"${term}"`),
+        metricNamespace: namespace,
+        metricName: name,
+        filterPattern: logs.FilterPattern.anyTerm(...terms),
         metricValue: '1',
       });
+      if (!alarmDescription) {
+        continue;
+      }
+      const alarm = new cloudwatch.Alarm(this, `${name}Alarm`, {
+        alarmDescription,
+        metric: filter.metric({ statistic: 'Sum', period: cdk.Duration.minutes(5) }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        // No log line means nothing went wrong, not that data is missing.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      if (alarmTopic) {
+        alarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+      }
     }
 
     this.policyParameter.grantRead(this.interceptorFunction);

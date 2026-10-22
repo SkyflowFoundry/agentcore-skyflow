@@ -115,8 +115,8 @@ To accept that such a target is not protected, set
 `"httpPayloads": {"action": "passthrough"}`. Its traffic then goes through
 untouched, and every call logs `http_payload_passthrough` at WARNING so the
 gap stays visible. The stack turns both log lines into the
-`SkyflowInterceptor/HttpPayloadBlocked` and `HttpPayloadPassthrough` metrics
-for alarming.
+`SkyflowInterceptor/HttpPayloadBlocked` and `HttpPayloadPassthrough` metrics,
+and alarms on the second; see [Metrics and alarms](#metrics-and-alarms).
 
 The setting is gateway-wide rather than per tool. An HTTP response event
 carries no request, so on the way back there is no target name to match an
@@ -479,7 +479,8 @@ policy that depends on it.
 ## Logging
 
 Everything the interceptor writes goes to its CloudWatch log group, named by the
-`InterceptorLogGroupName` stack output, with one week of retention. There are
+`InterceptorLogGroupName` stack output, kept for 30 days by default (CDK
+context `logRetentionDays`). There are
 four settings that change what lands there, and one guarantee that holds under
 every combination of them.
 
@@ -609,7 +610,28 @@ Two limits worth stating plainly:
   "upstream" payload *is* the original, so logging it would write user data to
   CloudWatch. `Policy.should_log_upstream` enforces that, not the caller.
 
-Log retention on the interceptor group is one week.
+### Metrics and alarms
+
+The stack turns the log lines that matter into CloudWatch metrics in the
+`SkyflowInterceptor` namespace (CDK context `metricNamespace`), and alarms on
+any occurrence in a five-minute window.
+
+| Metric | Counts | Alarm |
+| --- | --- | --- |
+| `FailClosed` | Calls withheld because de-identification could not complete | Yes |
+| `FailOpen` | Calls let through unprotected by a `fail_open` rule after an error | Yes |
+| `PolicyUnavailable` | Policy loads that failed, and refreshes serving a stale policy | Yes |
+| `HttpPayloadBlocked` | HTTP-shaped events refused | No: blocking is the intended outcome |
+| `HttpPayloadPassthrough` | HTTP-shaped events let through uninspected | Yes |
+
+The alarms change state on their own. To be told, deploy with
+`-c alarmTopicArn=<SNS topic ARN>`. A test checks that every term a metric
+filter counts is still logged by the Lambda, so a renamed log line cannot
+silently disable an alarm.
+
+Active X-Ray tracing is on, so each invocation shows up in X-Ray and
+CloudWatch Application Signals with its duration, including time spent waiting
+on Skyflow.
 
 ## Verify a live gateway
 
@@ -681,6 +703,7 @@ uv run --with boto3 python -m unittest discover \
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged for each direction and action, and which must never be; the deploy-time gate |
+| `test_metric_terms.py` | Every log term the stack's metric filters count is still logged by the Lambda |
 | `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential and PII-shape masking in logged payloads, header scrubbing on entry |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).
