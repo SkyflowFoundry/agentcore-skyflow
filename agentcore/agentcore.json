@@ -36,7 +36,7 @@
       "protocolType": "MCP",
       "authorizerType": "AWS_IAM",
       "enableSemanticSearch": true,
-      "exceptionLevel": "DEBUG",
+      "exceptionLevel": "NONE",
       "targets": [
         {
           "name": "exa",

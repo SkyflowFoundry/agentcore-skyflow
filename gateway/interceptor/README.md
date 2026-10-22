@@ -90,6 +90,17 @@ sees real data; the model context never does. Useful when results carry PII the
 agent has no need to read — the shipped policy applies this to Exa's
 `web_fetch_exa` tool, whose result is scraped web content.
 
+Shield the model should mint **one-way** tokens, which is how the shipped rule
+is set. All rules share one vault, so a vault token minted here can be
+re-identified by any other rule whose response re-identifies. A tool that
+echoes its input back would then hand the scraped originals to the model.
+Counter tokens cannot be reversed by anything.
+
+Per-tool `entities` narrow what counts as sensitive for one tool. The shipped
+rule for `web_search_exa` leaves out `location`, so a search for a customer's
+dispute with a merchant in London still names London: the customer's name is
+what identifies them, and the city is what makes the search useful.
+
 ### HTTP-shaped targets are blocked
 
 AgentCore Runtime, `passthrough` and inference targets reach the interceptor as
@@ -383,7 +394,10 @@ one server or tool, or in `defaults` to cover everything.
     "action": "deidentify",
     "directions": ["response"],
     "fields": ["url", "content[*].url"],
-    "urlPatterns": ["https://my-bucket.s3.amazonaws.com/*"],
+    "urlPatterns": [
+      "https://my-bucket.s3.amazonaws.com/*",
+      "https://my-bucket.s3.*.amazonaws.com/*"
+    ],
     "maxFiles": 2,
     "configuration": { "detect": { "entities": [ ... ] } }
   }
@@ -396,6 +410,17 @@ one server or tool, or in `defaults` to cover everything.
 | `fields` | Where the reference is, relative to the tool's arguments or its result. `content[*].url` covers a list. Naming fields stops the scan. |
 | `urlPatterns` | **Required.** The allowlist of places a file may come from, as `https://host/path` globs. Every URL is checked against it before the interceptor fetches it or hands it to Skyflow. Also finds references when `fields` is absent, and flags strays when it is not. |
 | `maxFiles` | Cap per call. Each file is a separate run and they are processed in order. |
+
+S3 presigns on more than one host form. The default boto3 client uses the
+global `bucket.s3.amazonaws.com`; a client configured for virtual-hosted
+addressing uses `bucket.s3.<region>.amazonaws.com`, and a dual-stack client
+`bucket.s3.dualstack.<region>.amazonaws.com`. The allowlist fails the call when
+a URL matches none of its patterns, so list every form your store produces. The
+shipped rule lists all three.
+
+The shipped bucket pattern ends in `*` so the demo works in any account. Anyone
+can create a bucket whose name starts the same way, so in production name your
+bucket exactly.
 | `configuration` | Inline Detect configuration, forwarded as given with `vaultId` injected. Anything the Detect API accepts works here without a code change. |
 
 Configurations are inline rather than referenced by `configurationId`: a
@@ -612,6 +637,21 @@ back off, and redeploy without `allowUpstreamPayloadLogging` when you are done,
 for the reasons given in the section above.
 
 ## Iterating on policy
+
+`put_policy.py` publishes the policy minified and refuses one that would not
+fit the parameter. A Standard-tier SSM parameter holds 4 KB, and the dry run
+prints how much of it the policy uses. Past that, deploy the stack with
+`-c policyParameterTier=advanced` and publish with `--tier advanced` for 8 KB.
+Advanced parameters are billed.
+
+A second interceptor in the same account and region needs its own parameter
+and stack name, or the two overwrite each other's policy:
+
+```bash
+npx cdk deploy -c stackName=SkyflowInterceptorStaging \
+  -c policyParameterName=/agentcore/interceptor/staging-policy
+python3 scripts/put_policy.py --parameter-name /agentcore/interceptor/staging-policy
+```
 
 ```bash
 python3 scripts/put_policy.py --dry-run     # validate and print the effective rules

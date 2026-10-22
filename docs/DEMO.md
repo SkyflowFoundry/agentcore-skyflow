@@ -189,7 +189,11 @@ the third entry in `overrides`. It looks like this:
     "action": "deidentify",
     "directions": ["response"],
     "fields": ["content[*].text.url"],
-    "urlPatterns": ["https://agentcore-skyflow-files-*.s3.amazonaws.com/*"],
+    "urlPatterns": [
+      "https://agentcore-skyflow-files-*.s3.amazonaws.com/*",
+      "https://agentcore-skyflow-files-*.s3.*.amazonaws.com/*",
+      "https://agentcore-skyflow-files-*.s3.dualstack.*.amazonaws.com/*"
+    ],
     "maxFiles": 1,
     "tokenType": "vault_token",
     "destinations": {"default": "table1.{entity}_entity"}

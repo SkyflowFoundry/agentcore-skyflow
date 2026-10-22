@@ -21,7 +21,6 @@ from mcp_client.endpoints import (  # noqa: E402
     AUTH_AWS_IAM,
     AUTH_CUSTOM_JWT,
     AUTH_NONE,
-    EXAMPLE_MCP_ENDPOINT,
     Endpoint,
     discover_gateways,
     explicit_endpoints,
@@ -189,11 +188,15 @@ class ResolveEndpointsTestCase(unittest.TestCase):
         found = resolve_endpoints({**IN_PROJECT_ENV, "MCP_ENDPOINTS": "https://direct.example/mcp"})
         self.assertEqual([e.url for e in found], ["https://direct.example/mcp"])
 
-    def test_nothing_configured_falls_back_to_the_example_with_a_warning(self):
-        with self.assertLogs("mcp_client.endpoints", level="WARNING") as logs:
-            found = resolve_endpoints({})
-        self.assertEqual(found, [Endpoint(url=EXAMPLE_MCP_ENDPOINT, auth_type=AUTH_NONE, source="fallback")])
-        self.assertTrue(any("MCP_ENDPOINTS" in line for line in logs.output))
+    def test_nothing_configured_stops_the_agent(self):
+        """No silent fallback to a public server: that would take the gateway,
+        and the Skyflow interceptor with it, out of the path unnoticed."""
+        with self.assertRaisesRegex(RuntimeError, "MCP_ENDPOINTS"):
+            resolve_endpoints({})
+
+    def test_an_explicit_endpoint_still_works_without_a_gateway(self):
+        found = resolve_endpoints({"MCP_ENDPOINTS": "https://mcp.exa.ai/mcp"})
+        self.assertEqual([e.url for e in found], ["https://mcp.exa.ai/mcp"])
 
 
 if __name__ == "__main__":

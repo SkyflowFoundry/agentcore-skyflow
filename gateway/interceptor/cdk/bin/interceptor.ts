@@ -75,6 +75,12 @@ function resolveEnv(): { account: string; region: string } {
  *   policyMaxStaleSeconds  how long the last good policy serves while SSM
  *                     cannot be read (default 3600)
  *   skyflowTimeoutSeconds  per-request Skyflow timeout (default 5)
+ *   policyParameterName  SSM parameter for the policy
+ *                     (default /agentcore/interceptor/skyflow-policy)
+ *   policyParameterTier  standard (4 KB, default) or advanced (8 KB)
+ *   stackName         CloudFormation stack name (default SkyflowInterceptorStack);
+ *                     set it, with policyParameterName, for a second deployment
+ *                     in the same account and region
  */
 function required(name: string): string {
   const value = app.node.tryGetContext(name);
@@ -86,7 +92,12 @@ function required(name: string): string {
 
 const env = resolveEnv();
 
-new InterceptorStack(app, 'SkyflowInterceptorStack', {
+const tier = app.node.tryGetContext('policyParameterTier') ?? 'standard';
+if (tier !== 'standard' && tier !== 'advanced') {
+  throw new Error(`policyParameterTier must be standard or advanced, got '${tier}'`);
+}
+
+new InterceptorStack(app, app.node.tryGetContext('stackName') ?? 'SkyflowInterceptorStack', {
   env,
   skyflowVaultUrl: required('skyflowVaultUrl'),
   skyflowVaultId: required('skyflowVaultId'),
@@ -96,4 +107,6 @@ new InterceptorStack(app, 'SkyflowInterceptorStack', {
   allowUpstreamPayloadLogging: String(app.node.tryGetContext('allowUpstreamPayloadLogging') ?? false) === 'true',
   policyMaxStaleSeconds: Number(app.node.tryGetContext('policyMaxStaleSeconds') ?? 3600),
   skyflowTimeoutSeconds: Number(app.node.tryGetContext('skyflowTimeoutSeconds') ?? 5),
+  policyParameterName: app.node.tryGetContext('policyParameterName'),
+  policyParameterTier: tier,
 });

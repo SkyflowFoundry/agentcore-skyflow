@@ -148,6 +148,17 @@ Step 3 grants the gateway's service role two things. The first is
 is permission to read the caller's configuration bundle because `tools/list`
 fails without it when the caller is a runtime.
 
+**After every later `agentcore deploy`, confirm the interceptor is still
+attached.** The gateway is a CloudFormation resource that knows nothing about the
+interceptor, so check that a deploy has not left it without one:
+
+```bash
+python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+```
+
+It changes nothing and exits non-zero if the interceptor is missing at either
+point. Re-run step 3 if it is.
+
 ## Policy
 
 The policy lives at `gateway/interceptor/config/policy.json` and it is the source

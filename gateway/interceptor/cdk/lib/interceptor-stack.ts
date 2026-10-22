@@ -34,6 +34,14 @@ export interface InterceptorStackProps extends cdk.StackProps {
   readonly policyMaxStaleSeconds?: number;
   /** Per-request timeout for Skyflow calls, in seconds. Default 5. */
   readonly skyflowTimeoutSeconds?: number;
+  /**
+   * SSM parameter holding the policy. Defaults to
+   * /agentcore/interceptor/skyflow-policy; set it to run two interceptors in
+   * one account and region without them overwriting each other's policy.
+   */
+  readonly policyParameterName?: string;
+  /** `standard` (4 KB, the default) or `advanced` (8 KB, billed). */
+  readonly policyParameterTier?: 'standard' | 'advanced';
 }
 
 /**
@@ -63,14 +71,25 @@ export class InterceptorStack extends cdk.Stack {
     if (!fs.existsSync(policyPath)) {
       throw new Error(`Policy file not found at ${policyPath} (resolved from ${__dirname})`);
     }
-    const policyBody = fs.readFileSync(policyPath, 'utf8');
-    JSON.parse(policyBody); // fail synth on malformed policy rather than at runtime
+    // Parsing fails synth on malformed policy rather than at runtime, and the
+    // minified form is what is published, so whitespace does not spend the
+    // parameter's size limit. scripts/put_policy.py publishes the same form.
+    const policyBody = JSON.stringify(JSON.parse(fs.readFileSync(policyPath, 'utf8')));
+    const advanced = props.policyParameterTier === 'advanced';
+    const limit = advanced ? 8192 : 4096;
+    if (Buffer.byteLength(policyBody, 'utf8') > limit) {
+      throw new Error(
+        `Policy is ${Buffer.byteLength(policyBody, 'utf8')} bytes minified; the ` +
+          `${advanced ? 'Advanced' : 'Standard'} SSM tier allows ${limit}.` +
+          (advanced ? '' : ' Deploy with -c policyParameterTier=advanced to raise the limit to 8 KB.'),
+      );
+    }
 
     this.policyParameter = new ssm.StringParameter(this, 'RedactionPolicy', {
-      parameterName: '/agentcore/interceptor/skyflow-policy',
+      parameterName: props.policyParameterName ?? '/agentcore/interceptor/skyflow-policy',
       stringValue: policyBody,
       description: 'Skyflow interceptor redaction policy (per-server, per-tool)',
-      tier: ssm.ParameterTier.STANDARD,
+      tier: advanced ? ssm.ParameterTier.ADVANCED : ssm.ParameterTier.STANDARD,
     });
 
     const skyflowSecret = secretsmanager.Secret.fromSecretNameV2(
