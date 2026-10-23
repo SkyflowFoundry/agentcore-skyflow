@@ -41,6 +41,11 @@ SAFE_ERROR_BODY_PREFIXES = ("/v2/detect/",)
 #: Cap on a surfaced error body.
 MAX_ERROR_DETAIL = 300
 _URL = re.compile(r"""https?://([^/\s"'?#]+)[^\s"']*""")
+#: Signing parameters of a presigned URL, matched on their own as a backstop
+#: for a URL whose scheme or slashes arrived in a form `_URL` cannot see.
+_SIGNING_PARAM = re.compile(
+    r"""(?i)\b(x-amz-[a-z0-9-]+|signature|awsaccesskeyid|x-goog-[a-z0-9-]+|sig|se|sp|sv)=[^&\s"']*"""
+)
 
 #: File formats for which `VAULT_TOKEN` de-identification is supported, per the
 #: Detect v2 spec. Every other format — notably PDF, images and audio — can only
@@ -119,8 +124,16 @@ def _safe_error_detail(exc: urllib.error.HTTPError) -> str:
         raw = exc.read().decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - a diagnostic must not mask the real error
         return ""
-    text = " ".join(_URL.sub(r"https://\1/<redacted>", raw).split())
-    return text[:MAX_ERROR_DETAIL]
+    # JSON may spell a URL as `https:\/\/host` or with `\u` escapes, which the
+    # pattern below would not recognise. Decoding and re-encoding a JSON body
+    # writes every string plainly first.
+    try:
+        text = json.dumps(json.loads(raw), ensure_ascii=False)
+    except ValueError:
+        text = raw.replace("\\/", "/")
+    text = _URL.sub(r"https://\1/<redacted>", text)
+    text = _SIGNING_PARAM.sub(r"\1=<redacted>", text)
+    return " ".join(text.split())[:MAX_ERROR_DETAIL]
 
 
 def build_file_configuration(
@@ -186,7 +199,7 @@ class SkyflowClient:
         timeout_seconds: float = 5.0,
         max_retries: int = 2,
         backoff_initial_ms: int = 100,
-        refresh_api_key: Callable[[], str] | None = None,
+        refresh_api_key: Callable[[str], str] | None = None,
     ) -> None:
         self._vault_url = vault_url.rstrip("/")
         self._vault_id = vault_id
@@ -194,7 +207,8 @@ class SkyflowClient:
         self._timeout = timeout_seconds
         self._max_retries = max_retries
         self._backoff_initial_ms = backoff_initial_ms
-        #: Called once when Skyflow answers 401, to pick up a rotated key.
+        #: Called once when Skyflow answers 401, with the key it rejected, to
+        #: pick up a rotated key.
         self._refresh_api_key = refresh_api_key
 
     def deidentify(
@@ -347,7 +361,7 @@ class SkyflowClient:
                     # spend a retry, and is not repeated if the new key fails.
                     key_refreshed = True
                     exc.close()
-                    fresh = self._refresh_api_key()
+                    fresh = self._refresh_api_key(used_key)
                     # Compared with the key this request sent, not the shared
                     # attribute, which a parallel call may already have updated.
                     if fresh and fresh != used_key:

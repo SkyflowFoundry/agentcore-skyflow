@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -67,6 +68,8 @@ class SettingsTestCase(unittest.TestCase):
         # Module-scope caches persist across invocations in a warm Lambda, so
         # each test starts from a cold one.
         settings._policy_cache = None
+        settings._policy_next_read = 0.0
+        settings._policy_failure = None
         settings._api_key_cache = None
         settings._api_key_refreshed_at = None
 
@@ -114,8 +117,9 @@ class PolicyCacheTestCase(SettingsTestCase):
             "request": {"action": "deidentify", "tokenType": "counter"},
             "response": {"action": "reidentify"}}}
         with mock.patch.object(settings, "_ssm_client", return_value=FakeSsm(json.dumps(broken))):
-            with self.assertRaises(Exception):
-                settings.load_policy()
+            with self.assertLogs(settings.logger, level="ERROR"):
+                with self.assertRaises(Exception):
+                    settings.load_policy()
 
 
 class StalePolicyTestCase(SettingsTestCase):
@@ -189,9 +193,58 @@ class StalePolicyTestCase(SettingsTestCase):
 
     def test_nothing_cached_still_raises(self):
         settings._policy_cache = None
+        settings._policy_next_read = 0.0
         self.ssm.error = RuntimeError("ThrottlingException")
-        with self.assertRaises(RuntimeError):
+        with self.assertLogs(settings.logger, level="ERROR"):
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+
+    def test_the_retry_pause_cannot_outlive_the_stale_limit(self):
+        """A failure just before the limit must not schedule the next read
+        past it, or the pause would serve a policy older than allowed."""
+        self.ssm.error = RuntimeError("ThrottlingException")
+        self.clock.now += 599
+        with self.assertLogs(settings.logger, level="WARNING"):
+            self.assertIs(settings.load_policy(), self.good)
+        self.clock.now += 0.5
+        self.assertIs(settings.load_policy(), self.good, "still inside the limit")
+        self.clock.now += 1
+        with self.assertLogs(settings.logger, level="ERROR"):
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+
+    def test_failing_closed_backs_off_ssm_too(self):
+        """Once nothing is servable, the next calls fail closed without
+        reading SSM until the retry time, rather than one read per call."""
+        self.ssm.error = RuntimeError("ThrottlingException")
+        self.clock.now += 601
+        with self.assertLogs(settings.logger, level="ERROR"):
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+        reads = self.ssm.calls
+        for _ in range(5):
+            self.clock.now += 1
+            with self.assertRaises(settings.PolicyUnavailable) as caught:
+                settings.load_policy()
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        self.assertEqual(self.ssm.calls, reads, "no SSM read inside the retry window")
+        self.clock.now += settings.POLICY_RETRY_SECONDS
+        self.ssm.error = None
+        self.assertEqual(settings.load_policy().resolve("x", "y").request.action, "deidentify")
+        self.assertEqual(self.ssm.calls, reads + 1, "recovers on the first read after the window")
+
+    def test_a_cold_start_failure_backs_off_too(self):
+        settings._policy_cache = None
+        settings._policy_next_read = 0.0
+        self.ssm.error = RuntimeError("ThrottlingException")
+        with self.assertLogs(settings.logger, level="ERROR"):
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+        reads = self.ssm.calls
+        self.clock.now += 1
+        with self.assertRaises(settings.PolicyUnavailable):
             settings.load_policy()
+        self.assertEqual(self.ssm.calls, reads)
 
 
 class ApiKeyTestCase(SettingsTestCase):
@@ -256,6 +309,46 @@ class ApiKeyRefreshTestCase(SettingsTestCase):
             with self.assertLogs(settings.logger, level="WARNING"):
                 settings.refresh_api_key()
             self.assertEqual(fake.calls, reads + 1)
+
+
+class ConcurrentRefreshTestCase(SettingsTestCase):
+    """Parallel 401s during a rotation all end up with the new key."""
+
+    def test_a_second_caller_waits_for_the_first_read(self):
+        gate, entered = threading.Event(), threading.Event()
+
+        class SlowSecrets(FakeSecrets):
+            def get_secret_value(self, SecretId):  # noqa: N803 - boto3 casing
+                if self.stored == "sky-new":
+                    entered.set()
+                    gate.wait(5)
+                return super().get_secret_value(SecretId)
+
+        fake = SlowSecrets("sky-old")
+        results = {}
+        with mock.patch.object(settings, "_secrets_client", return_value=fake), \
+                self.assertLogs(settings.logger, level="WARNING"):
+            settings.load_api_key()
+            fake.stored = "sky-new"
+            first = threading.Thread(target=lambda: results.update(first=settings.refresh_api_key("sky-old")))
+            first.start()
+            self.assertTrue(entered.wait(5), "the first refresh is reading Secrets Manager")
+            second = threading.Thread(target=lambda: results.update(second=settings.refresh_api_key("sky-old")))
+            second.start()
+            second.join(0.2)
+            self.assertTrue(second.is_alive(), "the second caller waits rather than take the old key")
+            gate.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(results, {"first": "sky-new", "second": "sky-new"})
+        self.assertEqual(fake.calls, 2, "one initial load and one refresh; the second caller reads nothing")
+
+    def test_a_key_already_replaced_is_returned_without_a_read(self):
+        fake = FakeSecrets("sky-new")
+        with mock.patch.object(settings, "_secrets_client", return_value=fake):
+            settings.load_api_key()
+            self.assertEqual(settings.refresh_api_key("sky-old"), "sky-new")
+        self.assertEqual(fake.calls, 1)
 
 
 class ClientConstructionTestCase(SettingsTestCase):

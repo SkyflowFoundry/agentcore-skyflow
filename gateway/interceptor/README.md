@@ -127,18 +127,25 @@ override against, and a per-target rule could only be half enforced.
 - **A failed policy refresh serves the last good policy.** If SSM throttles, or
   someone publishes a policy that does not parse, the Lambda keeps using the
   policy it last loaded and logs `policy_refresh_failed ...
-  action=serving_last_good`. It asks SSM again after ten seconds rather than on
-  every call. After `POLICY_MAX_STALE_SECONDS` (default one hour, CDK context
-  `policyMaxStaleSeconds`) it stops and fails closed. A cold Lambda with no
-  policy at all always fails closed.
+  action=serving_last_good`. Once the policy is `POLICY_MAX_STALE_SECONDS` old
+  (default one hour, CDK context `policyMaxStaleSeconds`), measured from when it
+  was loaded, it stops and fails closed. A cold Lambda with no policy at all
+  always fails closed.
+- **A failing SSM is asked at most every ten seconds.** That holds while a
+  stale policy is being served and while failing closed, so a throttled SSM is
+  never read on every call. The pause never stretches a stale policy past its
+  limit.
 - **A rotated API key is picked up on the first 401.** The client re-reads the
-  secret once and retries. A key that is simply wrong is re-read at most once
+  secret once and retries. Calls that hit a 401 together wait for one re-read
+  and all use its answer. A key that is simply wrong is re-read at most once
   every thirty seconds, so a bad key cannot turn every call into a Secrets
   Manager read.
 - **File endpoint errors are readable.** A Detect v2 error such as `Missing
-  Destination for entity NAME` reaches the log, with any URL in it cut to its
-  host because a presigned URL's query string is a credential. String endpoint
-  errors stay opaque because their bodies can echo the submitted text.
+  Destination for entity NAME` reaches the log. Any URL in it is cut to its
+  host, and any signing parameter is masked wherever it appears, because a
+  presigned URL's query string is a credential. A JSON body is decoded first,
+  so an escaped URL cannot slip past. String endpoint errors stay opaque
+  because their bodies can echo the submitted text.
 - **The Skyflow timeout is configurable.** `SKYFLOW_TIMEOUT_SECONDS`, default
   five, CDK context `skyflowTimeoutSeconds`. Raise it if large fetched pages
   fail closed on a slow vault.
