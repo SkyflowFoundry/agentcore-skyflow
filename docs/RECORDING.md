@@ -80,12 +80,12 @@ $PY scripts/show_document.py samples/dispute-case-note.docx
 $PY scripts/show_document.py samples/dispute-case-note.pdf
 ```
 
-Each should end with `OK`, or for the PDF print the Skyflow host. The case note
-includes a card number, which no earlier sample did. If only these runs fail,
-the vault most likely has no column for card numbers: add
-`table1.credit_card_entity`, or point a `credit_card` entry in the policy's
-`files.destinations` at a column that exists. The failure message in the
-interceptor log carries Skyflow's reason.
+Each should end with `OK`, except the PDF, which is not compared: open the copy
+it saves and check the values are tokens. The case note includes a card number,
+which no earlier sample did. If only these runs fail, the vault most likely has
+no column for card numbers: add `table1.credit_card_entity`, or point a
+`credit_card` entry in the policy's `files.destinations` at a column that
+exists. The failure message in the interceptor log carries Skyflow's reason.
 
 **7. Choose the region you show.** The clean copy's URL names the bucket and
 region of the Skyflow vault's environment. A trial vault answers from

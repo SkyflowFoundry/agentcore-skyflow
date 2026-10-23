@@ -9,8 +9,9 @@ returns, and prints the two side by side.
     app/Flow/.venv/bin/python scripts/show_document.py samples/dispute-case-note.txt
     app/Flow/.venv/bin/python scripts/show_document.py samples/dispute-case-note.docx
 
-Word documents are compared by their paragraphs. A PDF prints only the two
-hosts, since its text is not worth extracting here; open the link to see it.
+Word documents are compared by their paragraphs. A PDF is not compared, since
+its text is not worth extracting here: the clean copy is saved to a new local
+file, and its path printed, so it can be opened without the signed link.
 
 It exits non-zero when the swap did not happen: the gateway returned an error,
 or a link to your own bucket, or a copy with the original values still in it.
@@ -23,6 +24,7 @@ import io
 import json
 import re
 import sys
+import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -85,6 +87,15 @@ def clean_url(response: dict) -> str:
     return json.loads(text)["url"]
 
 
+def save_copy(data: bytes, key: str, out_dir: str | None) -> Path:
+    """Write the clean copy to a new file, so a rerun never overwrites one."""
+    name = Path(key)
+    fd, path = tempfile.mkstemp(prefix=f"{name.stem}-clean-", suffix=name.suffix, dir=out_dir)
+    with open(fd, "wb") as out:
+        out.write(data)
+    return Path(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("key", help="document key, for example samples/dispute-case-note.txt")
@@ -93,6 +104,8 @@ def main() -> None:
     parser.add_argument("--url", default=None, help="gateway MCP URL; defaults to the stack output")
     parser.add_argument("--bucket", default=None, help="defaults to agentcore-skyflow-files-<account>")
     parser.add_argument("--timeout", type=int, default=300, help="seconds to wait for the gateway")
+    parser.add_argument("--out-dir", default=None,
+                        help="where a non-text clean copy is saved; defaults to the system temp directory")
     args = parser.parse_args()
 
     import boto3
@@ -130,7 +143,7 @@ def main() -> None:
 
     left, right = text_of(original, args.key), text_of(clean, args.key)
     if left is None or right is None:
-        print("Not a text format; open the link above to see the clean copy.")
+        print(f"Not a text format, so not compared. The clean copy is saved at\n  {save_copy(clean, args.key, args.out_dir)}")
         return
     print(side_by_side(left, right))
     survivors = leaked(right)

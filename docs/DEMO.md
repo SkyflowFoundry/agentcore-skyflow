@@ -216,16 +216,20 @@ the override for `get_document`. It looks like this:
 ```
 
 Change `tokenType` to `counter` and publish it. `scripts/demo_policy.py` does
-exactly that edit without touching the file, and `reset` puts the shipped
-policy back:
+exactly that edit without touching the file:
 
 ```bash
 app/Flow/.venv/bin/python scripts/demo_policy.py one-way-documents --region us-east-1
-app/Flow/.venv/bin/python scripts/demo_policy.py reset --region us-east-1
 ```
 
 Wait about sixty seconds for the interceptor cache to expire and call again. The
 tokens become `[NAME_1]` instead of `[NAME_AJbrIud]`. No redeploy is involved.
+
+Once you have seen that, put the shipped policy back:
+
+```bash
+app/Flow/.venv/bin/python scripts/demo_policy.py reset --region us-east-1
+```
 
 Set `"action": "none"` inside the `files` block and the agent starts receiving
 links to your original documents again. That is the clearest demonstration of

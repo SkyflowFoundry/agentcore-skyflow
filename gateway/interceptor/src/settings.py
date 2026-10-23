@@ -137,6 +137,9 @@ def load_policy(force: bool = False) -> PolicySet:
         raw = _ssm_client().get_parameter(Name=name)["Parameter"]["Value"]
         policy_set = PolicySet.from_json(json.loads(raw))
     except Exception as exc:
+        # The read can block for many seconds, so judge staleness and
+        # schedule the retry from when it failed, not from when it started.
+        now = time.monotonic()
         _policy_failure = exc
         policy = _usable_policy(now)
         if policy is None:
@@ -157,6 +160,7 @@ def load_policy(force: bool = False) -> PolicySet:
         )
         return policy
 
+    now = time.monotonic()
     _policy_cache = (now, policy_set)
     _policy_next_read = now + _cache_ttl()
     _policy_failure = None

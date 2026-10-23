@@ -35,9 +35,14 @@ class FakeSsm:
         self.value = value
         self.calls = 0
         self.error: Exception | None = None
+        # A read that takes this long moves `clock` on, as a slow SSM would.
+        self.clock: Clock | None = None
+        self.latency = 0.0
 
     def get_parameter(self, Name):  # noqa: N803 - boto3 casing
         self.calls += 1
+        if self.clock is not None:
+            self.clock.now += self.latency
         if self.error is not None:
             raise self.error
         return {"Parameter": {"Value": self.value}}
@@ -133,6 +138,7 @@ class StalePolicyTestCase(SettingsTestCase):
         super().setUp()
         self.clock = Clock()
         self.ssm = FakeSsm(json.dumps(POLICY))
+        self.ssm.clock = self.clock
         patches = [
             mock.patch.object(settings.time, "monotonic", self.clock),
             mock.patch.object(settings, "_ssm_client", return_value=self.ssm),
@@ -232,6 +238,35 @@ class StalePolicyTestCase(SettingsTestCase):
         self.ssm.error = None
         self.assertEqual(settings.load_policy().resolve("x", "y").request.action, "deidentify")
         self.assertEqual(self.ssm.calls, reads + 1, "recovers on the first read after the window")
+
+    def test_a_slow_failed_read_is_judged_when_it_ends(self):
+        """A read that starts inside the stale limit and fails after it must
+        fail closed, and back off from the failure rather than the start."""
+        self.ssm.error = RuntimeError("ReadTimeout")
+        self.ssm.latency = 20
+        self.clock.now += 599
+        with self.assertLogs(settings.logger, level="ERROR") as logs:
+            with self.assertRaises(RuntimeError):
+                settings.load_policy()
+        self.assertIn("stale_seconds=619", logs.output[0])
+        self.assertEqual(settings._policy_next_read, self.clock.now + settings.POLICY_RETRY_SECONDS)
+
+    def test_a_slow_failed_read_caps_the_pause_from_when_it_ends(self):
+        loaded_at = self.clock.now
+        self.ssm.error = RuntimeError("ReadTimeout")
+        self.ssm.latency = 20
+        self.clock.now += 575
+        with self.assertLogs(settings.logger, level="WARNING") as logs:
+            self.assertIs(settings.load_policy(), self.good)
+        self.assertIn("stale_seconds=595", logs.output[0])
+        self.assertEqual(settings._policy_next_read, loaded_at + 600, "next read at the stale limit, still ahead")
+
+    def test_a_slow_successful_read_is_aged_from_when_it_ends(self):
+        self.ssm.latency = 20
+        self.expire()
+        settings.load_policy()
+        self.assertEqual(settings._policy_cache[0], self.clock.now)
+        self.assertEqual(settings._policy_next_read, self.clock.now + 60)
 
     def test_a_cold_start_failure_backs_off_too(self):
         settings._policy_cache = None
