@@ -22,3 +22,6 @@ notes/
 
 # Generated throughput fixtures. Rebuild with scripts/make_samples.py
 samples/claims-*.txt
+
+# Demo recordings and cuts
+demo-out/
