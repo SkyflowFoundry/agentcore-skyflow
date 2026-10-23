@@ -43,16 +43,25 @@ cd -
 ```
 
 **3. Deploy the agent and gateway, then check the interceptor is attached.**
-This ships the agent and gateway changes on this branch. The gateway knows
-nothing about the interceptor, so confirm a deploy has not left it without one.
+This ships the agent and gateway changes on this branch. It has to come after
+step 2 because the gateway imports the interceptor's function ARN from the stack
+that step 2 deploys and attaches it in the same deploy.
 
 ```bash
 agentcore deploy --target dev -y
 $PY scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 ```
 
-If the check prints `FAIL`, re-attach with step 3 of the main README and check
-again.
+If the check prints `FAIL`, the gateway in `agentcore/cdk/lib/cdk-stack.ts` has
+lost its interceptor configuration. Attach it by hand for the session and check
+again. The next `agentcore deploy` that changes the gateway removes it again
+until the CDK app is fixed.
+
+```bash
+$PY scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway \
+  --function-arn "$(aws cloudformation describe-stacks --stack-name SkyflowInterceptorStack \
+    --query "Stacks[0].Outputs[?OutputKey=='InterceptorFunctionArn'].OutputValue" --output text)"
+```
 
 **4. Publish the shipped policy, then switch scene 1's logging on.**
 
@@ -178,8 +187,9 @@ cd gateway/interceptor/cdk && npx cdk deploy --require-approval never && cd -
 $PY scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 ```
 
-Redeploying the interceptor stack does not detach it, because its function ARN
-does not change, but the check costs nothing.
+Redeploying the interceptor stack does not detach it because its function ARN
+does not change. CloudFormation refuses any change to that ARN while the
+AgentCore stack imports it. The check costs nothing all the same.
 
 ## If something goes wrong
 
@@ -197,5 +207,8 @@ does not change, but the check costs nothing.
   published. Run step 4 again.
 - **The link points at your own bucket.** The interceptor is not attached. Run
   the `--check` from step 3.
+- **`agentcore deploy` fails with `No export named
+  SkyflowInterceptorStack-InterceptorFunctionArn found`.** The interceptor stack
+  is not deployed in this account and region. Run step 2, then step 3 again.
 - **The agent refuses to start.** It found no gateway in its environment. Run
   `agentcore deploy` again.

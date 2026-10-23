@@ -8,9 +8,19 @@ import {
   type CustomJWTAuthorizerConfig,
   type HarnessDeploymentConfig,
 } from '@aws/agentcore-cdk';
-import { CfnOutput, Stack, type StackProps } from 'aws-cdk-lib';
+import { CfnOutput, Fn, Stack, type StackProps } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+
+/** The gateway in agentcore.json that the Skyflow interceptor guards. */
+export const SKYFLOW_GATEWAY_NAME = 'SkyflowGateway';
+
+/**
+ * The interceptor function ARN, exported by SkyflowInterceptorStack in
+ * gateway/interceptor/cdk. Importing it means CloudFormation refuses to deploy
+ * this stack until that one exists, which is the deploy order the gateway needs.
+ */
+export const INTERCEPTOR_ARN_EXPORT = 'SkyflowInterceptorStack-InterceptorFunctionArn';
 
 /**
  * Harness deployment config: role-scoped fields (for IAM role + container build)
@@ -127,13 +137,14 @@ export class AgentCoreStack extends Stack {
 
     // Create AgentCoreMcp if there are gateways configured
     if (mcpSpec?.agentCoreGateways && mcpSpec.agentCoreGateways.length > 0) {
-      new AgentCoreMcp(this, 'Mcp', {
+      const mcp = new AgentCoreMcp(this, 'Mcp', {
         projectName: spec.name,
         mcpSpec,
         agentCoreApplication: this.application,
         credentials,
         projectTags: spec.tags,
       });
+      this.attachSkyflowInterceptor(mcp);
     }
 
     // Create payment infrastructure via CFN constructs
@@ -287,5 +298,74 @@ export class AgentCoreStack extends Stack {
       description: 'Name of the CloudFormation Stack',
       value: this.stackName,
     });
+  }
+
+  /**
+   * Attach the Skyflow interceptor to the gateway and grant the gateway role
+   * what the interceptor needs.
+   *
+   * This is the one deliberate hand edit to the vended CDK app (see AGENTS.md).
+   * agentcore.json has no interceptor field, so without this the gateway is
+   * synthesized with no InterceptorConfigurations. Whenever any gateway property
+   * changed, CloudFormation then sent UpdateGateway without interceptors and
+   * detached the one scripts/attach_interceptor.py had set. Declaring it here
+   * keeps it in every update.
+   *
+   * The ARN comes from the `interceptorFunctionArn` context value when one is
+   * given and from the interceptor stack's export otherwise, so nothing
+   * account-specific is committed.
+   */
+  private attachSkyflowInterceptor(mcp: AgentCoreMcp): void {
+    const gateway = mcp.gateways.get(SKYFLOW_GATEWAY_NAME);
+    if (!gateway) {
+      throw new Error(
+        `agentcore.json has no gateway named ${SKYFLOW_GATEWAY_NAME}, so the Skyflow interceptor has ` +
+          'nothing to attach to. If the gateway was renamed, update SKYFLOW_GATEWAY_NAME in lib/cdk-stack.ts.'
+      );
+    }
+
+    const functionArn: string =
+      this.node.tryGetContext('interceptorFunctionArn') ?? Fn.importValue(INTERCEPTOR_ARN_EXPORT);
+
+    // The L3 Gateway component that owns the CfnGateway also owns its role. The
+    // component class is not exported, so reach it through the construct tree.
+    const role = (gateway.node.scope as unknown as { role?: iam.IRole } | undefined)?.role;
+    if (!role) {
+      throw new Error(`Could not find the IAM role of gateway ${SKYFLOW_GATEWAY_NAME} in the construct tree.`);
+    }
+
+    // The gateway must be able to invoke the interceptor before it is created or
+    // updated with it, so the gateway waits for this policy.
+    const invokePolicy = new iam.Policy(this, 'SkyflowInterceptorInvoke', {
+      roles: [role],
+      statements: [new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [functionArn] })],
+    });
+    gateway.node.addDependency(invokePolicy);
+
+    // When a runtime calls tools/list the gateway fetches the runtime's config
+    // bundle and fails with HTTP 400 if it cannot. The L3 grants this to the
+    // runtime role only. Nothing waits for this policy because the bundle depends
+    // on the runtime and the runtime depends on the gateway.
+    const bundleArns = [...this.application.configBundles.values()].map(bundle => bundle.bundleArn);
+    if (bundleArns.length > 0) {
+      new iam.Policy(this, 'SkyflowGatewayConfigBundleRead', {
+        roles: [role],
+        statements: [
+          new iam.PolicyStatement({
+            actions: ['bedrock-agentcore:GetConfigurationBundleVersion'],
+            resources: bundleArns,
+          }),
+        ],
+      });
+    }
+
+    gateway.interceptorConfigurations = [
+      {
+        interceptor: { lambda: { arn: functionArn } },
+        interceptionPoints: ['REQUEST', 'RESPONSE'],
+        // Headers carry bearer tokens and the interceptor never reads them.
+        inputConfiguration: { passRequestHeaders: false },
+      },
+    ];
   }
 }

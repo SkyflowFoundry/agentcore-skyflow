@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Wire an AgentCore Gateway up to everything `agentcore deploy` leaves undone.
+"""Check, or repair by hand, the Skyflow interceptor on an AgentCore Gateway.
 
-The AgentCore CLI cannot declare interceptors, and the CDK-created gateway role
-starts with no permissions at all, so this runs after `agentcore deploy`:
+`agentcore deploy` attaches the interceptor itself. The AgentCore CLI cannot
+declare interceptors, so agentcore/cdk/lib/cdk-stack.ts sets them on the
+gateway's CloudFormation resource from the interceptor stack's exported
+function ARN, and grants the gateway role both permissions listed below. Run
+this with `--check` after every `agentcore deploy` to confirm it:
 
-    agentcore deploy
+    python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+
+Without `--check` it attaches the interceptor through `update-gateway`, outside
+CloudFormation. That repairs a live gateway, but the next `agentcore deploy`
+that changes the gateway sets it back to whatever the CDK app declares:
+
     python3 scripts/attach_interceptor.py \
         --gateway-name agentflow-SkyflowGateway \
         --function-arn arn:aws:lambda:us-east-1:...:function:... \
@@ -13,7 +21,7 @@ starts with no permissions at all, so this runs after `agentcore deploy`:
 Note the gateway name carries the project prefix: a gateway named
 `SkyflowGateway` in `agentcore.json` is deployed as `agentflow-SkyflowGateway`.
 
-It does three things:
+Without `--check` it does three things:
 
 1. Grants the gateway's service role `lambda:InvokeFunction` on that one
    function. Per the AgentCore docs this is an identity-based grant on the
@@ -22,8 +30,8 @@ It does three things:
 2. Grants that same role `bedrock-agentcore:GetConfigurationBundleVersion` on
    the project's config bundles. When a caller has a ConfigBundle the gateway
    fetches it to resolve tool descriptions; without this, a runtime calling the
-   gateway fails at `tools/list` with HTTP 400. The CDK grants this to the
-   runtime role but not to the gateway role. It hides well: a caller with no
+   gateway fails at `tools/list` with HTTP 400. The AgentCore L3 constructs
+   grant this to the runtime role only. It hides well: a caller with no
    bundle — an IAM user running `scripts/mcp_call.py` — triggers no fetch, so
    the gateway looks healthy from every direction except a runtime.
 3. Calls `update-gateway` with `interceptorConfigurations`, preserving the
@@ -37,11 +45,8 @@ Re-running is safe: role policies are replaced in place and the interceptor
 configuration is overwritten with the same values.
 
 `--check` changes nothing. It reports whether the interceptor is attached at
-both points and exits non-zero if it is not. Run it after every `agentcore
-deploy`: the gateway is a CloudFormation resource that knows nothing about the
-interceptor, so confirm a deploy has not left the gateway without one.
-
-    python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+both points and exits non-zero if it is not. Pass `--function-arn` as well to
+also confirm which function is attached.
 """
 
 from __future__ import annotations

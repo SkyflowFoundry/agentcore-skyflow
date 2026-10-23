@@ -5,8 +5,9 @@ This CDK project is managed by the AgentCore CLI. It deploys your agent infrastr
 ## Structure
 
 - `bin/cdk.ts` — Entry point. Reads project configuration from `agentcore/` and creates a stack per deployment target.
-- `lib/cdk-stack.ts` — Defines `AgentCoreStack`, which wraps the `AgentCoreApplication` L3 construct.
+- `lib/cdk-stack.ts` — Defines `AgentCoreStack`, which wraps the `AgentCoreApplication` L3 construct. It also attaches the Skyflow interceptor to `SkyflowGateway`, the one deliberate hand edit described in `AGENTS.md`.
 - `test/cdk.test.ts` — Unit tests for stack synthesis.
+- `test/skyflow-interceptor.test.ts` — Pins the interceptor attachment and the two gateway role grants.
 
 ## Useful commands
 
