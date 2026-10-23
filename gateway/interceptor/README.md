@@ -173,26 +173,33 @@ uv run --with boto3 python scripts/create_documents_bucket.py \
   --region us-east-1 --upload-samples
 ```
 
-Then:
+Then deploy this stack before `agentcore deploy`. The AgentCore CDK app imports
+this stack's `SkyflowInterceptorStack-InterceptorFunctionArn` export and attaches
+the function to the gateway in the gateway's own CloudFormation resource, so a
+later `agentcore deploy` cannot detach it.
 
 ```bash
-# 1. gateway and its targets
-agentcore deploy --target dev -y
-
-# 2. interceptor Lambda + policy parameter
+# 1. interceptor Lambda + policy parameter
 cd gateway/interceptor/cdk
 cp cdk.context.json.example cdk.context.json   # fill in your vault URL and ID
 npm install && npm run build
 npx cdk deploy --require-approval never
+cd -
 
-# 3. attach it to the gateway (also grants the gateway role invoke
-#    on the Lambda and read on the project's config bundles)
+# 2. gateway and its targets with the interceptor attached. Also grants the
+#    gateway role invoke on the Lambda and read on the project's config
+#    bundles. Fails with "No export named
+#    SkyflowInterceptorStack-InterceptorFunctionArn found" until step 1 has run.
+agentcore deploy --target dev -y
+
+# 3. confirm it is attached at REQUEST and RESPONSE. Changes nothing.
 #    Note the gateway name is prefixed with the project name.
-python3 scripts/attach_interceptor.py \
-  --gateway-name agentflow-SkyflowGateway \
-  --function-arn <InterceptorFunctionArn from step 2> \
-  --region us-east-1
+python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 ```
+
+While the AgentCore stack imports the export, CloudFormation will not delete
+this stack or let the function's ARN change. Tear the AgentCore stack down
+first.
 
 Account and region come from `agentcore/aws-targets.json`, so the Lambda always
 lands in the same region as the gateway. Override with `-c account= -c region=`.
@@ -496,7 +503,7 @@ every combination of them.
 | `LOG_LEVEL` | Lambda environment variable; not set by the stack, so `INFO` | How much the interceptor's own code logs. `INFO` is one line per decision: which tool, which action, how many fields changed, which file run. `WARNING` and above are failures only. `DEBUG` adds nothing today and is reserved for future diagnostics. |
 | `logUpstreamPayloads` | Policy, per default or per override; live within the cache TTL | Adds the two tokenized payload snapshots described in the next section, capped at 4000 characters. Ships `false`, and has no effect unless the next setting is also on. |
 | `ALLOW_UPSTREAM_PAYLOAD_LOGGING` | Lambda environment variable, set by the stack from `cdk deploy -c allowUpstreamPayloadLogging=true`; defaults to `false` | Whether `logUpstreamPayloads` is honoured at all. The policy lives in SSM and changes without a deploy, so this keeps payload logging a deployed decision rather than a parameter edit. While it is off and a policy asks for payload logging, the Lambda logs one `upstream_payload_logging_refused` warning per execution environment. |
-| `passRequestHeaders` | `scripts/attach_interceptor.py --pass-request-headers`; gateway-side | Whether the caller's HTTP headers arrive in the event at all. Ships off. It changes what the Lambda receives, not what it logs. |
+| `passRequestHeaders` | `agentcore/cdk/lib/cdk-stack.ts`, which sets it to `false` on the gateway; gateway-side | Whether the caller's HTTP headers arrive in the event at all. Ships off. It changes what the Lambda receives, not what it logs. |
 
 What is never logged, whatever the settings:
 
@@ -681,6 +688,10 @@ npx cdk deploy -c stackName=SkyflowInterceptorStaging \
   -c policyParameterName=/agentcore/interceptor/staging-policy
 python3 scripts/put_policy.py --parameter-name /agentcore/interceptor/staging-policy
 ```
+
+The AgentCore stack imports only the default stack's export. To attach the
+second interceptor to a gateway, set `interceptorFunctionArn` to its ARN in
+`agentcore/cdk/cdk.context.json` before `agentcore deploy`.
 
 ```bash
 python3 scripts/put_policy.py --dry-run     # validate and print the effective rules

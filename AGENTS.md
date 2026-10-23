@@ -26,6 +26,16 @@ Tags defined in `agentcore.json` flow through to deployed CloudFormation resourc
 5. **Invocation Input:** Validate runtime payloads and require text prompts to be strings. If a Strands app accepts a
    caller-supplied message history, normalize the history tail with `strip_trailing_tool_use()` before invocation.
 
+### The one deliberate exception to invariant 1
+
+`agentcore/cdk/lib/cdk-stack.ts` attaches the Skyflow interceptor to `SkyflowGateway` and grants the gateway role
+`lambda:InvokeFunction` on it and `bedrock-agentcore:GetConfigurationBundleVersion` on the project's config bundles.
+This lives in generated code because the schema has no interceptor field. A gateway built only from `agentcore.json`
+has no interceptor, so every CloudFormation update to it removed the one `scripts/attach_interceptor.py` had attached by
+hand. The function ARN comes from the `SkyflowInterceptorStack-InterceptorFunctionArn` export, so deploy
+`gateway/interceptor/cdk` before `agentcore deploy`. CLI 0.29 rewrites `cdk/` only during `agentcore create`, and
+`agentcore/cdk/test/skyflow-interceptor.test.ts` fails if the edit is lost. Do not change any other behavior there.
+
 ## Directory Structure
 
 ```

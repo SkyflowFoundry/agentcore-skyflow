@@ -7,3 +7,6 @@ node_modules/
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Local context such as an interceptorFunctionArn override. It names one account.
+cdk.context.json

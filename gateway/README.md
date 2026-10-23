@@ -34,18 +34,21 @@ each per gateway, and one Lambda can serve both by listing
 
 ### Interceptors cannot be declared in `agentcore.json`
 
-The AgentCore CLI has no field for them. The order is:
+The AgentCore CLI has no field for them, so `agentcore/cdk/lib/cdk-stack.ts`
+sets `InterceptorConfigurations` on the gateway's CloudFormation resource
+directly. An interceptor attached only by calling `update-gateway` does not
+survive: the next change to any gateway property makes CloudFormation send
+`UpdateGateway` without it. The order is:
 
 ```bash
-agentcore deploy                            # creates the gateway and its targets
-cd gateway/interceptor/cdk && npm run cdk deploy -- ...   # creates the Lambda
-python3 scripts/attach_interceptor.py ...   # update-gateway + the two IAM grants
+cd gateway/interceptor/cdk && npm run cdk deploy -- ...   # creates the Lambda and exports its ARN
+agentcore deploy                                          # creates the gateway with the interceptor attached
+python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 ```
 
 The gateway's **service role** needs `lambda:InvokeFunction` on the interceptor
 function — an identity-based grant, not a Lambda resource policy. Scope it to
-the specific function ARN, never a wildcard. `scripts/attach_interceptor.py`
-does this.
+the specific function ARN, never a wildcard. The same CDK stack grants it.
 
 ### Payload shape depends on the target type
 
@@ -135,9 +138,8 @@ is not authorized to perform: bedrock-agentcore:GetConfigurationBundleVersion ..
 ```
 
 The *runtime* role gets this permission; the *gateway* role does not.
-`scripts/attach_interceptor.py` grants it alongside the Lambda invoke grant, so
-there is one post-deploy step rather than two. Bundle ARNs come from
-`agentcore/.cli/deployed-state.json`; a project with no config bundle skips it.
+`agentcore/cdk/lib/cdk-stack.ts` grants it on the project's config bundles
+alongside the Lambda invoke grant. A project with no config bundle skips it.
 
 Worth knowing how this hides: a caller with no config bundle — an IAM user
 running `scripts/mcp_call.py`, say — triggers no fetch at all, so the gateway

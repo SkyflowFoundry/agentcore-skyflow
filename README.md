@@ -60,7 +60,7 @@ agentcore/                  # repo root
 ├── agentcore/
 │   ├── agentcore.json      # every resource in the project: runtime, gateway, targets, memory
 │   ├── aws-targets.json    # account and region for each deployment target
-│   └── cdk/                # generated CDK app; do not hand-edit
+│   └── cdk/                # generated CDK app; one deliberate hand edit, see AGENTS.md
 ├── app/Flow/               # the agent runtime
 │   ├── main.py             # entrypoint
 │   ├── mcp_client/         # gateway discovery, SigV4 signing, error diagnostics
@@ -73,7 +73,7 @@ agentcore/                  # repo root
 │       ├── cdk/            # standalone CDK app for the Lambda and its SSM parameter
 │       └── tests/          # offline tests that touch neither AWS nor Skyflow
 ├── samples/                # the synthetic card-dispute case note, as txt, docx and pdf
-├── scripts/                # attach the interceptor, publish policy, call the gateway, demo helpers
+├── scripts/                # check the interceptor, publish policy, call the gateway, demo helpers
 ├── tests/flow/             # agent tests, kept outside app/ so they do not ship
 └── ui/                     # web console: Cognito login + chat UI for the Flow agent
 ```
@@ -88,8 +88,10 @@ agentcore/                  # repo root
 ## Deploying
 
 The interceptor cannot be declared in `agentcore.json` because the AgentCore CLI
-has no field for it. That forces a three step order and every step depends on the
-one before it. Two one-time steps come first.
+has no field for it. The CDK app that `agentcore deploy` runs attaches it to the
+gateway instead, using the function ARN that the interceptor stack exports. That
+fixes the order: the interceptor stack deploys first and `agentcore deploy`
+second. Two one-time steps come before either.
 
 **Step 0a points the project at your account.** The committed
 `agentcore/aws-targets.json` carries a placeholder account. Replace it with your
@@ -114,51 +116,62 @@ uv run --with boto3 python scripts/create_documents_bucket.py \
   --region us-east-1 --upload-samples
 ```
 
-**Step 1 creates the gateway and its targets.**
-
-```bash
-agentcore deploy --target dev -y
-```
-
-**Step 2 creates the interceptor Lambda and its policy parameter.**
+**Step 1 creates the interceptor Lambda and its policy parameter.**
 
 ```bash
 cd gateway/interceptor/cdk
 cp cdk.context.json.example cdk.context.json   # fill in your vault URL and vault ID
 npm install && npm run build
 npx cdk deploy --require-approval never
+cd -
 ```
 
-**Step 3 attaches the Lambda to the gateway and grants the two IAM permissions it
-needs.**
+**Step 2 creates the gateway with the interceptor attached.**
 
 ```bash
-python3 scripts/attach_interceptor.py \
-  --gateway-name agentflow-SkyflowGateway \
-  --function-arn <InterceptorFunctionArn printed by step 2> \
-  --region us-east-1
+agentcore deploy --target dev -y
 ```
 
+The AgentCore stack imports the `SkyflowInterceptorStack-InterceptorFunctionArn`
+export that step 1 creates. CloudFormation stops the deploy with
+`No export named SkyflowInterceptorStack-InterceptorFunctionArn found` when step
+1 has not run. The same stack grants the gateway's service role the two
+permissions the interceptor needs.
+
+1. `lambda:InvokeFunction` on the interceptor lets the gateway call it.
+2. `bedrock-agentcore:GetConfigurationBundleVersion` on the project's
+   configuration bundles lets `tools/list` succeed when the caller is a runtime.
+
 The deployed gateway name carries the project name as a prefix so `SkyflowGateway`
-becomes `agentflow-SkyflowGateway`. Step 1 also writes
-`agentcore/.cli/deployed-state.json`, which step 3 and the helper scripts read.
-It is not committed because it names one deployment.
+becomes `agentflow-SkyflowGateway`. Step 2 also writes
+`agentcore/.cli/deployed-state.json`, which the helper scripts read. It is not
+committed because it names one deployment.
 
-Step 3 grants the gateway's service role two things. The first is
-`lambda:InvokeFunction` on the interceptor so the gateway can call it. The second
-is permission to read the caller's configuration bundle because `tools/list`
-fails without it when the caller is a runtime.
-
-**After every later `agentcore deploy`, confirm the interceptor is still
-attached.** The gateway is a CloudFormation resource that knows nothing about the
-interceptor, so check that a deploy has not left it without one:
+**Step 3 confirms the interceptor is attached.** Run this after every
+`agentcore deploy`:
 
 ```bash
 python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 ```
 
 It changes nothing and exits non-zero if the interceptor is missing at either
-point. Re-run step 3 if it is.
+point. A failure after a successful step 2 means the gateway resource in
+`agentcore/cdk/lib/cdk-stack.ts` has lost its interceptor configuration. Running
+the script without `--check` repairs the live gateway, but the next deploy that
+changes the gateway removes the interceptor again until the CDK app is fixed.
+
+The import also holds the order in reverse. CloudFormation will not delete the
+interceptor stack or change its exported ARN while the AgentCore stack imports
+it, so tear the AgentCore stack down first.
+
+To attach a Lambda that was deployed some other way, put its ARN in
+`agentcore/cdk/cdk.context.json` as `interceptorFunctionArn`. That file is
+gitignored and `agentcore deploy` reads it. The gateway then uses that ARN and no
+longer waits for the interceptor stack.
+
+```json
+{ "interceptorFunctionArn": "arn:aws:lambda:us-east-1:<account>:function:<name>" }
+```
 
 ## Policy
 
@@ -216,6 +229,9 @@ uv run --with boto3 python -m unittest discover \
 
 # agent
 uv run --with boto3 python -m unittest discover -s tests/flow -t tests/flow
+
+# the interceptor attachment in the AgentCore CDK app
+(cd agentcore/cdk && npm ci && npm test)
 ```
 
 CI runs four jobs on every push and pull request.

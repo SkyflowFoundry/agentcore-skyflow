@@ -24,7 +24,7 @@ export SKYFLOW_GATEWAY_URL=$(aws cloudformation describe-stacks \
 
 Everything below assumes the stack is already deployed. If you are starting from
 a fresh clone in a different AWS account then five things need your values
-before `agentcore deploy` will work.
+before you deploy.
 
 1. `agentcore/aws-targets.json` names the account and region to deploy into. It
    ships with a placeholder account.
@@ -46,9 +46,20 @@ its own function ARN, so the default name needs no configuration. Set the SSM
 parameter `/agentcore/s3-target/bucket` to point it somewhere else, and change
 `files.urlPatterns` in the policy to match.
 
-The full deploy order is in `gateway/interceptor/README.md` because the
-interceptor cannot be declared in `agentcore.json` and has to be attached after
-the gateway exists.
+Deploy the interceptor stack before `agentcore deploy`. The gateway imports the
+interceptor's function ARN from that stack and attaches it in the same deploy,
+so `agentcore deploy` fails with `No export named
+SkyflowInterceptorStack-InterceptorFunctionArn found` until the interceptor
+stack exists. The last command confirms the interceptor is attached at both
+interception points and changes nothing.
+
+```bash
+(cd gateway/interceptor/cdk && npm ci && npm run build && npx cdk deploy --require-approval never)
+agentcore deploy --target dev -y
+python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+```
+
+Run the check again after every later `agentcore deploy`.
 
 ## The quickest check
 
@@ -66,7 +77,8 @@ The agent returns a URL. Look at the host.
    `try-sb1-uw2-detect-input.s3.us-west-2.amazonaws.com`.
 2. A host that starts with `agentcore-skyflow-files-` is your own
    bucket and means the interceptor did not fire. The agent is holding a link to
-   the original document.
+   the original document. Check whether the interceptor is attached with
+   `python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check`.
 
 ## Prove the contents changed
 

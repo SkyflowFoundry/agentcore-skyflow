@@ -79,9 +79,8 @@ const METRICS: Array<[string, string[], string | null]> = [
  * Skyflow de-identify/re-identify interceptor for an AgentCore Gateway.
  *
  * Deploys the interceptor Lambda plus the SSM parameter holding its redaction
- * policy. Attaching the function to a gateway is a separate step — the
- * AgentCore CLI cannot declare interceptors, so `scripts/attach_interceptor.py`
- * calls `update-gateway` after `agentcore deploy`.
+ * policy. The AgentCore stack in agentcore/cdk imports the function ARN this
+ * stack exports and attaches it to the gateway, so this stack deploys first.
  */
 export class InterceptorStack extends cdk.Stack {
   public readonly interceptorFunction: lambda.Function;
@@ -207,13 +206,13 @@ export class InterceptorStack extends cdk.Stack {
     this.policyParameter.grantRead(this.interceptorFunction);
     skyflowSecret.grantRead(this.interceptorFunction);
 
-    // The gateway service role invokes this function. That grant is added by
-    // scripts/attach_interceptor.py, which knows the gateway's role ARN; it
-    // cannot be expressed here because the gateway is created by the AgentCore
-    // CLI in a separate stack.
+    // The AgentCore stack imports this export by name, attaches the function to
+    // its gateway and grants the gateway role permission to invoke it. Renaming
+    // the export breaks `agentcore deploy`, and CloudFormation refuses to change
+    // or delete it while that stack imports it.
     new cdk.CfnOutput(this, 'InterceptorFunctionArn', {
       value: this.interceptorFunction.functionArn,
-      description: 'Pass to scripts/attach_interceptor.py',
+      description: 'Imported by the AgentCore stack, which attaches it to the gateway',
       exportName: `${this.stackName}-InterceptorFunctionArn`,
     });
 
