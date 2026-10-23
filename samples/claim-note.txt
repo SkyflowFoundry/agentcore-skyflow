@@ -1,5 +1,0 @@
-Claim note
-Customer: Daniel Okonkwo
-Email: daniel.okonkwo@example.com
-Phone: 555-0133
-Notes: follow up about the Chicago policy renewal.

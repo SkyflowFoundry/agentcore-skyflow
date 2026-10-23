@@ -220,5 +220,47 @@ class DocumentParsingTestCase(unittest.TestCase):
         self.assertGreater(len(policy_set.overrides), 0)
 
 
+class ShippedPolicyTestCase(unittest.TestCase):
+    """Decisions in the shipped policy that a well-meaning edit could undo."""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        path = Path(__file__).resolve().parents[1] / "config" / "policy.json"
+        cls.policy = PolicySet.from_json(json.loads(path.read_text()))
+
+    def test_shield_the_model_mints_one_way_tokens(self):
+        """Vault tokens here could be re-identified by any rule that
+        re-identifies, handing scraped originals back to the model."""
+        rule = self.policy.resolve("exa", "web_fetch_exa").response
+        self.assertEqual((rule.action, rule.token_type), ("deidentify", "counter"))
+
+    def test_no_rule_mints_vault_tokens_on_a_response(self):
+        for server, tool in [("exa", "web_fetch_exa"), ("exa", "web_search_exa"), ("s3", "list_documents"),
+                             ("s3", "get_document"), ("other", "anything")]:
+            with self.subTest(tool=tool):
+                self.assertFalse(self.policy.resolve(server, tool).response.mints_vault_tokens)
+
+    def test_web_search_keeps_locations_and_still_shields_names(self):
+        policy = self.policy.resolve("exa", "web_search_exa")
+        self.assertNotIn("location", policy.entities)
+        self.assertIn("name", policy.entities)
+        self.assertEqual(policy.request.action, "deidentify")
+        self.assertTrue(policy.request.mints_vault_tokens, "the answer must be re-identifiable")
+
+    def test_listing_documents_calls_skyflow_for_nothing(self):
+        policy = self.policy.resolve("s3", "list_documents")
+        self.assertTrue(policy.is_noop)
+        self.assertFalse(policy.files.is_active)
+
+    def test_documents_are_allowed_from_every_s3_host_form(self):
+        rule = self.policy.resolve("s3", "get_document").files
+        bucket = "agentcore-skyflow-files-123456789012"
+        for host in (f"{bucket}.s3.amazonaws.com", f"{bucket}.s3.eu-west-1.amazonaws.com",
+                     f"{bucket}.s3.dualstack.eu-west-1.amazonaws.com"):
+            with self.subTest(host=host):
+                self.assertTrue(rule.matches_url(f"https://{host}/samples/a.txt?X-Amz-Signature=x"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

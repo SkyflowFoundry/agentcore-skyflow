@@ -1,0 +1,8 @@
+Card dispute case note
+Case: DSP-20481
+Customer: Daniel Okonkwo
+Email: daniel.okonkwo@example.com
+Phone: 555-0133
+Card: 4111 1111 1111 1111
+Merchant: ACME Electronics, London
+Notes: Disputes a £249.00 charge on 12 September. Order never arrived.

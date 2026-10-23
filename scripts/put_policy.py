@@ -41,45 +41,84 @@ def describe(policy_set: PolicySet) -> None:
               f"-> request={resolved.request.action} response={resolved.response.action}")
 
 
+#: SSM's limit for a Standard-tier parameter value. Advanced allows 8 KB but is
+#: billed per parameter, so it is opt-in.
+STANDARD_TIER_LIMIT = 4096
+ADVANCED_TIER_LIMIT = 8192
+
+
+def serialize(document: dict) -> str:
+    """The policy as published: minified, so whitespace does not spend the limit."""
+    return json.dumps(document, separators=(",", ":"))
+
+
+def validate(document: dict) -> PolicySet:
+    """Parse with the Lambda's own model, exiting with the reason on failure."""
+    try:
+        return PolicySet.from_json(document)
+    except PolicyError as exc:
+        sys.exit(f"Policy is invalid: {exc}")
+
+
+def check_size(value: str, tier: str) -> None:
+    """Exit before SSM refuses the write, naming the way out."""
+    limit = ADVANCED_TIER_LIMIT if tier == "Advanced" else STANDARD_TIER_LIMIT
+    if len(value.encode("utf-8")) > limit:
+        hint = (
+            "Publish with --tier advanced (and deploy the stack with "
+            "-c policyParameterTier=advanced) to raise the limit to 8 KB."
+            if tier != "Advanced" else "Split the policy or shorten its overrides."
+        )
+        sys.exit(f"Policy is {len(value.encode('utf-8'))} bytes minified; the {tier} tier allows {limit}. {hint}")
+
+
+def publish(document: dict, parameter_name: str, region: str | None, tier: str) -> None:
+    value = serialize(document)
+    check_size(value, tier)
+
+    import boto3
+
+    session = boto3.Session(region_name=region) if region else boto3.Session()
+    session.client("ssm").put_parameter(
+        Name=parameter_name,
+        Value=value,
+        Type="String",
+        Tier=tier,
+        Overwrite=True,
+    )
+    print(f"\nWrote {parameter_name} ({len(value)} bytes). Active within the interceptor's cache TTL.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--parameter-name", default=DEFAULT_PARAMETER)
     parser.add_argument("--region", default=None)
+    parser.add_argument("--tier", choices=["standard", "advanced"], default="standard",
+                        help="SSM parameter tier. Standard holds 4 KB, advanced 8 KB.")
     parser.add_argument("--dry-run", action="store_true", help="Validate without writing to SSM.")
     args = parser.parse_args()
+    tier = args.tier.capitalize()
 
     if not POLICY_FILE.exists():
         sys.exit(f"Policy file not found: {POLICY_FILE}")
 
-    raw = POLICY_FILE.read_text()
     try:
-        document = json.loads(raw)
+        document = json.loads(POLICY_FILE.read_text())
     except json.JSONDecodeError as exc:
         sys.exit(f"Policy file is not valid JSON: {exc}")
 
-    try:
-        policy_set = PolicySet.from_json(document)
-    except PolicyError as exc:
-        sys.exit(f"Policy is invalid: {exc}")
-
+    policy_set = validate(document)
     print(f"Policy valid ({POLICY_FILE.relative_to(REPO_ROOT)}):")
     describe(policy_set)
+    value = serialize(document)
+    check_size(value, tier)
+    print(f"  size: {len(value)} of {STANDARD_TIER_LIMIT if tier == 'Standard' else ADVANCED_TIER_LIMIT} bytes ({tier} tier)")
 
     if args.dry_run:
         print("\nDry run — nothing written.")
         return
 
-    import boto3
-
-    session = boto3.Session(region_name=args.region) if args.region else boto3.Session()
-    ssm = session.client("ssm")
-    ssm.put_parameter(
-        Name=args.parameter_name,
-        Value=raw,
-        Type="String",
-        Overwrite=True,
-    )
-    print(f"\nWrote {args.parameter_name}. Active within the interceptor's cache TTL.")
+    publish(document, args.parameter_name, args.region, tier)
 
 
 if __name__ == "__main__":

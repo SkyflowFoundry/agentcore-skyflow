@@ -9,13 +9,15 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
 endobj
 4 0 obj
-<< /Length 208 >>
+<< /Length 341 >>
 stream
 BT
 /F1 12 Tf
 72 720 Td
 14 TL
-(Claim note) Tj
+(Card dispute case note) Tj
+T*
+(Case: DSP-20481) Tj
 T*
 (Customer: Daniel Okonkwo) Tj
 T*
@@ -23,13 +25,17 @@ T*
 T*
 (Phone: 555-0133) Tj
 T*
-(Notes: follow up about the Chicago policy renewal.) Tj
+(Card: 4111 1111 1111 1111) Tj
+T*
+(Merchant: ACME Electronics, London) Tj
+T*
+(Notes: Disputes a £249.00 charge on 12 September. Order never arrived.) Tj
 T*
 ET
 endstream
 endobj
 5 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
 endobj
 xref
 0 6
@@ -38,9 +44,9 @@ xref
 0000000058 00000 n 
 0000000115 00000 n 
 0000000241 00000 n 
-0000000500 00000 n 
+0000000633 00000 n 
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-570
+730
 %%EOF

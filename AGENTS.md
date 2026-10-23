@@ -76,7 +76,7 @@ Deploy injects one set per reachable resource, so an agent never hardcodes a URL
 | `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | One pair per gateway in `agentCoreGateways[]`, wired to every runtime in the project. `<NAME>` is the gateway name upper-cased — `SKYFLOWGATEWAY` here. |
 | `GATEWAY_<ID>_URL`, `_AUTH_TYPE`, `_ARN` | One set per runtime `connections[]` entry pointing at a gateway outside the project. `<ID>` is the connection id upper-cased. |
 | `MEMORY_FLOWMEMORY_ID` | Injected by AgentCore for the `FlowMemory` resource. |
-| `MCP_ENDPOINTS` | Override — comma-separated MCP URLs that *replace* everything discovered. |
+| `MCP_ENDPOINTS` | Override — comma-separated MCP URLs that *replace* everything discovered. With neither this nor a gateway, the agent refuses to start. |
 | `MCP_AUTH_TYPE` | Auth for `MCP_ENDPOINTS`: `AWS_IAM`, `CUSTOM_JWT` or `NONE`. Defaults to `CUSTOM_JWT` when `MCP_BEARER_TOKEN` is set, else `NONE`. |
 | `MCP_BEARER_TOKEN` | Bearer token for `CUSTOM_JWT` endpoints. |
 | `BEDROCK_MODEL_ID` | Model or inference-profile id. Defaults to `global.anthropic.claude-sonnet-5`; the template's original default is not subscribed in this account. |

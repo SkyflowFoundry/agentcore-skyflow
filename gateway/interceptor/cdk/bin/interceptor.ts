@@ -72,6 +72,18 @@ function resolveEnv(): { account: string; region: string } {
  *   account / region  override aws-targets.json entirely
  *   allowUpstreamPayloadLogging  true to let the policy's logUpstreamPayloads
  *                     take effect (default false: the flag is ignored)
+ *   policyMaxStaleSeconds  how long the last good policy serves while SSM
+ *                     cannot be read (default 3600)
+ *   skyflowTimeoutSeconds  per-request Skyflow timeout (default 5)
+ *   policyParameterName  SSM parameter for the policy
+ *                     (default /agentcore/interceptor/skyflow-policy)
+ *   policyParameterTier  standard (4 KB, default) or advanced (8 KB)
+ *   logRetentionDays  days to keep interceptor logs (default 30)
+ *   metricNamespace   CloudWatch namespace for metrics (default SkyflowInterceptor)
+ *   alarmTopicArn     SNS topic the alarms notify (default: none)
+ *   stackName         CloudFormation stack name (default SkyflowInterceptorStack);
+ *                     set it, with policyParameterName, for a second deployment
+ *                     in the same account and region
  */
 function required(name: string): string {
   const value = app.node.tryGetContext(name);
@@ -83,7 +95,12 @@ function required(name: string): string {
 
 const env = resolveEnv();
 
-new InterceptorStack(app, 'SkyflowInterceptorStack', {
+const tier = app.node.tryGetContext('policyParameterTier') ?? 'standard';
+if (tier !== 'standard' && tier !== 'advanced') {
+  throw new Error(`policyParameterTier must be standard or advanced, got '${tier}'`);
+}
+
+new InterceptorStack(app, app.node.tryGetContext('stackName') ?? 'SkyflowInterceptorStack', {
   env,
   skyflowVaultUrl: required('skyflowVaultUrl'),
   skyflowVaultId: required('skyflowVaultId'),
@@ -91,4 +108,11 @@ new InterceptorStack(app, 'SkyflowInterceptorStack', {
   policyCacheTtlSeconds: Number(app.node.tryGetContext('policyCacheTtlSeconds') ?? 60),
   // Context arrives as the string "true" from -c, or a boolean from cdk.json.
   allowUpstreamPayloadLogging: String(app.node.tryGetContext('allowUpstreamPayloadLogging') ?? false) === 'true',
+  policyMaxStaleSeconds: Number(app.node.tryGetContext('policyMaxStaleSeconds') ?? 3600),
+  skyflowTimeoutSeconds: Number(app.node.tryGetContext('skyflowTimeoutSeconds') ?? 5),
+  policyParameterName: app.node.tryGetContext('policyParameterName'),
+  policyParameterTier: tier,
+  logRetentionDays: Number(app.node.tryGetContext('logRetentionDays') ?? 30),
+  metricNamespace: app.node.tryGetContext('metricNamespace'),
+  alarmTopicArn: app.node.tryGetContext('alarmTopicArn'),
 });

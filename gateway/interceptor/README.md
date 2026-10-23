@@ -90,6 +90,17 @@ sees real data; the model context never does. Useful when results carry PII the
 agent has no need to read — the shipped policy applies this to Exa's
 `web_fetch_exa` tool, whose result is scraped web content.
 
+Shield the model should mint **one-way** tokens, which is how the shipped rule
+is set. All rules share one vault, so a vault token minted here can be
+re-identified by any other rule whose response re-identifies. A tool that
+echoes its input back would then hand the scraped originals to the model.
+Counter tokens cannot be reversed by anything.
+
+Per-tool `entities` narrow what counts as sensitive for one tool. The shipped
+rule for `web_search_exa` leaves out `location`, so a search for a customer's
+dispute with a merchant in London still names London: the customer's name is
+what identifies them, and the city is what makes the search useful.
+
 ### HTTP-shaped targets are blocked
 
 AgentCore Runtime, `passthrough` and inference targets reach the interceptor as
@@ -104,12 +115,40 @@ To accept that such a target is not protected, set
 `"httpPayloads": {"action": "passthrough"}`. Its traffic then goes through
 untouched, and every call logs `http_payload_passthrough` at WARNING so the
 gap stays visible. The stack turns both log lines into the
-`SkyflowInterceptor/HttpPayloadBlocked` and `HttpPayloadPassthrough` metrics
-for alarming.
+`SkyflowInterceptor/HttpPayloadBlocked` and `HttpPayloadPassthrough` metrics,
+and alarms on the second; see [Metrics and alarms](#metrics-and-alarms).
 
 The setting is gateway-wide rather than per tool. An HTTP response event
 carries no request, so on the way back there is no target name to match an
 override against, and a per-target rule could only be half enforced.
+
+### When SSM or Skyflow misbehaves
+
+- **A failed policy refresh serves the last good policy.** If SSM throttles, or
+  someone publishes a policy that does not parse, the Lambda keeps using the
+  policy it last loaded and logs `policy_refresh_failed ...
+  action=serving_last_good`. Once the policy is `POLICY_MAX_STALE_SECONDS` old
+  (default one hour, CDK context `policyMaxStaleSeconds`), measured from when it
+  was loaded, it stops and fails closed. A cold Lambda with no policy at all
+  always fails closed.
+- **A failing SSM is asked at most every ten seconds.** That holds while a
+  stale policy is being served and while failing closed, so a throttled SSM is
+  never read on every call. The pause never stretches a stale policy past its
+  limit.
+- **A rotated API key is picked up on the first 401.** The client re-reads the
+  secret once and retries. Calls that hit a 401 together wait for one re-read
+  and all use its answer. A key that is simply wrong is re-read at most once
+  every thirty seconds, so a bad key cannot turn every call into a Secrets
+  Manager read.
+- **File endpoint errors are readable.** A Detect v2 error such as `Missing
+  Destination for entity NAME` reaches the log. Any URL in it is cut to its
+  host, and any signing parameter is masked wherever it appears, because a
+  presigned URL's query string is a credential. A JSON body is decoded first,
+  so an escaped URL cannot slip past. String endpoint errors stay opaque
+  because their bodies can echo the submitted text.
+- **The Skyflow timeout is configurable.** `SKYFLOW_TIMEOUT_SECONDS`, default
+  five, CDK context `skyflowTimeoutSeconds`. Raise it if large fetched pages
+  fail closed on a slow vault.
 
 ### Validation rule
 
@@ -362,7 +401,10 @@ one server or tool, or in `defaults` to cover everything.
     "action": "deidentify",
     "directions": ["response"],
     "fields": ["url", "content[*].url"],
-    "urlPatterns": ["https://my-bucket.s3.amazonaws.com/*"],
+    "urlPatterns": [
+      "https://my-bucket.s3.amazonaws.com/*",
+      "https://my-bucket.s3.*.amazonaws.com/*"
+    ],
     "maxFiles": 2,
     "configuration": { "detect": { "entities": [ ... ] } }
   }
@@ -375,6 +417,17 @@ one server or tool, or in `defaults` to cover everything.
 | `fields` | Where the reference is, relative to the tool's arguments or its result. `content[*].url` covers a list. Naming fields stops the scan. |
 | `urlPatterns` | **Required.** The allowlist of places a file may come from, as `https://host/path` globs. Every URL is checked against it before the interceptor fetches it or hands it to Skyflow. Also finds references when `fields` is absent, and flags strays when it is not. |
 | `maxFiles` | Cap per call. Each file is a separate run and they are processed in order. |
+
+S3 presigns on more than one host form. The default boto3 client uses the
+global `bucket.s3.amazonaws.com`; a client configured for virtual-hosted
+addressing uses `bucket.s3.<region>.amazonaws.com`, and a dual-stack client
+`bucket.s3.dualstack.<region>.amazonaws.com`. The allowlist fails the call when
+a URL matches none of its patterns, so list every form your store produces. The
+shipped rule lists all three.
+
+The shipped bucket pattern ends in `*` so the demo works in any account. Anyone
+can create a bucket whose name starts the same way, so in production name your
+bucket exactly.
 | `configuration` | Inline Detect configuration, forwarded as given with `vaultId` injected. Anything the Detect API accepts works here without a code change. |
 
 Configurations are inline rather than referenced by `configurationId`: a
@@ -433,7 +486,8 @@ policy that depends on it.
 ## Logging
 
 Everything the interceptor writes goes to its CloudWatch log group, named by the
-`InterceptorLogGroupName` stack output, with one week of retention. There are
+`InterceptorLogGroupName` stack output, kept for 30 days by default (CDK
+context `logRetentionDays`). There are
 four settings that change what lands there, and one guarantee that holds under
 every combination of them.
 
@@ -563,7 +617,28 @@ Two limits worth stating plainly:
   "upstream" payload *is* the original, so logging it would write user data to
   CloudWatch. `Policy.should_log_upstream` enforces that, not the caller.
 
-Log retention on the interceptor group is one week.
+### Metrics and alarms
+
+The stack turns the log lines that matter into CloudWatch metrics in the
+`SkyflowInterceptor` namespace (CDK context `metricNamespace`), and alarms on
+any occurrence in a five-minute window.
+
+| Metric | Counts | Alarm |
+| --- | --- | --- |
+| `FailClosed` | Calls withheld because de-identification could not complete | Yes |
+| `FailOpen` | Calls let through unprotected by a `fail_open` rule after an error | Yes |
+| `PolicyUnavailable` | Policy loads that failed, and refreshes serving a stale policy | Yes |
+| `HttpPayloadBlocked` | HTTP-shaped events refused | No: blocking is the intended outcome |
+| `HttpPayloadPassthrough` | HTTP-shaped events let through uninspected | Yes |
+
+The alarms change state on their own. To be told, deploy with
+`-c alarmTopicArn=<SNS topic ARN>`. A test checks that every term a metric
+filter counts is still logged by the Lambda, so a renamed log line cannot
+silently disable an alarm.
+
+Active X-Ray tracing is on, so each invocation shows up in X-Ray and
+CloudWatch Application Signals with its duration, including time spent waiting
+on Skyflow.
 
 ## Verify a live gateway
 
@@ -592,6 +667,21 @@ for the reasons given in the section above.
 
 ## Iterating on policy
 
+`put_policy.py` publishes the policy minified and refuses one that would not
+fit the parameter. A Standard-tier SSM parameter holds 4 KB, and the dry run
+prints how much of it the policy uses. Past that, deploy the stack with
+`-c policyParameterTier=advanced` and publish with `--tier advanced` for 8 KB.
+Advanced parameters are billed.
+
+A second interceptor in the same account and region needs its own parameter
+and stack name, or the two overwrite each other's policy:
+
+```bash
+npx cdk deploy -c stackName=SkyflowInterceptorStaging \
+  -c policyParameterName=/agentcore/interceptor/staging-policy
+python3 scripts/put_policy.py --parameter-name /agentcore/interceptor/staging-policy
+```
+
 ```bash
 python3 scripts/put_policy.py --dry-run     # validate and print the effective rules
 python3 scripts/put_policy.py --region us-east-1
@@ -614,12 +704,13 @@ uv run --with boto3 python -m unittest discover \
 | `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
 | `test_skyflow_client.py` | Request shape, retry and backoff, and that error bodies never leak |
-| `test_settings.py` | Policy cache TTL, API key parsing, lazy boto3 construction |
+| `test_settings.py` | Policy cache TTL, serving the last good policy, API key parsing and refresh, lazy boto3 construction |
 | `test_skyflow_files.py` | Detect v2 submit-by-URL, run polling and its deadline, output selection |
 | `test_file_url_safety.py` | The file URL allowlist (SC-16092): pattern parsing, wildcard confinement, parser-confusion URLs, non-public addresses, no redirects or non-HTTPS handlers in the probe |
 | `test_file_interception.py` | URL swapping, named fields, stray warnings, format detection, fail-closed paths, token types and destinations, size limits, the MCP text envelope |
 | `test_envelope.py` | Decoding a JSON text content block and encoding it back |
 | `test_upstream_logging.py` | Which payload snapshots may be logged for each direction and action, and which must never be; the deploy-time gate |
+| `test_metric_terms.py` | Every log term the stack's metric filters count is still logged by the Lambda |
 | `test_logsafe.py` | `LOG_LEVEL` never reaching the AWS SDK loggers, credential and PII-shape masking in logged payloads, header scrubbing on entry |
 
 Each file also runs standalone (`python3 tests/test_policy.py`).

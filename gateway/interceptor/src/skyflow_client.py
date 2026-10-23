@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +32,20 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+#: Paths whose error bodies are safe to surface. The file endpoints are sent a
+#: URL and a configuration, never document text, so their errors describe the
+#: request (`Missing Destination for entity NAME`) rather than echo user data.
+#: The string endpoints are sent the text itself, so theirs stay unread.
+SAFE_ERROR_BODY_PREFIXES = ("/v2/detect/",)
+#: Cap on a surfaced error body.
+MAX_ERROR_DETAIL = 300
+_URL = re.compile(r"""https?://([^/\s"'?#]+)[^\s"']*""")
+#: Signing parameters of a presigned URL, matched on their own as a backstop
+#: for a URL whose scheme or slashes arrived in a form `_URL` cannot see.
+_SIGNING_PARAM = re.compile(
+    r"""(?i)\b(x-amz-[a-z0-9-]+|signature|awsaccesskeyid|x-goog-[a-z0-9-]+|sig|se|sp|sv)=[^&\s"']*"""
+)
 
 #: File formats for which `VAULT_TOKEN` de-identification is supported, per the
 #: Detect v2 spec. Every other format — notably PDF, images and audio — can only
@@ -99,6 +114,28 @@ class RunTimeout(SkyflowError):
     """The run did not reach a terminal state inside the caller's deadline."""
 
 
+def _safe_error_detail(exc: urllib.error.HTTPError) -> str:
+    """A short, URL-free excerpt of a file endpoint's error body.
+
+    The submitted value is a presigned URL, and its query string is a working
+    credential until it expires, so any URL in the body is cut to its host.
+    """
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - a diagnostic must not mask the real error
+        return ""
+    # JSON may spell a URL as `https:\/\/host` or with `\u` escapes, which the
+    # pattern below would not recognise. Decoding and re-encoding a JSON body
+    # writes every string plainly first.
+    try:
+        text = json.dumps(json.loads(raw), ensure_ascii=False)
+    except ValueError:
+        text = raw.replace("\\/", "/")
+    text = _URL.sub(r"https://\1/<redacted>", text)
+    text = _SIGNING_PARAM.sub(r"\1=<redacted>", text)
+    return " ".join(text.split())[:MAX_ERROR_DETAIL]
+
+
 def build_file_configuration(
     entity_types: tuple[str, ...] | list[str] = (),
     token_type: str = "counter",
@@ -162,6 +199,7 @@ class SkyflowClient:
         timeout_seconds: float = 5.0,
         max_retries: int = 2,
         backoff_initial_ms: int = 100,
+        refresh_api_key: Callable[[str], str] | None = None,
     ) -> None:
         self._vault_url = vault_url.rstrip("/")
         self._vault_id = vault_id
@@ -169,6 +207,9 @@ class SkyflowClient:
         self._timeout = timeout_seconds
         self._max_retries = max_retries
         self._backoff_initial_ms = backoff_initial_ms
+        #: Called once when Skyflow answers 401, with the key it rejected, to
+        #: pick up a rotated key.
+        self._refresh_api_key = refresh_api_key
 
     def deidentify(
         self,
@@ -293,14 +334,20 @@ class SkyflowClient:
         attempts = self._max_retries + 1
         backoff_ms = self._backoff_initial_ms
         last_error: str | None = None
+        key_refreshed = False
+        attempt = 0
 
-        for attempt in range(1, attempts + 1):
+        while attempt < attempts:
+            attempt += 1
+            # Captured per attempt: string fields are transformed in parallel
+            # on one client, so another thread may swap the key mid-flight.
+            used_key = self._api_key
             req = urllib.request.Request(
                 url,
                 data=payload,
                 method=method,
                 headers={
-                    "Authorization": f"Bearer {self._api_key}",
+                    "Authorization": f"Bearer {used_key}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
@@ -309,16 +356,35 @@ class SkyflowClient:
                 with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
+                if exc.code == 401 and self._refresh_api_key and not key_refreshed:
+                    # A rotated key: re-read it once and try again. Does not
+                    # spend a retry, and is not repeated if the new key fails.
+                    key_refreshed = True
+                    exc.close()
+                    fresh = self._refresh_api_key(used_key)
+                    # Compared with the key this request sent, not the shared
+                    # attribute, which a parallel call may already have updated.
+                    if fresh and fresh != used_key:
+                        self._api_key = fresh
+                        attempt -= 1
+                        continue
+                    raise SkyflowError(f"Skyflow {path} failed with status 401") from exc
                 if exc.code in RETRYABLE_STATUS and attempt < attempts:
                     last_error = str(exc.code)
+                    exc.close()
                     logger.warning(
                         "skyflow_retryable_status path=%s status=%d attempt=%d/%d",
                         path, exc.code, attempt, attempts,
                     )
                 else:
-                    # The error body is deliberately not logged or attached: it can
-                    # echo the submitted text, which is the sensitive data itself.
-                    raise SkyflowError(f"Skyflow {path} failed with status {exc.code}") from exc
+                    message = f"Skyflow {path} failed with status {exc.code}"
+                    if path.startswith(SAFE_ERROR_BODY_PREFIXES):
+                        detail = _safe_error_detail(exc)
+                        if detail:
+                            message = f"{message}: {detail}"
+                    # Any other error body is deliberately not logged or attached:
+                    # it can echo the submitted text, which is the sensitive data.
+                    raise SkyflowError(message) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = repr(exc)
                 logger.warning(

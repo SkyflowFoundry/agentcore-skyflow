@@ -4,6 +4,9 @@ This walks through proving that the gateway de-identifies a document before the
 agent can read it. Everything here runs against the deployed stack so there is
 nothing to build first.
 
+To record the demo for the blog post, follow `docs/RECORDING.md` instead. It
+uses the same sample and adds the setup, scene-by-scene prompts and teardown.
+
 Run every command from the repository root.
 
 Two values differ per deployment. Export them once and every command below works
@@ -52,7 +55,7 @@ the gateway exists.
 Ask the agent for a document.
 
 ```bash
-agentcore invoke --target dev "Get a download link for samples/claim-note.txt and tell me the exact URL."
+agentcore invoke --target dev "Get a download link for samples/dispute-case-note.txt and tell me the exact URL."
 ```
 
 The agent returns a URL. Look at the host.
@@ -71,22 +74,25 @@ Compare what is stored against what the agent receives.
 
 ```bash
 # what is actually stored in your bucket
-aws s3 cp s3://$BUCKET/samples/claim-note.txt -
+aws s3 cp s3://$BUCKET/samples/dispute-case-note.txt -
 ```
 
 ```
-Claim note
+Card dispute case note
+Case: DSP-20481
 Customer: Daniel Okonkwo
 Email: daniel.okonkwo@example.com
 Phone: 555-0133
-Notes: follow up about the Chicago policy renewal.
+Card: 4111 1111 1111 1111
+Merchant: ACME Electronics, London
+Notes: Disputes a £249.00 charge on 12 September. Order never arrived.
 ```
 
 ```bash
 # what the agent receives
 app/Flow/.venv/bin/python scripts/mcp_call.py tools/call \
   --name s3___get_document \
-  --arguments '{"key": "samples/claim-note.txt"}' \
+  --arguments '{"key": "samples/dispute-case-note.txt"}' \
   | python3 -c "
 import json,sys,urllib.request
 d = json.load(sys.stdin)
@@ -96,12 +102,20 @@ print(urllib.request.urlopen(url, timeout=60).read().decode())
 ```
 
 ```
-Claim note
+Card dispute case note
+Case: DSP-20481
 Customer: [NAME_AJbrIud]
 Email: [EMAIL_ADDRESS_nJFlbfH]
 Phone: [PHONE_NUMBER_VVwjCfV]
-Notes: follow up about the [LOCATION_y3wQt7I] policy renewal.
+Card: [CREDIT_CARD_k2LpQ8s]
+Merchant: ACME Electronics, [LOCATION_y3wQt7I]
+Notes: Disputes a £249.00 charge on 12 September. Order never arrived.
 ```
+
+That output is illustrative. The suffixes differ on every run, and exactly
+which spans become tokens is Detect's call, so a date may or may not be caught.
+The document rule uses the default entity list, which includes `location`, so
+London is tokenized in the document even though the web search rule keeps it.
 
 The long random suffix tells you which kind of token you got.
 
@@ -129,8 +143,8 @@ It cannot carry a vault token because Skyflow only stores reversible tokens for
 Try them yourself:
 
 ```bash
-agentcore invoke --target dev "Get a download link for samples/claim-note.docx"
-agentcore invoke --target dev "Get a download link for samples/claim-note.pdf"
+agentcore invoke --target dev "Get a download link for samples/dispute-case-note.docx"
+agentcore invoke --target dev "Get a download link for samples/dispute-case-note.pdf"
 ```
 
 ## How large a document can be
@@ -177,7 +191,7 @@ untouched.
 ## Change the rules and watch the behaviour change
 
 The policy lives at `gateway/interceptor/config/policy.json` and the S3 rule is
-the third entry in `overrides`. It looks like this:
+the override for `get_document`. It looks like this:
 
 ```json
 {
@@ -189,7 +203,11 @@ the third entry in `overrides`. It looks like this:
     "action": "deidentify",
     "directions": ["response"],
     "fields": ["content[*].text.url"],
-    "urlPatterns": ["https://agentcore-skyflow-files-*.s3.amazonaws.com/*"],
+    "urlPatterns": [
+      "https://agentcore-skyflow-files-*.s3.amazonaws.com/*",
+      "https://agentcore-skyflow-files-*.s3.*.amazonaws.com/*",
+      "https://agentcore-skyflow-files-*.s3.dualstack.*.amazonaws.com/*"
+    ],
     "maxFiles": 1,
     "tokenType": "vault_token",
     "destinations": {"default": "table1.{entity}_entity"}
@@ -197,15 +215,21 @@ the third entry in `overrides`. It looks like this:
 }
 ```
 
-Change `tokenType` to `counter` and publish it.
+Change `tokenType` to `counter` and publish it. `scripts/demo_policy.py` does
+exactly that edit without touching the file:
 
 ```bash
-python3 scripts/put_policy.py --dry-run          # validate and print the rules
-app/Flow/.venv/bin/python scripts/put_policy.py --region us-east-1
+app/Flow/.venv/bin/python scripts/demo_policy.py one-way-documents --region us-east-1
 ```
 
 Wait about sixty seconds for the interceptor cache to expire and call again. The
 tokens become `[NAME_1]` instead of `[NAME_AJbrIud]`. No redeploy is involved.
+
+Once you have seen that, put the shipped policy back:
+
+```bash
+app/Flow/.venv/bin/python scripts/demo_policy.py reset --region us-east-1
+```
 
 Set `"action": "none"` inside the `files` block and the agent starts receiving
 links to your original documents again. That is the clearest demonstration of
@@ -242,12 +266,19 @@ aws logs filter-log-events \
   --query 'events[].message' --output text | tr '\t' '\n' | grep -i fail
 ```
 
-Two causes account for most failures.
+Three causes account for most failures. The log line carries Skyflow's own
+message for each.
 
 1. `Missing Destination for entity NAME in DetectConfigV2` means the policy asks
    for vault tokens without naming a `table.column` for every entity.
 2. `<name> schema not found` means a destination names a table that the vault
    does not have.
+3. A run that fails only for documents containing a card number usually means
+   the vault has no column for that entity, such as `table1.credit_card_entity`.
+   Add the column or a `destinations` entry pointing at one that exists.
+
+If the call fails with `not allowed by files.urlPatterns`, the document URL's
+host matched none of the allowlist's patterns. The log names the host.
 
 ## Browsing the gateway from your own MCP client
 
@@ -292,7 +323,7 @@ assigned at creation so it differs in every account.
 Open it and use the test pane to send the same prompts.
 
 ```
-Get a download link for samples/claim-note.txt
+Get a download link for samples/dispute-case-note.txt
 ```
 
 The console shows the agent's tool calls, so you can watch it call

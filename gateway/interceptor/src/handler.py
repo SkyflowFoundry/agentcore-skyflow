@@ -47,6 +47,7 @@ import base64
 import copy
 import json
 import logging
+import time
 
 import envelope
 import file_urls
@@ -69,6 +70,9 @@ MAX_LOGGED_PAYLOAD = 4000
 #: Seconds held back from the Lambda budget so a response can still be built
 #: after a file run is abandoned.
 FILE_RESERVE_SECONDS = 5.0
+
+#: Polling budget when there is no Lambda context (direct invocation, tests).
+NO_CONTEXT_BUDGET_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------- entry point
@@ -449,7 +453,10 @@ def _remaining_seconds(context):
     """
     getter = getattr(context, "get_remaining_time_in_millis", None)
     if getter is None:
-        return lambda: 60.0
+        # A fixed deadline, not a fixed remainder: a constant would never run
+        # out, and a run that never finished would be polled forever.
+        deadline = time.monotonic() + NO_CONTEXT_BUDGET_SECONDS
+        return lambda: deadline - time.monotonic()
     return lambda: getter() / 1000.0
 
 

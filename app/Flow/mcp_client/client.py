@@ -20,11 +20,11 @@ from strands.tools.mcp.mcp_client import MCPClient
 
 from mcp_client.auth import build_auth
 from mcp_client.diagnostics import log_http_errors
-from mcp_client.endpoints import EXAMPLE_MCP_ENDPOINT, resolve_endpoints
+from mcp_client.endpoints import resolve_endpoints
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["EXAMPLE_MCP_ENDPOINT", "build_auth", "get_mcp_client", "get_mcp_clients"]
+__all__ = ["build_auth", "get_mcp_client", "get_mcp_clients"]
 
 
 def build_http_client(

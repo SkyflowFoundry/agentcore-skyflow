@@ -43,11 +43,6 @@ AUTH_TYPES = (AUTH_AWS_IAM, AUTH_CUSTOM_JWT, AUTH_NONE)
 # is the one reported.
 GATEWAY_ENV_PREFIXES = ("AGENTCORE_GATEWAY_", "GATEWAY_")
 
-# ExaAI provides information about code through web searches, crawling and code
-# context searches. Requires no authentication. Template default only — reached
-# only when neither a gateway nor MCP_ENDPOINTS is configured.
-EXAMPLE_MCP_ENDPOINT = "https://mcp.exa.ai/mcp"
-
 # https://<id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp
 _GATEWAY_HOST_REGION = re.compile(r"\.gateway\.bedrock-agentcore\.([a-z0-9-]+)\.")
 
@@ -167,9 +162,12 @@ def resolve_endpoints(environ: dict | None = None) -> list[Endpoint]:
         logger.info("Discovered %d gateway endpoint(s) from the environment", len(gateways))
         return gateways
 
-    logger.warning(
-        "No gateway environment variables and no MCP_ENDPOINTS; falling back to the "
-        "template example endpoint %s. Deploy a gateway or set MCP_ENDPOINTS.",
-        EXAMPLE_MCP_ENDPOINT,
+    # The CLI template fell back to a public MCP server here. In this project
+    # that would send the agent's tool calls to a third party with no
+    # interceptor in the path, and the only sign would be a warning line, so a
+    # missing gateway stops the agent instead.
+    raise RuntimeError(
+        "No MCP endpoint configured: no AGENTCORE_GATEWAY_*_URL or GATEWAY_*_URL in the "
+        "environment and no MCP_ENDPOINTS. Deploy the gateway, or set MCP_ENDPOINTS "
+        "explicitly to choose an endpoint without it."
     )
-    return [Endpoint(url=EXAMPLE_MCP_ENDPOINT, auth_type=AUTH_NONE, source="fallback")]

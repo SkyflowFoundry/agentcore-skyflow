@@ -171,5 +171,128 @@ class ErrorDisclosureTestCase(unittest.TestCase):
         )
 
 
+class KeyRotationTestCase(unittest.TestCase):
+    """A 401 re-reads the key once, so a rotated secret does not mean an outage."""
+
+    def test_the_refresher_is_told_which_key_was_rejected(self):
+        seen = []
+        c = client(refresh_api_key=lambda rejected: seen.append(rejected) or "new-key")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http_error(401), response({"processed_text": "ok"})]):
+            c.deidentify("x", ["name"])
+        self.assertEqual(seen, ["test-key"])
+
+    def test_a_401_refreshes_the_key_and_retries(self):
+        refreshed = []
+        c = client(refresh_api_key=lambda rejected: refreshed.append(1) or "new-key")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http_error(401), response({"processed_text": "ok"})]) as urlopen:
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+        self.assertEqual(refreshed, [1])
+        self.assertEqual(urlopen.call_args_list[1][0][0].get_header("Authorization"), "Bearer new-key")
+
+    def test_the_refresh_does_not_spend_a_retry(self):
+        c = client(max_retries=0, refresh_api_key=lambda rejected: "new-key")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http_error(401), response({"processed_text": "ok"})]):
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+
+    def test_an_unchanged_key_fails_without_looping(self):
+        c = client(refresh_api_key=lambda rejected: "test-key")
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)]) as urlopen:
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                c.deidentify("x", ["name"])
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_a_second_401_is_not_refreshed_again(self):
+        calls = []
+        c = client(refresh_api_key=lambda rejected: calls.append(1) or f"key-{len(calls)}")
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401), http_error(401)]):
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                c.deidentify("x", ["name"])
+        self.assertEqual(calls, [1])
+
+    def test_a_key_another_call_already_refreshed_is_still_retried(self):
+        """Fields are transformed in parallel on one client. If another call
+        swapped the key while this one was in flight, the refreshed key differs
+        from the one this request sent, and it must retry rather than give up."""
+        c = client(refresh_api_key=lambda rejected: "new-key")
+
+        def first_call(request, timeout):
+            c._api_key = "new-key"  # a parallel call got there first
+            raise http_error(401)
+
+        calls = iter([first_call, lambda request, timeout: response({"processed_text": "ok"})])
+        with mock.patch("urllib.request.urlopen", side_effect=lambda request, timeout: next(calls)(request, timeout)):
+            self.assertEqual(c.deidentify("x", ["name"]).processed_text, "ok")
+
+    def test_without_a_refresher_a_401_fails_as_before(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)]):
+            with self.assertRaisesRegex(SkyflowError, "status 401"):
+                client().deidentify("x", ["name"])
+
+
+class FileErrorDetailTestCase(unittest.TestCase):
+    """File endpoint errors are readable; string endpoint errors stay opaque."""
+
+    SIGNED = "https://bucket.s3.amazonaws.com/doc.txt?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA"
+
+    def test_a_file_submit_error_carries_the_reason(self):
+        body = '{"error":{"message":"Missing Destination for entity NAME in DetectConfigV2"}}'
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        self.assertIn("Missing Destination for entity NAME", str(caught.exception))
+
+    def test_a_url_in_the_body_is_cut_to_its_host(self):
+        body = f'{{"error":"could not fetch {self.SIGNED}"}}'
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        message = str(caught.exception)
+        self.assertIn("bucket.s3.amazonaws.com", message)
+        self.assertNotIn("deadbeef", message)
+        self.assertNotIn("AKIA", message)
+
+    def test_an_escaped_url_is_still_cut_to_its_host(self):
+        """JSON may write `/` as `\\/` and any character as a `\\u` escape,
+        either of which hides a URL from a plain pattern."""
+        plain = json.dumps({"error": f"could not fetch {self.SIGNED}"})
+        for label, body in (
+            ("escaped slashes", plain.replace("/", "\\/")),
+            ("unicode scheme", plain.replace("https", "\\u0068ttps")),
+            ("unicode slashes", plain.replace("/", "\\u002f")),
+        ):
+            with self.subTest(label):
+                with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+                    with self.assertRaises(SkyflowError) as caught:
+                        client().deidentify_file_url(self.SIGNED, "txt", {})
+                message = str(caught.exception)
+                self.assertNotIn("deadbeef", message)
+                self.assertNotIn("AKIA", message)
+
+    def test_signing_parameters_are_masked_even_outside_a_url(self):
+        body = "bad request: X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA123 rejected"
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, body)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        message = str(caught.exception)
+        self.assertNotIn("deadbeef", message)
+        self.assertNotIn("AKIA123", message)
+        self.assertIn("X-Amz-Signature=<redacted>", message)
+
+    def test_a_long_body_is_capped(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, "x" * 5000)]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify_file_url(self.SIGNED, "txt", {})
+        self.assertLess(len(str(caught.exception)), 400)
+
+    def test_a_string_endpoint_body_is_still_withheld(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(400, "Jane Doe was here")]):
+            with self.assertRaises(SkyflowError) as caught:
+                client().deidentify("Jane Doe was here", ["name"])
+        self.assertNotIn("Jane", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

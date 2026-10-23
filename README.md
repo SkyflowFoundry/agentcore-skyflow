@@ -72,7 +72,8 @@ agentcore/                  # repo root
 │       ├── config/         # policy.json is the source of truth for redaction rules
 │       ├── cdk/            # standalone CDK app for the Lambda and its SSM parameter
 │       └── tests/          # offline tests that touch neither AWS nor Skyflow
-├── scripts/                # attach the interceptor, publish policy, call the gateway
+├── samples/                # the synthetic card-dispute case note, as txt, docx and pdf
+├── scripts/                # attach the interceptor, publish policy, call the gateway, demo helpers
 ├── tests/flow/             # agent tests, kept outside app/ so they do not ship
 └── ui/                     # web console: Cognito login + chat UI for the Flow agent
 ```
@@ -148,6 +149,17 @@ Step 3 grants the gateway's service role two things. The first is
 is permission to read the caller's configuration bundle because `tools/list`
 fails without it when the caller is a runtime.
 
+**After every later `agentcore deploy`, confirm the interceptor is still
+attached.** The gateway is a CloudFormation resource that knows nothing about the
+interceptor, so check that a deploy has not left it without one:
+
+```bash
+python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+```
+
+It changes nothing and exits non-zero if the interceptor is missing at either
+point. Re-run step 3 if it is.
+
 ## Policy
 
 The policy lives at `gateway/interceptor/config/policy.json` and it is the source
@@ -219,6 +231,7 @@ CI runs four jobs on every push and pull request.
 | Path | What it covers |
 | --- | --- |
 | `docs/DEMO.md` | How to prove the de-identification works against the deployed stack |
+| `docs/RECORDING.md` | The script for recording the blog demo: setup, three scenes, screenshots and teardown |
 | `gateway/README.md` | How AgentCore interceptors and targets work, including the payload shape trap that catches people out |
 | `gateway/interceptor/README.md` | The policy model, both redaction directions, file handling, deployment and debugging |
 | `app/Flow/README.md` | The agent runtime, its environment variables and how it discovers the gateway |

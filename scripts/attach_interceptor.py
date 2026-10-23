@@ -35,6 +35,13 @@ It does three things:
 
 Re-running is safe: role policies are replaced in place and the interceptor
 configuration is overwritten with the same values.
+
+`--check` changes nothing. It reports whether the interceptor is attached at
+both points and exits non-zero if it is not. Run it after every `agentcore
+deploy`: the gateway is a CloudFormation resource that knows nothing about the
+interceptor, so confirm a deploy has not left the gateway without one.
+
+    python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 """
 
 from __future__ import annotations
@@ -149,10 +156,29 @@ def build_update(control, gateway: dict, interceptor_configurations: list[dict])
     return update
 
 
+def check_attached(gateway: dict, function_arn: str | None) -> list[str]:
+    """Problems with the gateway's interceptor configuration, or none."""
+    configs = gateway.get("interceptorConfigurations") or []
+    if not configs:
+        return ["no interceptor is attached; tool calls pass through uninspected"]
+    problems = []
+    points: set[str] = set()
+    for config in configs:
+        arn = ((config.get("interceptor") or {}).get("lambda") or {}).get("arn", "")
+        if function_arn and arn != function_arn:
+            problems.append(f"attached function is {arn.rsplit(':', 1)[-1] or '<none>'}, "
+                            f"not {function_arn.rsplit(':', 1)[-1]}")
+        points.update(config.get("interceptionPoints") or [])
+    for point in ("REQUEST", "RESPONSE"):
+        if point not in points:
+            problems.append(f"not attached at {point}")
+    return problems
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--gateway-name", required=True, help="deployed name, including the project prefix")
-    parser.add_argument("--function-arn", required=True)
+    parser.add_argument("--function-arn", help="required unless --check")
     parser.add_argument("--region", default=None)
     parser.add_argument("--target", default="dev", help="deployment target, for the config bundle lookup")
     parser.add_argument(
@@ -175,7 +201,11 @@ def main() -> None:
         "headers carry bearer tokens and this interceptor does not need them.",
     )
     parser.add_argument("--skip-iam", action="store_true", help="Skip both role grants (already done).")
+    parser.add_argument("--check", action="store_true",
+                        help="Change nothing; exit 1 unless the interceptor is attached at both points.")
     args = parser.parse_args()
+    if not args.check and not args.function_arn:
+        parser.error("--function-arn is required unless --check is given")
 
     session = boto3.Session(region_name=args.region) if args.region else boto3.Session()
     control = session.client("bedrock-agentcore-control")
@@ -186,6 +216,15 @@ def main() -> None:
 
     gateway = control.get_gateway(gatewayIdentifier=gateway_id)
     role_arn = gateway.get("roleArn")
+
+    if args.check:
+        problems = check_attached(gateway, args.function_arn)
+        if problems:
+            for problem in problems:
+                print(f"  FAIL {problem}")
+            sys.exit(1)
+        print("  OK interceptor attached at REQUEST and RESPONSE")
+        return
     print(f"  gatewayId={gateway_id}")
     print(f"  roleArn={role_arn}")
 
