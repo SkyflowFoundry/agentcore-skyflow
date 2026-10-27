@@ -234,13 +234,15 @@ uv run --with boto3 python -m unittest discover -s tests/flow -t tests/flow
 (cd agentcore/cdk && npm ci && npm test)
 ```
 
-CI runs four jobs on every push and pull request.
+CI runs five jobs on every push and pull request.
 
 1. The interceptor unit tests.
 2. The agent unit tests.
 3. The secret-safety hook tests.
-4. A CDK typecheck and a credential-free synth that asserts the Lambda bundle
-   still carries no third-party dependencies.
+4. An interceptor CDK typecheck and a credential-free synth that asserts the
+   Lambda bundle still carries no third-party dependencies.
+5. An AgentCore CDK typecheck and the tests that pin the interceptor's
+   attachment to the gateway.
 
 ## Documentation
 

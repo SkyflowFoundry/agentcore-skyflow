@@ -130,3 +130,30 @@ jobs:
             echo "::error::Lambda asset contains build or dependency artifacts"
             exit 1
           fi
+
+  agentcore-cdk:
+    name: agentcore cdk typecheck and tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agentcore/cdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: agentcore/cdk/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        # Pins the Skyflow interceptor attachment in lib/cdk-stack.ts. The tests
+        # synthesize a small in-test spec, so they need no AWS credentials and
+        # never package the Flow runtime.
+        run: npm test
