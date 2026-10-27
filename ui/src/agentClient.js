@@ -62,6 +62,9 @@ export async function invokeFlow(prompt, sessionId, onDelta) {
   );
 
   let full = '';
+  // Each tool call ends one model message and the reply resumes in a new one.
+  // Without a break the text either side of the call runs together.
+  let newMessage = false;
   const emit = (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -70,11 +73,15 @@ export async function invokeFlow(prompt, sessionId, onDelta) {
     if (!payload || payload === '[DONE]') return;
     let text = '';
     try {
-      text = textFromEvent(JSON.parse(payload));
+      const obj = JSON.parse(payload);
+      if ((obj?.event ?? obj)?.messageStart) newMessage = true;
+      text = textFromEvent(obj);
     } catch {
       return; // keep-alive / comment / partial — ignore
     }
     if (text) {
+      if (newMessage && full) text = `\n\n${text}`;
+      newMessage = false;
       full += text;
       onDelta?.(text);
     }
