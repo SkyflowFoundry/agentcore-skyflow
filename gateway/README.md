@@ -64,7 +64,9 @@ Both reach the same upstream, but `passthrough` delivers the `http` shape —
 base64 bodies with no MCP framing, so there is no tool name or arguments to
 match a policy against. The interceptor blocks `http`-shaped calls unless the
 policy sets `httpPayloads.action` to `passthrough`; see
-`interceptor/README.md`.
+`interceptor/README.md`. Inference targets are the exception. The policy's
+`inference` block shields the model calls they carry, because a model request
+has a known shape even without MCP framing.
 
 Other behaviour worth knowing:
 

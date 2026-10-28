@@ -15,10 +15,15 @@ That is what lets a signed URL from S3 or Box be handed straight to Skyflow:
 the file bytes never pass through this Lambda, so neither the 6 MB synchronous
 invocation limit nor the payload size of the object applies. v2 is in beta and
 feature-flagged per vault.
+
+v2 also accepts `dataSource: BASE64`, which is how a file attached to a model
+request is sent: it is already inside the request body, so there is no URL to
+hand over. A run then reports its output as base64 or as a URL in `outputType`.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -46,6 +51,8 @@ _URL = re.compile(r"""https?://([^/\s"'?#]+)[^\s"']*""")
 _SIGNING_PARAM = re.compile(
     r"""(?i)\b(x-amz-[a-z0-9-]+|signature|awsaccesskeyid|x-goog-[a-z0-9-]+|sig|se|sp|sv)=[^&\s"']*"""
 )
+#: A run of base64 long enough to be file content rather than an identifier.
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 
 #: File formats for which `VAULT_TOKEN` de-identification is supported, per the
 #: Detect v2 spec. Every other format — notably PDF, images and audio — can only
@@ -89,6 +96,9 @@ class FileRunResult:
     status: str
     outputs: tuple[FileOutput, ...] = ()
     message: str = ""
+    #: `BASE64` when each output's `url` field holds the file itself rather
+    #: than a link to it. Runs submitted as a presigned URL answer with URLs.
+    output_type: str = "PRESIGNED_URL"
 
     @property
     def is_terminal(self) -> bool:
@@ -133,6 +143,9 @@ def _safe_error_detail(exc: urllib.error.HTTPError) -> str:
         text = raw.replace("\\/", "/")
     text = _URL.sub(r"https://\1/<redacted>", text)
     text = _SIGNING_PARAM.sub(r"\1=<redacted>", text)
+    # A base64 submission is the file itself, so an error that echoes part of
+    # it would put document content in a log line.
+    text = _BASE64_RUN.sub("<base64>", text)
     return " ".join(text.split())[:MAX_ERROR_DETAIL]
 
 
@@ -263,11 +276,58 @@ class SkyflowClient:
             "configuration": {"vaultId": self._vault_id, **configuration},
         }
 
+        return self._submit_file(body)
+
+    def deidentify_file_base64(
+        self,
+        content_base64: str,
+        data_format: str,
+        configuration: dict[str, Any],
+    ) -> str:
+        """Submit a file's bytes as base64 for de-identification. Returns a run id.
+
+        For files that arrive inside a request, such as an attachment to a
+        model call. The caller bounds the size: the bytes are in this Lambda's
+        payload already and are sent on to Skyflow in one request.
+        """
+        body: dict[str, Any] = {
+            "dataSource": "BASE64",
+            "value": content_base64,
+            "dataFormat": data_format,
+            "configuration": {"vaultId": self._vault_id, **configuration},
+        }
+        return self._submit_file(body)
+
+    def _submit_file(self, body: dict[str, Any]) -> str:
         data = self._post("/v2/detect/deidentify/file", body)
         run_id = data.get("runId")
         if not run_id:
             raise SkyflowError("Skyflow accepted the file but returned no runId")
         return run_id
+
+    def processed_file_bytes(self, run: FileRunResult, output: FileOutput, max_bytes: int) -> bytes:
+        """The bytes of a run's processed file, from base64 or by download.
+
+        A download only follows an `https` URL from Skyflow's own answer and
+        stops at `max_bytes`, so a run cannot make this Lambda fetch something
+        arbitrary or hold an unbounded body.
+        """
+        if run.output_type.upper() == "BASE64":
+            try:
+                content = base64.b64decode(output.url, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise SkyflowError("Skyflow returned a processed file that is not valid base64") from exc
+        else:
+            if not output.url.lower().startswith("https://"):
+                raise SkyflowError("Skyflow returned a processed file URL that is not https")
+            try:
+                with urllib.request.urlopen(output.url, timeout=self._timeout * 4) as resp:
+                    content = resp.read(max_bytes + 1)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise SkyflowError(f"could not download the processed file: {type(exc).__name__}") from exc
+        if len(content) > max_bytes:
+            raise SkyflowError(f"processed file exceeds {max_bytes} bytes")
+        return content
 
     def get_run(self, run_id: str) -> FileRunResult:
         """Current state of a file run."""
@@ -287,6 +347,7 @@ class SkyflowClient:
             status=(data.get("status") or "UNKNOWN").upper(),
             outputs=outputs,
             message=data.get("message", "") or "",
+            output_type=(data.get("outputType") or "PRESIGNED_URL").upper(),
         )
 
     def wait_for_run(

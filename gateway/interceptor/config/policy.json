@@ -40,6 +40,42 @@
   "httpPayloads": {
     "action": "block"
   },
+  "inference": {
+    "models": [
+      "*"
+    ],
+    "request": {
+      "action": "deidentify",
+      "tokenType": "vault_token",
+      "parts": [
+        "system",
+        "user",
+        "assistant",
+        "tool_call",
+        "tool_result",
+        "document",
+        "image"
+      ],
+      "systemNote": true
+    },
+    "response": {
+      "action": "reidentify",
+      "parts": [
+        "text",
+        "tool_call"
+      ],
+      "only": "minted_for_request"
+    },
+    "scope": {
+      "minLength": 3
+    },
+    "attachments": {
+      "maxBytes": 2097152
+    },
+    "failure": {
+      "onError": "fail_closed"
+    }
+  },
   "overrides": [
     {
       "servers": [

@@ -23,12 +23,27 @@ from urllib.parse import urlsplit
 logger = logging.getLogger(__name__)
 
 ACTIONS = ("deidentify", "reidentify", "none")
-#: What to do with an `http`-shaped interceptor event (AgentCore Runtime,
-#: passthrough and inference targets). Its body carries no MCP framing, so the
-#: interceptor cannot redact it; the only choices are to refuse it or to let it
+#: What to do with an `http`-shaped interceptor event that no `inference` rule
+#: handles: AgentCore Runtime and passthrough targets, and inference targets
+#: when the policy has no `inference` block. Such a body carries no framing the
+#: interceptor can redact, so the only choices are to refuse it or to let it
 #: through uninspected.
 HTTP_PAYLOAD_ACTIONS = ("block", "passthrough")
 TOKEN_TYPES = ("counter", "vault_token")
+
+#: Parts of a model request that `inference.request.parts` can name. `system`
+#: is the system prompt, `user` and `assistant` the turns, `tool_call` the
+#: arguments of earlier tool calls, `tool_result` what tools returned, and
+#: `document` and `image` attached files. Tool definitions and thinking blocks
+#: are not parts: they are never touched.
+INFERENCE_REQUEST_PARTS = ("system", "user", "assistant", "tool_call", "tool_result", "document", "image")
+#: Parts of a model answer that `inference.response.parts` can name.
+INFERENCE_RESPONSE_PARTS = ("text", "tool_call")
+#: Which tokens an answer may have restored. `minted_for_request` restores
+#: only tokens the same call's request minted, so a model cannot be prompted
+#: into printing some other token and having the gateway resolve it.
+#: `any_vault_token` restores every vault token, as the tool path does.
+REIDENTIFY_SCOPES = ("minted_for_request", "any_vault_token")
 
 DEFAULT_ENTITIES = [
     "name",
@@ -549,6 +564,170 @@ class Override:
         )
 
 
+def _parts(raw: Any, allowed: tuple[str, ...], where: str) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+        raise PolicyError(f"{where} must be an array of strings")
+    unknown = [p for p in raw if p not in allowed]
+    if unknown:
+        raise PolicyError(f"{where} has unknown parts {unknown}; allowed are {list(allowed)}")
+    return tuple(raw)
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    """What happens to a model request before the model provider sees it."""
+
+    action: str = "none"
+    #: `vault_token` so the answer can be re-identified. `counter` tokens are
+    #: one-way, so the user would see them in the answer too.
+    token_type: str = "vault_token"
+    parts: tuple[str, ...] = INFERENCE_REQUEST_PARTS
+    #: Add one sentence to the system prompt explaining the tokens. Without it
+    #: a model given `[NAME_AJbrIud]` may remark that the name looks like a
+    #: placeholder instead of using it.
+    system_note: bool = True
+
+    def __post_init__(self) -> None:
+        if self.action not in ("deidentify", "none"):
+            raise PolicyError(f"inference request.action must be deidentify or none, got {self.action!r}")
+        if self.token_type not in TOKEN_TYPES:
+            raise PolicyError(f"inference request.tokenType must be one of {TOKEN_TYPES}, got {self.token_type!r}")
+
+    @classmethod
+    def from_json(cls, raw: Any, where: str) -> "InferenceRequest":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise PolicyError(f"{where} must be an object, got {type(raw).__name__}")
+        note = _bool_field(raw, "systemNote", where)
+        return cls(
+            action=raw.get("action", "none"),
+            token_type=raw.get("tokenType", "vault_token"),
+            parts=_parts(raw.get("parts", list(INFERENCE_REQUEST_PARTS)), INFERENCE_REQUEST_PARTS, f"{where}.parts"),
+            system_note=True if note is None else note,
+        )
+
+
+@dataclass(frozen=True)
+class InferenceResponse:
+    """What happens to a model answer before the agent sees it."""
+
+    action: str = "none"
+    parts: tuple[str, ...] = INFERENCE_RESPONSE_PARTS
+    only: str = "minted_for_request"
+
+    def __post_init__(self) -> None:
+        if self.action not in ("reidentify", "none"):
+            raise PolicyError(f"inference response.action must be reidentify or none, got {self.action!r}")
+        if self.only not in REIDENTIFY_SCOPES:
+            raise PolicyError(f"inference response.only must be one of {REIDENTIFY_SCOPES}, got {self.only!r}")
+
+    @classmethod
+    def from_json(cls, raw: Any, where: str) -> "InferenceResponse":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise PolicyError(f"{where} must be an object, got {type(raw).__name__}")
+        return cls(
+            action=raw.get("action", "none"),
+            parts=_parts(raw.get("parts", list(INFERENCE_RESPONSE_PARTS)), INFERENCE_RESPONSE_PARTS, f"{where}.parts"),
+            only=raw.get("only", "minted_for_request"),
+        )
+
+
+@dataclass(frozen=True)
+class Attachments:
+    """Limits on files attached to a model request."""
+
+    #: Refuse an attachment larger than this many decoded bytes. The whole
+    #: request reaches the Lambda as base64 of a JSON body that itself holds
+    #: base64, inside Lambda's 6 MB invocation limit, so this stays small.
+    max_bytes: int = 2 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.max_bytes < 1:
+            raise PolicyError(f"inference attachments.maxBytes must be at least 1, got {self.max_bytes}")
+
+    @classmethod
+    def from_json(cls, raw: Any, where: str) -> "Attachments":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise PolicyError(f"{where} must be an object, got {type(raw).__name__}")
+        return cls(max_bytes=int(raw.get("maxBytes", 2 * 1024 * 1024)))
+
+
+@dataclass(frozen=True)
+class InferenceRule:
+    """Effective settings for one model call: the shield-the-model rule."""
+
+    models: tuple[str, ...] = ("*",)
+    request: InferenceRequest = field(default_factory=InferenceRequest)
+    response: InferenceResponse = field(default_factory=InferenceResponse)
+    entities: tuple[str, ...] = tuple(DEFAULT_ENTITIES)
+    #: Only `minLength` applies to conversation text. The key globs apply to
+    #: the arguments of tool calls, which are JSON like any tool payload.
+    scope: Scope = field(default_factory=lambda: Scope(min_length=3))
+    attachments: Attachments = field(default_factory=Attachments)
+    failure: Failure = field(default_factory=Failure)
+
+    def matches(self, model: str) -> bool:
+        return any(fnmatchcase(model, p) for p in self.models)
+
+    @property
+    def is_noop(self) -> bool:
+        return self.request.action == "none" and self.response.action == "none"
+
+
+@dataclass(frozen=True)
+class InferenceOverride:
+    """One conditional inference rule, matched on the model id."""
+
+    models: tuple[str, ...] = ("*",)
+    request: InferenceRequest | None = None
+    response: InferenceResponse | None = None
+    entities: tuple[str, ...] | None = None
+    scope: Scope | None = None
+    attachments: Attachments | None = None
+    failure: Failure | None = None
+
+    def matches(self, model: str) -> bool:
+        return any(fnmatchcase(model, p) for p in self.models)
+
+    @classmethod
+    def from_json(cls, raw: Any, index: int) -> "InferenceOverride":
+        where = f"inferenceOverrides[{index}]"
+        if not isinstance(raw, dict):
+            raise PolicyError(f"{where} must be an object")
+        entities = raw.get("entities")
+        return cls(
+            models=tuple(raw.get("models", ["*"])),
+            request=InferenceRequest.from_json(raw["request"], f"{where}.request") if "request" in raw else None,
+            response=InferenceResponse.from_json(raw["response"], f"{where}.response") if "response" in raw else None,
+            entities=tuple(entities) if entities is not None else None,
+            scope=Scope.from_json(raw["scope"], f"{where}.scope") if "scope" in raw else None,
+            attachments=Attachments.from_json(raw["attachments"], f"{where}.attachments") if "attachments" in raw else None,
+            failure=Failure.from_json(raw["failure"], f"{where}.failure") if "failure" in raw else None,
+        )
+
+
+def _inference_rule(raw: Any, default_entities: tuple[str, ...]) -> InferenceRule | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise PolicyError("inference must be an object")
+    entities = raw.get("entities")
+    return InferenceRule(
+        models=tuple(raw.get("models", ["*"])),
+        request=InferenceRequest.from_json(raw.get("request"), "inference.request"),
+        response=InferenceResponse.from_json(raw.get("response"), "inference.response"),
+        entities=tuple(entities) if entities is not None else default_entities,
+        scope=Scope.from_json(raw["scope"], "inference.scope") if "scope" in raw else Scope(min_length=3),
+        attachments=Attachments.from_json(raw.get("attachments"), "inference.attachments"),
+        failure=Failure.from_json(raw.get("failure"), "inference.failure"),
+    )
+
+
 @dataclass(frozen=True)
 class PolicySet:
     """Top-level stored config: defaults plus ordered conditional overrides."""
@@ -561,6 +740,34 @@ class PolicySet:
     #: an override against on the way back. Blocking is the default because a
     #: target the interceptor cannot inspect must not look protected.
     http_payloads: str = "block"
+    #: The shield-the-model rule for inference targets, or None when the policy
+    #: has no `inference` block. Without one, inference traffic is an ordinary
+    #: HTTP payload and `http_payloads` decides it.
+    inference: InferenceRule | None = None
+    inference_overrides: tuple[InferenceOverride, ...] = ()
+
+    def resolve_inference(self, model: str) -> InferenceRule | None:
+        """The rule for one model id, or None when no rule covers it.
+
+        The first override whose `models` match wins and replaces whole
+        sub-blocks of the `inference` block, as overrides do for tools. A model
+        that neither an override nor the block's own `models` names is left
+        uncovered, and the caller blocks it.
+        """
+        if self.inference is None:
+            return None
+        for ov in self.inference_overrides:
+            if ov.matches(model):
+                return self._materialize(ov)
+        return self.inference if self.inference.matches(model) else None
+
+    def _materialize(self, ov: InferenceOverride) -> InferenceRule:
+        updates: dict[str, Any] = {"models": ov.models}
+        for name in ("request", "response", "entities", "scope", "attachments", "failure"):
+            value = getattr(ov, name)
+            if value is not None:
+                updates[name] = value
+        return replace(self.inference, **updates)
 
     def resolve(self, server: str, tool: str) -> Policy:
         """Return effective policy for a tool, applying the first matching override."""
@@ -633,11 +840,23 @@ class PolicySet:
                 f"httpPayloads.action must be one of {HTTP_PAYLOAD_ACTIONS}, got {http_payloads!r}"
             )
 
+        inference = _inference_rule(raw.get("inference"), defaults.entities)
+        inference_overrides_raw = raw.get("inferenceOverrides", [])
+        if not isinstance(inference_overrides_raw, list):
+            raise PolicyError("inferenceOverrides must be an array")
+        if inference_overrides_raw and inference is None:
+            raise PolicyError("inferenceOverrides needs an inference block to override")
+        inference_overrides = tuple(
+            InferenceOverride.from_json(o, i) for i, o in enumerate(inference_overrides_raw)
+        )
+
         policy_set = cls(
             defaults=defaults,
             overrides=overrides,
             tool_name_separator=raw.get("toolNameSeparator", "___"),
             http_payloads=http_payloads,
+            inference=inference,
+            inference_overrides=inference_overrides,
         )
         policy_set.validate()
         return policy_set
@@ -685,6 +904,8 @@ class PolicySet:
                             f"or a 'default' template such as 'table1.{{entity}}_entity'."
                         )
 
+        self._validate_inference()
+
         mints_anywhere = any(
             pol.request.mints_vault_tokens or pol.response.mints_vault_tokens for pol in resolved
         )
@@ -696,6 +917,27 @@ class PolicySet:
                 "policy re-identifies but no rule mints vault tokens; re-identify will be a no-op "
                 "unless tokens originate from another gateway's policy"
             )
+
+    def _validate_inference(self) -> None:
+        """The same round-trip rule as for tools, applied to every inference rule."""
+        if self.inference is None:
+            return
+        rules = [("inference", self.inference)] + [
+            (f"inferenceOverrides[{i}]", self._materialize(ov)) for i, ov in enumerate(self.inference_overrides)
+        ]
+        for where, rule in rules:
+            if rule.response.action != "reidentify":
+                continue
+            if rule.request.action == "deidentify" and rule.request.token_type != "vault_token":
+                raise PolicyError(
+                    f"{where}: response re-identifies but request mints 'counter' tokens, which are "
+                    "one-way. Set request.tokenType to 'vault_token'."
+                )
+            if rule.request.action == "none" and rule.response.only == "minted_for_request":
+                raise PolicyError(
+                    f"{where}: response re-identifies only tokens minted for the request, but the "
+                    "request mints none. De-identify the request or set response.only to 'any_vault_token'."
+                )
 
     def resolve_override(self, ov: Override) -> Policy:
         """Materialize an override against the defaults, for validation."""

@@ -1,7 +1,10 @@
 # Skyflow interceptor
 
 De-identifies tool-call arguments on the way out and re-identifies tool results
-on the way back, conditionally per server and per tool.
+on the way back, conditionally per server and per tool. On inference targets it
+also shields the model: it de-identifies everything a model reads, including the
+prompt, the history and attached files, and re-identifies what the model writes.
+See [Shield the model on inference targets](#shield-the-model-on-inference-targets).
 
 Port of [`SkyflowFoundry/context-forge-skyflow`](https://github.com/SkyflowFoundry/context-forge-skyflow)
 onto AgentCore Gateway. The Context Forge plugin ran in-process on
@@ -28,6 +31,8 @@ Flow (agent)
 interceptor/
 ├── src/                    # Lambda source — stdlib + boto3 only, no bundling
 │   ├── handler.py          # entry point; dispatches REQUEST vs RESPONSE
+│   ├── inference.py        # shield the model on inference targets
+│   ├── records.py          # carries a model call's decision from request to response
 │   ├── policy.py           # policy model, matching, validation
 │   ├── payload.py          # find and rewrite eligible strings
 │   ├── envelope.py         # decode MCP text blocks around the file swap
@@ -36,7 +41,8 @@ interceptor/
 │   ├── skyflow_client.py   # Detect string and file endpoints, retry/backoff
 │   └── settings.py         # SSM policy + Secrets Manager key, both cached
 ├── config/policy.json      # the redaction policy — source of truth
-├── cdk/                    # standalone CDK app (Lambda + SSM parameter)
+├── cdk/                    # standalone CDK app (Lambda, SSM parameter, record table;
+│                           #   plus the optional inference target stack)
 └── tests/                  # offline tests; no AWS, no Skyflow
 ```
 
@@ -85,10 +91,14 @@ redeploying the function.
 sees real data; the upstream never does. This is the default here, because it
 round-trips and is therefore verifiable end to end.
 
-**Shield the model** — `response: deidentify`, `request: reidentify`. The tool
-sees real data; the model context never does. Useful when results carry PII the
-agent has no need to read — the shipped policy applies this to Exa's
-`web_fetch_exa` tool, whose result is scraped web content.
+**Shield the model** — keep sensitive data out of everything the model reads.
+For a tool that is `response: deidentify` with `request: reidentify`. The tool
+sees real data and the model context never does. That suits results that carry
+PII the agent has no need to read, and the shipped policy applies it to Exa's
+`web_fetch_exa` tool, whose result is scraped web content. For the model call
+itself, meaning the prompt and the history and attached files, it is the
+`inference` block described under
+[Shield the model on inference targets](#shield-the-model-on-inference-targets).
 
 Shield the model should mint **one-way** tokens, which is how the shipped rule
 is set. All rules share one vault, so a vault token minted here can be
@@ -104,9 +114,10 @@ what identifies them, and the city is what makes the search useful.
 ### HTTP-shaped targets are blocked
 
 AgentCore Runtime, `passthrough` and inference targets reach the interceptor as
-`event["http"]`: a base64 body with no MCP framing, so there is no tool call to
-match a policy against and nothing to redact. The interceptor therefore
-refuses them by default. A request is answered with a 403 whose error code is
+`event["http"]`: a base64 body with no MCP framing. The `inference` block
+handles the model calls it recognises. Everything else on `http` has no tool
+call to match a policy against and nothing to redact, so the interceptor
+refuses it by default. A request is answered with a 403 whose error code is
 `SENSITIVE_DATA_UNINSPECTED`, before the target is called, and a response is
 replaced with the same. Each refusal logs `http_payload_blocked` at WARNING
 with the target name (the first path segment only).
@@ -121,6 +132,87 @@ and alarms on the second; see [Metrics and alarms](#metrics-and-alarms).
 The setting is gateway-wide rather than per tool. An HTTP response event
 carries no request, so on the way back there is no target name to match an
 override against, and a per-target rule could only be half enforced.
+
+### Shield the model on inference targets
+
+An [inference target](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-targets-inference.html)
+makes the gateway front model calls on its `/inference` path. With an
+`inference` block in the policy, the interceptor de-identifies every part of a
+model request the rule names before the provider sees it. It then re-identifies
+the answer before the agent sees it.
+
+```json
+"inference": {
+  "models": ["*"],
+  "request": {
+    "action": "deidentify",
+    "tokenType": "vault_token",
+    "parts": ["system", "user", "assistant", "tool_call", "tool_result", "document", "image"],
+    "systemNote": true
+  },
+  "response": { "action": "reidentify", "parts": ["text", "tool_call"], "only": "minted_for_request" },
+  "scope": { "minLength": 3 },
+  "attachments": { "maxBytes": 2097152 },
+  "failure": { "onError": "fail_closed" }
+},
+"inferenceOverrides": [
+  { "models": ["*haiku*"], "request": { "action": "deidentify", "parts": ["user"] } }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `models` | Globs matched against the model id in the request. A model no rule names is blocked. |
+| `request.parts` | What is de-identified. `system` is the system prompt, `user` and `assistant` the turns, `tool_call` earlier tool-call arguments, `tool_result` what tools returned, and `document` and `image` attached files. Tool definitions and thinking blocks are never touched. |
+| `request.tokenType` | `vault_token` so the answer can be restored, or `counter` for one-way tokens the user sees too. |
+| `request.systemNote` | Adds one sentence to the system prompt explaining the tokens. The model may still remark on them. |
+| `response.parts` | What is re-identified: `text` is the model's prose and `tool_call` the arguments of a tool call it makes. |
+| `response.only` | `minted_for_request` restores only tokens this call's request minted. `any_vault_token` restores every vault token, as the tool path does. |
+| `attachments.maxBytes` | Largest attached file. The request arrives as base64 of a JSON body that holds base64, inside Lambda's 6 MB limit. |
+| `entities`, `scope`, `failure` | As for tools. Only `scope.minLength` applies to conversation text. `entities` defaults to `defaults.entities`. |
+| `inferenceOverrides` | `models` globs, first match wins, whole sub-blocks replace. |
+
+What each recognised call gets:
+
+| Path | Request | Answer |
+| --- | --- | --- |
+| `/v1/messages` | de-identified | re-identified, as JSON or as a buffered stream |
+| `/v1/messages/count_tokens` | de-identified | passed |
+| `/model/{id}/invoke` | de-identified | re-identified |
+| `/model/{id}/invoke-with-response-stream` | de-identified | refused while the rule re-identifies |
+| `/v1/models` | passed | passed |
+| `/v1/chat/completions`, `/v1/responses` | refused while the rule does anything | |
+
+Behaviour worth knowing:
+
+- **The answer's rule travels in a record.** An HTTP response event carries no
+  request, and the model name in an answer does not match the request's. The
+  request side therefore writes the rule's response settings and the tokens it
+  minted under the gateway's `REQUEST_ID`. It uses the DynamoDB table in
+  `INFERENCE_RECORD_TABLE`. Records hold no values and expire after fifteen
+  minutes. Without the table every model call is blocked.
+- **Streams arrive whole.** The gateway buffers an inference answer before the
+  interceptor sees it, so a shielded stream reaches the client in one piece
+  when the model finishes. A token can be split across two text deltas, so each
+  block's deltas are joined, restored and written back as one delta.
+- **Attachments.** Text documents and base64 `text/plain`, `text/csv` and
+  `application/json` attachments are de-identified as strings and keep vault
+  tokens. PDFs, images and Office files go through Detect's file API one way.
+  PDFs come back with counter tokens such as `NAME_1`, and images come back
+  with the values blacked out. A document or image sent by URL or file id is
+  refused because the interceptor cannot read it.
+- **Unknown content blocks are refused.** A block type the interceptor does not
+  recognise could carry anything, so a rule that de-identifies refuses the call.
+  Server-tool blocks such as `web_search_tool_result` came from the provider and
+  go back as they came.
+- **A warm Lambda caches de-identified strings.** Vault tokens are
+  deterministic, so a conversation's earlier turns cost nothing on later calls.
+- **Errors come back in the caller's dialect.** Refusals are 403s and failures
+  502s, shaped as Anthropic, Bedrock or OpenAI errors so the client's SDK raises
+  a typed exception. Each logs `inference_blocked` or `inference_fail_closed`.
+
+Flow sends its model calls through the gateway by default. See
+`app/Flow/model/gateway.py` and step 4 under [Deploy](#deploy).
 
 ### When SSM or Skyflow misbehaves
 
@@ -195,7 +287,21 @@ agentcore deploy --target dev -y
 # 3. confirm it is attached at REQUEST and RESPONSE. Changes nothing.
 #    Note the gateway name is prefixed with the project name.
 python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
+
+# 4. shield the model: a Bedrock inference target on the gateway, plus the
+#    gateway role's Bedrock permissions. Needs the gateway from step 2.
+GW=$(aws bedrock-agentcore-control list-gateways \
+  --query "items[?name=='agentflow-SkyflowGateway'].gatewayId | [0]" --output text)
+ROLE=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GW" --query roleArn --output text)
+cd gateway/interceptor/cdk
+npx cdk deploy SkyflowInferenceStack -c gatewayIdentifier="$GW" -c gatewayRoleArn="$ROLE" --require-approval never
+cd -
 ```
+
+Flow sends its model calls through that target by default, so they fail until
+step 4 has run. On a fresh deployment run step 4 straight after step 2. On an
+existing deployment run step 1 and step 4 before step 2. To keep Flow calling
+Bedrock directly, set `MODEL_VIA_GATEWAY=0` on the runtime.
 
 While the AgentCore stack imports the export, CloudFormation will not delete
 this stack or let the function's ARN change. Tear the AgentCore stack down
@@ -711,6 +817,7 @@ uv run --with boto3 python -m unittest discover \
 | Suite | Covers |
 | --- | --- |
 | `test_http_payloads.py` | HTTP-shaped events (SC-16091): blocked by default on both directions, explicit passthrough, WARNING logs without bodies or full paths, policy parsing |
+| `test_inference.py` | Shield the model: path routing, every request part, thinking blocks left alone, attachments and their refusals, records, minted-only restore, JSON and split-stream answers, failure modes, the inference policy and the base64 file client |
 | `test_handler.py` | Dispatch, direction routing, overrides, fail-closed/open, streaming, round trip |
 | `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
@@ -757,3 +864,8 @@ tokenizing those would break tool discovery.
    streaming gateway. Leave streaming off.
 6. **Nothing prunes vault tokens.** Every de-identification writes tokens that
    persist in the vault.
+7. **Shield the model speaks Anthropic Messages and InvokeModel only.** The
+   OpenAI dialects are refused while a rule is active, and a streamed
+   InvokeModel answer is refused when it would need re-identifying, because its
+   binary event stream is not parsed yet.
+8. **Shielded answers do not stream word by word.** The gateway buffers them.

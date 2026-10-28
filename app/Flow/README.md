@@ -11,7 +11,10 @@ commands like `deploy`, `dev`, and `invoke` rely on the configuration stored her
 The main entrypoint to your app is defined in `main.py`. Using the AgentCore SDK `@app.entrypoint` decorator, this
 file defines a Starlette ASGI app with the chosen Agent framework SDK running within.
 
-`model/load.py` instantiates your chosen model provider.
+`model/load.py` instantiates the model. By default it sends model calls through
+the Skyflow gateway's inference target so that shield the model applies, using
+`model/gateway.py` to find the gateway and sign the calls. Set
+`MODEL_VIA_GATEWAY=0` to call Bedrock directly.
 
 `mcp_client/` supplies the agent's MCP tools. It is three modules so each can be
 tested at the weight it needs: `endpoints.py` decides which endpoints to connect
@@ -32,6 +35,10 @@ invoking the agent.
 | --- | --- | --- |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity |
 | `BEDROCK_MODEL_ID` | No | Model or inference-profile id; defaults to `global.anthropic.claude-sonnet-5` |
+| `MODEL_VIA_GATEWAY` | No | `0` calls Bedrock directly instead of through the gateway's inference target. Default `1` |
+| `MODEL_GATEWAY_URL` | No | Gateway MCP URL for model calls. Defaults to the first `AWS_IAM` gateway discovered |
+| `MODEL_GATEWAY_TARGET` | No | Inference target the model id is qualified with. Default `bedrock` |
+| `MODEL_MAX_TOKENS` | No | Longest answer in tokens. Default 4096 |
 | `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | Injected | One pair per gateway in the project; the agent discovers them rather than hardcoding a URL |
 | `MCP_ENDPOINTS` | No | Comma-separated MCP URLs that replace everything discovered. With no gateway injected and no `MCP_ENDPOINTS`, the agent refuses to start rather than fall back to a public server |
 | `MCP_AUTH_TYPE` | No | `AWS_IAM`, `CUSTOM_JWT` or `NONE` for `MCP_ENDPOINTS` |

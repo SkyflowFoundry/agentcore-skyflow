@@ -90,6 +90,8 @@ Deploy injects one set per reachable resource, so an agent never hardcodes a URL
 | `MCP_AUTH_TYPE` | Auth for `MCP_ENDPOINTS`: `AWS_IAM`, `CUSTOM_JWT` or `NONE`. Defaults to `CUSTOM_JWT` when `MCP_BEARER_TOKEN` is set, else `NONE`. |
 | `MCP_BEARER_TOKEN` | Bearer token for `CUSTOM_JWT` endpoints. |
 | `BEDROCK_MODEL_ID` | Model or inference-profile id. Defaults to `global.anthropic.claude-sonnet-5`; the template's original default is not subscribed in this account. |
+| `MODEL_VIA_GATEWAY` | `0` sends model calls straight to Bedrock. Default `1`: they go through `SkyflowGateway`'s inference target so shield the model applies. |
+| `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_TARGET`, `MODEL_MAX_TOKENS` | Which gateway and inference target model calls use, and the longest answer. Default the first `AWS_IAM` gateway, `bedrock` and 4096. |
 | `LOCAL_DEV` | Set to `1` to use `.env.local` instead of AgentCore Identity. |
 
 `SkyflowGateway` is `AWS_IAM`, so Flow SigV4-signs each MCP request with its execution role instead
@@ -98,6 +100,13 @@ without a `connections[]` entry. `app/Flow/mcp_client/` splits this three ways: 
 (discovery, stdlib only), `auth.py` (which credential an endpoint gets), `sigv4.py` (the httpx auth
 hook). Their tests are in `tests/flow/`, outside `app/Flow/` because that directory is the CodeZip
 deployment root and everything under it ships to the runtime.
+
+Model calls take the same route. `app/Flow/model/gateway.py` points Strands'
+Anthropic model at `<gateway>/inference` with the same SigV4 signing, and the
+interceptor shields what the model reads. The inference target is not in the
+schema: `SkyflowInferenceStack` in `gateway/interceptor/cdk` adds it after
+`agentcore deploy`, and Flow's model calls fail until it exists. See
+`gateway/interceptor/README.md` for the deploy order.
 
 See `gateway/README.md` for the four MCP interception seams.
 
