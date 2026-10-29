@@ -90,7 +90,7 @@ function resolveEnv(): { account: string; region: string } {
  *   gatewayIdentifier the gateway agentcore deploy created
  *   gatewayRoleArn    that gateway's execution role
  *   inferenceTargetName  target name (default bedrock)
- *   inferenceMantle      false to leave out the bedrock-mantle target (default true)
+ *   inferenceMantle      false, 0, no or off to leave out the bedrock-mantle target (default true)
  *   mantleTargetName     Mantle target name (default mantle)
  *   inferenceStackName   CloudFormation stack name (default SkyflowInferenceStack)
  */
@@ -142,8 +142,8 @@ if (gatewayIdentifier) {
     gatewayIdentifier,
     gatewayRoleArn,
     targetName: app.node.tryGetContext('inferenceTargetName'),
-    // Context arrives as the string "false" from -c, or a boolean from cdk.json.
-    mantle: String(app.node.tryGetContext('inferenceMantle') ?? true) !== 'false',
+    // Context arrives as a string from -c, or a boolean from cdk.json.
+    mantle: !['false', '0', 'no', 'off'].includes(String(app.node.tryGetContext('inferenceMantle') ?? true).toLowerCase()),
     mantleTargetName: app.node.tryGetContext('mantleTargetName'),
   });
 }

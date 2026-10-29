@@ -123,6 +123,35 @@ jobs:
             -c gatewayRoleArn=arn:aws:iam::123456789012:role/ci-placeholder
           test -f cdk.out/SkyflowInferenceStack.template.json
 
+      - name: Assert the inference targets
+        # Each target's connector, and that inferenceMantle=false leaves the
+        # Mantle target and its grant out. A wrong connector id would otherwise
+        # surface only when the target failed to reach READY on deploy.
+        run: |
+          check() {
+            python3 - "$1" "$2" <<'PY'
+          import json, sys
+          template = json.load(open(sys.argv[1]))
+          resources = template["Resources"].values()
+          targets = sorted(
+              (r["Properties"]["Name"], r["Properties"]["TargetConfiguration"]["Inference"]["Connector"]["Source"]["ConnectorId"])
+              for r in resources if r["Type"] == "AWS::BedrockAgentCore::GatewayTarget")
+          mantle_grant = any("bedrock-mantle" in json.dumps(r) for r in resources if r["Type"] == "AWS::IAM::Policy")
+          expected = [("bedrock", "bedrock-runtime"), ("mantle", "bedrock-mantle")] if sys.argv[2] == "on" else [("bedrock", "bedrock-runtime")]
+          assert targets == expected, targets
+          assert mantle_grant == (sys.argv[2] == "on"), mantle_grant
+          print(sys.argv[2], targets)
+          PY
+          }
+          check cdk.out/SkyflowInferenceStack.template.json on
+          npx cdk synth --quiet -o cdk.out/nomantle \
+            -c skyflowVaultUrl=https://ci.vault.example.com \
+            -c skyflowVaultId=ci-placeholder \
+            -c gatewayIdentifier=ci-gateway-placeholder \
+            -c gatewayRoleArn=arn:aws:iam::123456789012:role/ci-placeholder \
+            -c inferenceMantle=false
+          check cdk.out/nomantle/SkyflowInferenceStack.template.json off
+
       - name: Assert the Lambda bundle carries no dependencies
         # The interceptor deploys as plain source with no layer and no vendored
         # packages. A stray dependency directory would mean the bundle drifted.

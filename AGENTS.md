@@ -103,9 +103,10 @@ deployment root and everything under it ships to the runtime.
 
 Model calls take the same route. `app/Flow/model/gateway.py` points Strands'
 Anthropic model at `<gateway>/inference` with the same SigV4 signing, and the
-interceptor shields what the model reads. The inference target is not in the
-schema: `SkyflowInferenceStack` in `gateway/interceptor/cdk` adds it after
-`agentcore deploy`, and Flow's model calls fail until it exists. See
+interceptor shields what the model reads. The inference targets are not in
+the schema: `SkyflowInferenceStack` in `gateway/interceptor/cdk` adds a
+`bedrock` target and a `mantle` target after `agentcore deploy`, and Flow's
+model calls fail until the `bedrock` one exists. See
 `gateway/interceptor/README.md` for the deploy order.
 
 See `gateway/README.md` for the four MCP interception seams.

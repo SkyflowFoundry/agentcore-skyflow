@@ -131,17 +131,28 @@ def readable(kind: str, body: dict) -> bool:
 
 
 def collect(kind: str, body: dict, parts: set[str]) -> Found:
-    """Find everything in a request body that the parts name. Raises Refused."""
+    """Find everything in a request body that the parts name. Raises Refused.
+
+    `kind` only checks that the call is one this module reads. The body is
+    read in every format at once, as `_read` explains.
+    """
+    if kind not in REQUEST_FORMATS:
+        raise Refused(f"A {kind} call cannot be inspected")
     found = Found()
-    {ANTHROPIC: _anthropic_request, CHAT: _chat_request, RESPONSES: _responses_request}[
-        REQUEST_FORMATS[kind]
-    ](body, parts, found)
+    _read(body, parts, found)
     return found
 
 
 def add_system_note(kind: str, body: dict) -> None:
-    """Tell the model what the tokens are, in the format's own system prompt."""
+    """Tell the model what the tokens are, in the system prompt of the format that will read it.
+
+    A body with Anthropic's `system` or `anthropic_version` is read by Claude
+    whatever the path, and Claude refuses a body whose first message is a
+    system message, so the note goes into `system` there.
+    """
     fmt = REQUEST_FORMATS[kind]
+    if fmt == CHAT and ("system" in body or "anthropic_version" in body):
+        fmt = ANTHROPIC
     if fmt == ANTHROPIC:
         system = body.get("system")
         if isinstance(system, list):
@@ -170,88 +181,209 @@ def add_system_note(kind: str, body: dict) -> None:
             body["instructions"] = SYSTEM_NOTE
 
 
-# -------------------------------------------------- Anthropic Messages request
+# ------------------------------------------------- the one request reader
 
-#: The part of a message a text block belongs to, by the message's role.
-#: A `system` message in `messages` is a mid-conversation system prompt.
-_ANTHROPIC_ROLE_PARTS = {"user": "user", "assistant": "assistant", "system": "system"}
+#: The part each role's content belongs to, across all three formats. A
+#: `system` message in Anthropic's `messages` is a mid-conversation system
+#: prompt. `developer` is OpenAI's name for a system message.
+_ROLE_PARTS = {
+    "user": "user",
+    "assistant": "assistant",
+    "system": "system",
+    "developer": "system",
+    "tool": "tool_result",
+    "function": "tool_result",
+}
+
+#: Message fields besides `content` that a model reads as text. Chat
+#: Completions carries reasoning as `reasoning` or `reasoning_content`, and
+#: OpenAI gives a message's `name` to the model as well.
+_MESSAGE_TEXT_FIELDS = ("name", "reasoning", "reasoning_content", "refusal")
+
+#: Fields that other APIs and model families read as text and that nothing
+#: here inspects: legacy completions and Llama's `prompt` (and Responses'
+#: stored prompt), Titan's `inputText`, Cohere's `message`, `chat_history` and
+#: `documents`, and Chat Completions' predicted output.
+_FOREIGN_FIELDS = ("prompt", "inputText", "message", "chat_history", "documents", "prediction")
 
 #: Block types that the provider produced and checks or reads back verbatim.
 #: Server-tool results, whose types end in `_tool_result`, are treated alike.
 _UNTOUCHED_BLOCKS = frozenset({"thinking", "redacted_thinking", "server_tool_use"})
 
 
-def _anthropic_request(body: dict, parts: set[str], found: Found) -> None:
+def _read(body: dict, parts: set[str], found: Found) -> None:
+    """Read every format's fields, whatever the path.
+
+    The gateway hands a body on unchanged, and the model behind a path may
+    read it in a format other than the path's. A Messages call to DeepSeek
+    reaches an OpenAI endpoint, which reads Chat Completions fields such as
+    `tool_calls`. A Chat Completions call to Claude reaches InvokeModel, which
+    reads Anthropic's top-level `system`. So all of them are read everywhere,
+    and fields from formats not read at all are refused.
+    """
+    for key in _FOREIGN_FIELDS:
+        if body.get(key) is not None:
+            raise Refused(f"A request with a {key} field cannot be inspected")
+
     system = body.get("system")
-    if "system" in parts:
-        if isinstance(system, str):
+    if isinstance(system, str):
+        if "system" in parts:
             found.texts.append((body, "system"))
-        elif isinstance(system, list):
-            for block in system:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    found.texts.append((block, "text"))
+    elif isinstance(system, list):
+        for block in system:
+            if not (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)):
+                raise Refused("A system prompt block other than text cannot be inspected")
+            if "system" in parts:
+                found.texts.append((block, "text"))
+    elif system is not None:
+        raise Refused("A system prompt that is not text cannot be inspected")
 
-    for message in body.get("messages") or []:
-        if not isinstance(message, dict):
-            continue
-        role_part = _ANTHROPIC_ROLE_PARTS.get(message.get("role"), "user")
-        content = message.get("content")
-        if isinstance(content, str):
-            if role_part in parts:
-                found.texts.append((message, "content"))
-        elif isinstance(content, list):
-            for block in content:
-                _anthropic_block(block, role_part, parts, found)
+    instructions = body.get("instructions")
+    if isinstance(instructions, str):
+        if "system" in parts:
+            found.texts.append((body, "instructions"))
+    elif instructions is not None:
+        raise Refused("Instructions that are not a string cannot be inspected")
+
+    for message in _list(body, "messages"):
+        _message(message, parts, found)
+
+    given = body.get("input")
+    if isinstance(given, str):
+        if "user" in parts:
+            found.texts.append((body, "input"))
+    else:
+        for item in _list(body, "input"):
+            _input_item(item, parts, found)
 
 
-def _anthropic_block(block, text_part: str, parts: set[str], found: Found) -> None:
-    if not isinstance(block, dict):
+def continues_stored_conversation(body: dict) -> bool:
+    """Whether a request builds on turns the provider stored, which it does not carry itself."""
+    if body.get("previous_response_id") is not None or body.get("conversation") is not None:
+        return True
+    given = body.get("input")
+    return isinstance(given, list) and any(
+        isinstance(item, dict) and item.get("type") == "item_reference" for item in given
+    )
+
+
+def _list(holder: dict, key: str) -> list:
+    value = holder.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise Refused(f"A {key} that is not a list cannot be inspected")
+    return value
+
+
+def _message(message, parts: set[str], found: Found) -> None:
+    """One message, in Anthropic's shape or in Chat Completions' or in both."""
+    if not isinstance(message, dict):
+        raise Refused("A message that is not an object cannot be inspected")
+    role = message.get("role")
+    part = _ROLE_PARTS.get(role)
+    if part is None:
+        raise Refused(f"A message with role {role!r} cannot be inspected")
+    _content(message, "content", part, parts, found)
+    for key in _MESSAGE_TEXT_FIELDS:
+        value = message.get(key)
+        if isinstance(value, str):
+            if part in parts:
+                found.texts.append((message, key))
+        elif value is not None:
+            raise Refused(f"A message's {key} that is not a string cannot be inspected")
+    for call in _list(message, "tool_calls"):
+        if not isinstance(call, dict):
+            raise Refused("A tool call that is not an object cannot be inspected")
+        if call.get("function") is not None:
+            _arguments(call["function"], "arguments", parts, found)
+        if call.get("custom") is not None:
+            _arguments(call["custom"], "input", parts, found)
+    if message.get("function_call") is not None:
+        _arguments(message["function_call"], "arguments", parts, found)
+
+
+def _arguments(holder, key: str, parts: set[str], found: Found) -> None:
+    """Tool-call arguments: JSON in a string, JSON itself, or free text."""
+    if not isinstance(holder, dict):
+        raise Refused("A tool call that is not an object cannot be inspected")
+    value = holder.get(key)
+    if value is None:
         return
+    if isinstance(value, str):
+        if "tool_call" in parts:
+            found.json_strings.append((holder, key))
+    elif isinstance(value, (dict, list)):
+        if "tool_call" in parts:
+            found.trees.append((holder, key))
+    else:
+        raise Refused(f"Tool-call {key} of type {type(value).__name__} cannot be inspected")
+
+
+def _content(holder: dict, key: str, part: str, parts: set[str], found: Found) -> None:
+    content = holder.get(key)
+    if isinstance(content, str):
+        if part in parts:
+            found.texts.append((holder, key))
+        return
+    for block in _list(holder, key):
+        _block(block, part, parts, found)
+
+
+def _block(block, text_part: str, parts: set[str], found: Found) -> None:
+    """One content block or part, in any of the three formats' vocabularies."""
+    if not isinstance(block, dict):
+        raise Refused("A content block that is not an object cannot be inspected")
     kind = block.get("type") or ""
 
-    if kind == "text":
-        if text_part in parts:
-            found.texts.append((block, "text"))
+    if kind in ("text", "input_text", "output_text"):
+        _text(block, "text", text_part, parts, found, required=True)
+        # Citations and annotations quote the documents they point at.
+        for note in _list(block, "citations") + _list(block, "annotations"):
+            if not isinstance(note, dict):
+                raise Refused("A citation that is not an object cannot be inspected")
+            for key in ("cited_text", "document_title", "title"):
+                _text(note, key, text_part, parts, found)
+    elif kind == "refusal":
+        _text(block, "refusal", text_part, parts, found, required=True)
     elif kind in _UNTOUCHED_BLOCKS or (kind.endswith("_tool_result") and kind != "tool_result"):
         # The provider writes these into its own turn. Anywhere else one came
         # from the client, and skipping it would wave through whatever it holds.
         if text_part != "assistant":
             raise Refused(f"A {kind} block outside an assistant turn cannot be inspected")
-        return
     elif kind == "tool_use":
-        if "tool_call" in parts and isinstance(block.get("input"), (dict, list)):
-            found.trees.append((block, "input"))
+        value = block.get("input")
+        if isinstance(value, (dict, list)):
+            if "tool_call" in parts:
+                found.trees.append((block, "input"))
+        elif isinstance(value, str):
+            if "tool_call" in parts:
+                found.texts.append((block, "input"))
+        elif value is not None:
+            raise Refused("A tool call's input of an unknown type cannot be inspected")
     elif kind == "tool_result":
-        content = block.get("content")
-        if isinstance(content, str):
-            if "tool_result" in parts:
-                found.texts.append((block, "content"))
-        elif isinstance(content, list):
-            for inner in content:
-                _anthropic_block(inner, "tool_result", parts, found)
+        _content(block, "content", "tool_result", parts, found)
     elif kind == "search_result":
         # Part of whatever holds it: a tool result's when a tool returned it,
         # the turn's when the caller put it straight into a message.
-        if text_part in parts:
-            if isinstance(block.get("title"), str):
-                found.texts.append((block, "title"))
-            for inner in block.get("content") or []:
-                _anthropic_block(inner, text_part, parts, found)
+        for key in ("title", "source"):
+            _text(block, key, text_part, parts, found)
+        for inner in _list(block, "content"):
+            _block(inner, text_part, parts, found)
     elif kind == "document":
         if "document" not in parts:
             return
         for key in ("title", "context"):
-            if isinstance(block.get(key), str):
-                found.texts.append((block, key))
+            _text(block, key, "document", parts, found)
         source = _source(block, "document")
         source_type = source.get("type")
         if source_type == "text":
-            found.texts.append((source, "data"))
+            _text(source, "data", "document", parts, found, required=True)
         elif source_type == "base64":
             found.files.append(FileRef(source, "document"))
         elif source_type == "content":
-            for inner in source.get("content") or []:
-                _anthropic_block(inner, "document", parts | {"document"}, found)
+            for inner in _list(source, "content"):
+                _block(inner, "document", parts | {"document"}, found)
         else:
             raise Refused(f"An attached document sent as {source_type or 'an unknown source'} cannot be inspected")
     elif kind == "image":
@@ -261,8 +393,42 @@ def _anthropic_block(block, text_part: str, parts: set[str], found: Found) -> No
         if source.get("type") != "base64":
             raise Refused("An attached image sent by reference cannot be inspected")
         found.files.append(FileRef(source, "image"))
+    elif kind == "image_url":
+        if "image" not in parts:
+            return
+        image = block.get("image_url")
+        if isinstance(image, dict) and isinstance(image.get("url"), str):
+            found.files.append(_data_url(image, "url", "image"))
+        elif isinstance(image, str):
+            found.files.append(_data_url(block, "image_url", "image"))
+        else:
+            raise Refused("An attached image has no URL")
+    elif kind == "input_image":
+        if "image" not in parts:
+            return
+        if not isinstance(block.get("image_url"), str):
+            raise Refused("An attached image sent by file id cannot be inspected")
+        found.files.append(_data_url(block, "image_url", "image"))
+    elif kind == "file":
+        if "document" in parts:
+            _openai_file(block.get("file"), found)
+    elif kind == "input_file":
+        if "document" in parts:
+            _openai_file(block, found)
+    elif kind == "input_audio":
+        raise Refused("Attached audio cannot be inspected")
     else:
         raise Refused(f"A {kind or 'untyped'} content block is not supported by shield the model")
+
+
+def _text(holder: dict, key: str, part: str, parts: set[str], found: Found, required: bool = False) -> None:
+    """A text field: read when it is a string, refused when it is anything else."""
+    value = holder.get(key)
+    if isinstance(value, str):
+        if part in parts:
+            found.texts.append((holder, key))
+    elif value is not None or required:
+        raise Refused(f"A {key} that is not a string cannot be inspected")
 
 
 def _source(block: dict, part: str) -> dict:
@@ -272,181 +438,33 @@ def _source(block: dict, part: str) -> dict:
     return source
 
 
-# ----------------------------------------------- OpenAI Chat Completions request
-
-#: The part each Chat Completions role's content belongs to.
-_CHAT_ROLE_PARTS = {
-    "system": "system",
-    "developer": "system",
-    "user": "user",
-    "assistant": "assistant",
-    "tool": "tool_result",
-    "function": "tool_result",
-}
-
-#: Assistant message fields that hold text besides `content`. Mantle returns
-#: reasoning as `reasoning`. Some providers call it `reasoning_content`.
-_CHAT_TEXT_FIELDS = ("content", "reasoning", "reasoning_content", "refusal")
-
-
-def _chat_request(body: dict, parts: set[str], found: Found) -> None:
-    if body.get("prediction") is not None:
-        raise Refused("A predicted output cannot be inspected")
-    for message in body["messages"]:
-        if not isinstance(message, dict):
-            raise Refused("A chat message that is not an object cannot be inspected")
-        role = message.get("role")
-        part = _CHAT_ROLE_PARTS.get(role)
-        if part is None:
-            raise Refused(f"A chat message with role {role!r} cannot be inspected")
-        content = message.get("content")
-        if isinstance(content, str):
-            if part in parts:
-                found.texts.append((message, "content"))
-        elif isinstance(content, list):
-            for item in content:
-                _chat_content_part(item, part, parts, found)
-        elif content is not None:
-            raise Refused(f"A {role} message's content cannot be inspected")
-        if role != "assistant":
-            continue
-        if "assistant" in parts:
-            for key in _CHAT_TEXT_FIELDS[1:]:
-                if isinstance(message.get(key), str):
-                    found.texts.append((message, key))
-        if "tool_call" in parts:
-            for call in message.get("tool_calls") or []:
-                if not isinstance(call, dict):
-                    continue
-                function = call.get("function")
-                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
-                    found.json_strings.append((function, "arguments"))
-                custom = call.get("custom")
-                if isinstance(custom, dict) and isinstance(custom.get("input"), str):
-                    found.texts.append((custom, "input"))
-            legacy = message.get("function_call")
-            if isinstance(legacy, dict) and isinstance(legacy.get("arguments"), str):
-                found.json_strings.append((legacy, "arguments"))
-
-
-def _chat_content_part(item, part: str, parts: set[str], found: Found) -> None:
-    if not isinstance(item, dict):
-        raise Refused("A content part that is not an object cannot be inspected")
-    kind = item.get("type")
-    if kind == "text":
-        if part in parts and isinstance(item.get("text"), str):
-            found.texts.append((item, "text"))
-    elif kind == "refusal":
-        if part in parts and isinstance(item.get("refusal"), str):
-            found.texts.append((item, "refusal"))
-    elif kind == "image_url":
-        if "image" not in parts:
-            return
-        image = item.get("image_url")
-        if isinstance(image, dict) and isinstance(image.get("url"), str):
-            found.files.append(_data_url(image, "url", "image"))
-        elif isinstance(image, str):
-            found.files.append(_data_url(item, "image_url", "image"))
-        else:
-            raise Refused("An attached image has no URL")
-    elif kind == "file":
-        if "document" not in parts:
-            return
-        _openai_file(item.get("file"), "file_data", "file_id", found)
-    elif kind == "input_audio":
-        raise Refused("Attached audio cannot be inspected")
-    else:
-        raise Refused(f"A {kind or 'untyped'} content part is not supported by shield the model")
-
-
-# ------------------------------------------------------ OpenAI Responses request
-
-_RESPONSES_ROLE_PARTS = {"user": "user", "assistant": "assistant", "system": "system", "developer": "system"}
-
-
-def _responses_request(body: dict, parts: set[str], found: Found) -> None:
-    if body.get("prompt") is not None:
-        # A stored prompt's variables are filled in on the provider's side,
-        # where nothing here can read them.
-        raise Refused("A stored prompt cannot be inspected")
-    instructions = body.get("instructions")
-    if isinstance(instructions, str):
-        if "system" in parts:
-            found.texts.append((body, "instructions"))
-    elif instructions is not None:
-        raise Refused("Instructions that are not a string cannot be inspected")
-    given = body["input"]
-    if isinstance(given, str):
-        if "user" in parts:
-            found.texts.append((body, "input"))
-        return
-    for item in given:
-        _responses_item(item, parts, found)
-
-
-def _responses_item(item, parts: set[str], found: Found) -> None:
+def _input_item(item, parts: set[str], found: Found) -> None:
+    """One Responses input item."""
     if not isinstance(item, dict):
         raise Refused("An input item that is not an object cannot be inspected")
     kind = item.get("type") or ("message" if "role" in item else None)
     if kind == "message":
-        role = item.get("role")
-        part = _RESPONSES_ROLE_PARTS.get(role)
-        if part is None:
-            raise Refused(f"A message with role {role!r} cannot be inspected")
-        _responses_content(item, "content", part, parts, found)
+        _message(item, parts, found)
     elif kind == "function_call":
-        if "tool_call" in parts and isinstance(item.get("arguments"), str):
-            found.json_strings.append((item, "arguments"))
+        _arguments(item, "arguments", parts, found)
     elif kind == "custom_tool_call":
-        if "tool_call" in parts and isinstance(item.get("input"), str):
-            found.texts.append((item, "input"))
+        _arguments(item, "input", parts, found)
     elif kind in ("function_call_output", "custom_tool_call_output"):
-        _responses_content(item, "output", "tool_result", parts, found)
+        _content(item, "output", "tool_result", parts, found)
     elif kind == "reasoning":
         # Plain reasoning text the model wrote and will read again. Its
         # `encrypted_content`, when there is any, stays as it came.
-        if "assistant" in parts:
-            for key in ("content", "summary"):
-                for piece in item.get(key) or []:
-                    if isinstance(piece, dict) and isinstance(piece.get("text"), str):
+        for key in ("content", "summary"):
+            for piece in _list(item, key):
+                if isinstance(piece, dict) and isinstance(piece.get("text"), str):
+                    if "assistant" in parts:
                         found.texts.append((piece, "text"))
+                else:
+                    raise Refused("A reasoning part without text cannot be inspected")
     elif kind == "item_reference":
         return
     else:
         raise Refused(f"A {kind or 'untyped'} input item is not supported by shield the model")
-
-
-def _responses_content(holder: dict, key: str, part: str, parts: set[str], found: Found) -> None:
-    content = holder.get(key)
-    if isinstance(content, str):
-        if part in parts:
-            found.texts.append((holder, key))
-        return
-    if content is None:
-        return
-    if not isinstance(content, list):
-        raise Refused(f"Content of type {type(content).__name__} cannot be inspected")
-    for piece in content:
-        if not isinstance(piece, dict):
-            raise Refused("A content part that is not an object cannot be inspected")
-        kind = piece.get("type")
-        if kind in ("input_text", "output_text", "text"):
-            if part in parts and isinstance(piece.get("text"), str):
-                found.texts.append((piece, "text"))
-        elif kind == "refusal":
-            if part in parts and isinstance(piece.get("refusal"), str):
-                found.texts.append((piece, "refusal"))
-        elif kind == "input_image":
-            if "image" not in parts:
-                continue
-            if not isinstance(piece.get("image_url"), str):
-                raise Refused("An attached image sent by file id cannot be inspected")
-            found.files.append(_data_url(piece, "image_url", "image"))
-        elif kind == "input_file":
-            if "document" in parts:
-                _openai_file(piece, "file_data", "file_id", found)
-        else:
-            raise Refused(f"A {kind or 'untyped'} content part is not supported by shield the model")
 
 
 # ------------------------------------------------------- OpenAI attachments
@@ -467,18 +485,20 @@ def _data_url(holder: dict, key: str, part: str) -> FileRef:
     return FileRef(source, part, commit)
 
 
-def _openai_file(file, data_key: str, id_key: str, found: Found) -> None:
+def _openai_file(file, found: Found) -> None:
     """An attached file in either OpenAI format: a data URL, or base64 named by its filename."""
     if not isinstance(file, dict):
         raise Refused("An attached document has no file object")
-    if isinstance(file.get("filename"), str):
-        found.texts.append((file, "filename"))
-    data = file.get(data_key)
-    if not isinstance(data, str):
-        what = "file id" if file.get(id_key) else "URL" if file.get("file_url") else "unknown source"
-        raise Refused(f"An attached document sent by {what} cannot be inspected")
+    # Only called when documents are de-identified, so the filename always is.
+    _text(file, "filename", "document", {"document"}, found)
+    data = file.get("file_data")
+    # A file id or URL next to the data could be what the provider reads, and
+    # that file never passes through here.
+    by = "file id" if file.get("file_id") else "URL" if file.get("file_url") else None
+    if by or not isinstance(data, str):
+        raise Refused(f"An attached document sent by {by or 'an unknown source'} cannot be inspected")
     if data.startswith("data:"):
-        found.files.append(_data_url(file, data_key, "document"))
+        found.files.append(_data_url(file, "file_data", "document"))
         return
     media = mimetypes.guess_type(str(file.get("filename") or ""))[0]
     if media is None:
@@ -486,7 +506,7 @@ def _openai_file(file, data_key: str, id_key: str, found: Found) -> None:
     source = {"media_type": media, "data": data}
 
     def commit(result: dict) -> None:
-        file[data_key] = result["data"]
+        file["file_data"] = result["data"]
 
     found.files.append(FileRef(source, "document", commit))
 
@@ -664,6 +684,10 @@ def _anthropic_stream(events: list[_Event], parts: set[str], restore: Restore) -
 
 # ----------------------------------------------- Chat Completions answers
 
+#: Answer message fields that hold text. Mantle returns reasoning as
+#: `reasoning`, and some providers call it `reasoning_content`.
+_CHAT_TEXT_FIELDS = ("content", "reasoning", "reasoning_content", "refusal")
+
 
 def _chat_document(doc: dict, parts: set[str], restore: Restore) -> int:
     changed = 0
@@ -690,6 +714,7 @@ def _chat_document(doc: dict, parts: set[str], restore: Restore) -> int:
 def _chat_stream(events: list[_Event], parts: set[str], restore: Restore) -> int:
     texts: dict[Any, list] = defaultdict(list)
     arguments: dict[Any, list] = defaultdict(list)
+    custom_inputs: dict[Any, list] = defaultdict(list)
     for event in events:
         data = event.data
         if not isinstance(data, dict):
@@ -703,9 +728,14 @@ def _chat_stream(events: list[_Event], parts: set[str], restore: Restore) -> int
                 if isinstance(delta.get(key), str):
                     texts[(index, key)].append((event, delta))
             for call in delta.get("tool_calls") or []:
-                function = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
                 if isinstance(function, dict) and isinstance(function.get("arguments"), str):
                     arguments[(index, call.get("index", 0))].append((event, function))
+                custom = call.get("custom")
+                if isinstance(custom, dict) and isinstance(custom.get("input"), str):
+                    custom_inputs[(index, call.get("index", 0))].append((event, custom))
             legacy = delta.get("function_call")
             if isinstance(legacy, dict) and isinstance(legacy.get("arguments"), str):
                 arguments[(index, "function_call")].append((event, legacy))
@@ -716,6 +746,8 @@ def _chat_stream(events: list[_Event], parts: set[str], restore: Restore) -> int
     if "tool_call" in parts:
         for pieces in arguments.values():
             changed += _rejoin(pieces, "arguments", restore.json_string)
+        for pieces in custom_inputs.values():
+            changed += _rejoin(pieces, "input", restore.text)
     return changed
 
 
@@ -759,7 +791,29 @@ def _responses_document(doc: dict, parts: set[str], restore: Restore) -> int:
         changed += _responses_output_item(item, parts, restore)
     if "text" in parts:
         changed += _restore_field(doc, "output_text", restore.text)
+    changed += _echoed_instructions(doc, parts, restore)
     return changed
+
+
+def _echoed_instructions(doc: dict, parts: set[str], restore: Restore) -> int:
+    """Give back the caller's own instructions, which a Responses answer echoes.
+
+    The echo holds the de-identified instructions and the system note this
+    module added. The note is taken out and, when text is restored, so are the
+    tokens.
+    """
+    value = doc.get("instructions")
+    if not isinstance(value, str):
+        return 0
+    new = value
+    if new.endswith(SYSTEM_NOTE):
+        new = new[: -len(SYSTEM_NOTE)].removesuffix("\n\n")
+    if "text" in parts:
+        new = restore.text(new)
+    if new == value:
+        return 0
+    doc["instructions"] = new or None
+    return 1
 
 
 def _responses_output_item(item, parts: set[str], restore: Restore) -> int:

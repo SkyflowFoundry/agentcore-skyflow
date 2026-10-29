@@ -172,7 +172,22 @@ def handle(http: dict, direction: str, policy_set: PolicySet, context) -> dict |
         # Only the type is logged, because an exception's message can quote
         # the body it choked on.
         logger.error("inference_fail_closed direction=%s reason=internal_error err=%s", direction, type(exc).__name__)
-        return refusal("messages", "The interceptor could not process the model call, so it was blocked.", 502)
+        kind = "messages"
+        if direction == "request":
+            call = classify((http.get("gatewayRequest") or {}).get("path") or "", None)
+            kind = call.kind if call else kind
+            _record_refusal(context, kind)
+        return refusal(kind, "The interceptor could not process the model call, so it was blocked.", 502)
+
+
+def _record_refusal(context, kind: str) -> None:
+    """Record a refusal that came from an error, so the answer side lets it through as written."""
+    try:
+        store, rid = settings.record_store(), request_id(context)
+        if store is not None and rid is not None:
+            store.put(rid, CallRecord(kind=kind))
+    except Exception as exc:  # noqa: BLE001 - the call is refused either way
+        logger.error("inference_record_write_failed kind=%s err=%s", kind, type(exc).__name__)
 
 
 # ------------------------------------------------------------- request side
@@ -231,6 +246,17 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         return _remember(store, rid, record, call) or passthrough()
     if not isinstance(body, dict):
         return refuse("The model request body is not a JSON object.", 400)
+    if (rule.response.action == "reidentify" and rule.response.only == "minted_for_request"
+            and formats.continues_stored_conversation(body)):
+        # The earlier turns live with the provider and pass through here no
+        # more, so this call mints nothing and its answer could restore none
+        # of their tokens.
+        logger.warning("inference_blocked kind=%s model=%s reason=stored_conversation", call.kind, call.model)
+        return refuse(
+            "Shield the model restores only the tokens a call mints, and a call that continues a stored "
+            "conversation mints none for its earlier turns. Send the whole conversation in input instead.",
+            403,
+        )
     if not formats.readable(call.kind, body):
         logger.warning("inference_blocked kind=%s model=%s reason=body_unreadable", call.kind, call.model)
         return refuse(
@@ -361,7 +387,9 @@ def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, c
 
     # Tokens minted inside a base64 attachment cannot be seen in the body, so
     # the minted set counts as well as tokens an earlier turn carried in.
-    if rule.request.system_note and (minted or TOKEN.search(json.dumps(body))):
+    if rule.request.system_note and (
+        minted or TOKEN.search(json.dumps(body)) or formats.continues_stored_conversation(body)
+    ):
         formats.add_system_note(kind, body)
 
     return body, minted, {"strings": len(distinct), "files": len(checked)}
@@ -608,12 +636,18 @@ class _Restorer:
 
         Parsed when it parses, so a restored value is escaped by the encoder.
         Arguments cut short by the token limit are not JSON, and their tokens
-        are replaced in place with escaped values.
+        are replaced in place with escaped values. Arguments that were never
+        JSON get plain values.
         """
         try:
             parsed = json.loads(value)
         except ValueError:
-            return self.text(value, escape=True)
+            # Cut-short JSON needs its values escaped. Free-form arguments,
+            # which the request side de-identified as plain text, do not. A
+            # leading `[` may be a token rather than the start of an array.
+            start = value.lstrip()
+            looks_like_json = start.startswith(("{", '"')) or (start.startswith("[") and not TOKEN.match(start))
+            return self.text(value, escape=looks_like_json)
         new, changed = self.tree(parsed)
         return json.dumps(new) if changed else value
 

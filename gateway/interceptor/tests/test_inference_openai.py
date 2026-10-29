@@ -35,6 +35,7 @@ from records import CallRecord  # noqa: E402
 from skyflow_client import FileOutput, FileRunResult  # noqa: E402
 
 CHAT_MODEL = "bedrock/deepseek.v3.2"
+MODEL_CLAUDE = "bedrock/global.anthropic.claude-sonnet-5"
 RESPONSES_MODEL = "mantle/openai.gpt-oss-120b"
 LOOKUP = {"type": "object", "properties": {"email": {"type": "string"}}}
 
@@ -266,11 +267,24 @@ class ResponsesRequestTestCase(OpenAITestCase):
         self.assertEqual(content[1]["file_data"], data_url("application/pdf", b"%PDF redacted"))
         self.assertEqual([f[1] for f in self.client.files], ["png", "pdf"])
 
-    def test_an_item_reference_passes(self):
-        body = {"model": RESPONSES_MODEL, "input": [{"type": "item_reference", "id": "msg_1"},
-                                                    {"role": "user", "content": f"Hi {NAME}"}]}
-        items = self.sent_body(self.send_responses(body))["input"]
-        self.assertEqual(items[0], {"type": "item_reference", "id": "msg_1"})
+    def test_continuing_a_stored_conversation_is_refused_when_only_minted_tokens_are_restored(self):
+        """Its earlier turns mint nothing here, so their tokens could never be restored."""
+        for name, extra in {
+            "previous response": {"previous_response_id": "resp_1", "input": "What was the email again?"},
+            "conversation": {"conversation": "conv_1", "input": "What was the email again?"},
+            "item reference": {"input": [{"type": "item_reference", "id": "msg_1"}, {"role": "user", "content": "Again?"}]},
+        }.items():
+            with self.subTest(name=name):
+                body = {"model": RESPONSES_MODEL, **extra}
+                self.assertIn("stored conversation", self.openai_error(self.send_responses(body), 403)["message"])
+
+    def test_continuing_is_allowed_when_any_vault_token_is_restored_and_gets_the_note(self):
+        self.use(policy({**SHIELD, "response": {"action": "reidentify", "only": "any_vault_token"}}))
+        body = {"model": RESPONSES_MODEL, "previous_response_id": "resp_1",
+                "input": [{"type": "item_reference", "id": "msg_1"}, {"role": "user", "content": "Again?"}]}
+        sent = self.sent_body(self.send_responses(body))
+        self.assertEqual(sent["input"][0], {"type": "item_reference", "id": "msg_1"})
+        self.assertEqual(sent["instructions"], inference.SYSTEM_NOTE, "the stored turns hold tokens the model must not remark on")
 
     def test_what_cannot_be_inspected_is_refused(self):
         cases = {
@@ -285,6 +299,123 @@ class ResponsesRequestTestCase(OpenAITestCase):
         for name, body in cases.items():
             with self.subTest(name=name):
                 self.openai_error(self.send_responses(body), 403)
+
+
+class CrossFormatTestCase(OpenAITestCase):
+    """The gateway hands a body on unchanged, so every format's fields are read on every path."""
+
+    def test_chat_tool_calls_on_the_messages_path_are_deidentified(self):
+        """The Bedrock connector sends a Messages call to DeepSeek on to an OpenAI endpoint."""
+        body = {"model": CHAT_MODEL, "max_tokens": 100, "messages": [
+            {"role": "user", "content": f"Find {NAME}."},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "lookup", "arguments": json.dumps({"email": EMAIL})}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": f"Phone {PHONE}"}]}
+        messages = self.sent_body(self.send(body))["messages"]
+        self.assertEqual(json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]), {"email": TOKENS[EMAIL]})
+        self.assertEqual(messages[2]["content"], f"Phone {TOKENS[PHONE]}")
+
+    def test_anthropics_system_on_the_chat_path_is_deidentified(self):
+        """The Bedrock connector sends a Chat Completions call to Claude on to InvokeModel."""
+        body = {"model": "bedrock/global.anthropic.claude-sonnet-5", "anthropic_version": "bedrock-2023-05-31",
+                "system": f"The customer is {NAME}.", "messages": [{"role": "user", "content": "Who is it?"}]}
+        sent = self.sent_body(self.send(body, path="/v1/chat/completions"))
+        self.assertEqual(sent["system"], f"The customer is {TOKENS[NAME]}.\n\n{inference.SYSTEM_NOTE}")
+
+    def test_the_note_goes_where_claude_reads_it_on_the_chat_path(self):
+        """Claude refuses a first message with the system role. Seen live."""
+        body = {"model": "bedrock/global.anthropic.claude-sonnet-5", "anthropic_version": "bedrock-2023-05-31",
+                "messages": [{"role": "user", "content": f"Who is {NAME}?"}]}
+        sent = self.sent_body(self.send(body, path="/v1/chat/completions"))
+        self.assertEqual(sent["system"], inference.SYSTEM_NOTE)
+        self.assertEqual([m["role"] for m in sent["messages"]], ["user"])
+
+    def test_chat_tool_calls_in_an_invoke_body_are_deidentified(self):
+        body = {"anthropic_version": "bedrock-2023-05-31", "messages": [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "lookup", "arguments": json.dumps({"email": EMAIL})}}]}]}
+        messages = self.sent_body(self.send(body, path="/model/deepseek.v3-v1:0/invoke"))["messages"]
+        self.assertEqual(json.loads(messages[0]["tool_calls"][0]["function"]["arguments"]), {"email": TOKENS[EMAIL]})
+
+    def test_text_fields_of_formats_not_read_are_refused(self):
+        for key, value in {"prompt": f"Human: {NAME}", "inputText": NAME, "message": NAME,
+                           "chat_history": [{"role": "USER", "message": NAME}], "documents": [{"text": NAME}]}.items():
+            with self.subTest(key=key):
+                body = {"model": CHAT_MODEL, "messages": [{"role": "user", "content": "Hi"}], key: value}
+                self.openai_error(self.send(body, path="/v1/chat/completions"), 403)
+        self.assertEqual(self.client.deidentified, [])
+
+    def test_a_messages_name_is_deidentified(self):
+        body = {"model": CHAT_MODEL, "messages": [{"role": "user", "name": f"{NAME} desk", "content": "Hello there."}]}
+        messages = self.sent_body(self.send(body, path="/v1/chat/completions"))["messages"]
+        self.assertEqual(messages[-1]["name"], f"{TOKENS[NAME]} desk")
+
+    def test_arguments_sent_as_json_rather_than_a_string_are_deidentified(self):
+        chat = {"model": CHAT_MODEL, "messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "f", "arguments": {"email": EMAIL}}}]}]}
+        sent = self.sent_body(self.send(chat, path="/v1/chat/completions"))
+        self.assertEqual(sent["messages"][-1]["tool_calls"][0]["function"]["arguments"], {"email": TOKENS[EMAIL]})
+        responses = {"model": RESPONSES_MODEL, "input": [
+            {"type": "function_call", "call_id": "c", "name": "f", "arguments": {"email": EMAIL}}]}
+        sent = self.sent_body(self.send(responses, path="/v1/responses"))
+        self.assertEqual(sent["input"][0]["arguments"], {"email": TOKENS[EMAIL]})
+
+    def test_arguments_of_another_type_are_refused(self):
+        body = {"model": CHAT_MODEL, "messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "f", "arguments": 5}}]}]}
+        self.openai_error(self.send(body, path="/v1/chat/completions"), 403)
+
+    def test_text_fields_of_the_wrong_type_are_refused(self):
+        cases = {
+            "chat text object": {"role": "user", "content": [{"type": "text", "text": {"value": NAME}}]},
+            "responses text list": {"role": "user", "content": [{"type": "input_text", "text": [NAME]}]},
+            "document title list": {"role": "user", "content": [{"type": "document", "title": [NAME],
+                                                                 "source": {"type": "text", "data": "x"}}]},
+            "text source data list": {"role": "user", "content": [{"type": "document",
+                                                                   "source": {"type": "text", "data": [NAME]}}]},
+        }
+        for name, message in cases.items():
+            with self.subTest(name=name):
+                self.error(self.send({"model": MODEL_CLAUDE, "messages": [message]}), 403)
+
+    def test_citations_annotations_and_search_sources_are_deidentified(self):
+        body = {"model": MODEL_CLAUDE, "messages": [
+            {"role": "user", "content": [{"type": "search_result", "source": f"https://x.example/{EMAIL}",
+                                          "title": "Note", "content": [{"type": "text", "text": "See source."}]}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Quoted.", "citations": [
+                {"type": "char_location", "cited_text": f"{NAME} wrote", "document_title": f"{NAME} file"}]}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "Linked.", "annotations": [
+                {"type": "url_citation", "title": f"About {NAME}", "url": "https://x.example"}]}]}]}
+        messages = self.sent_body(self.send(body))["messages"]
+        self.assertEqual(messages[0]["content"][0]["source"], f"https://x.example/{TOKENS[EMAIL]}")
+        citation = messages[1]["content"][0]["citations"][0]
+        self.assertEqual((citation["cited_text"], citation["document_title"]),
+                         (f"{TOKENS[NAME]} wrote", f"{TOKENS[NAME]} file"))
+        self.assertEqual(messages[2]["content"][0]["annotations"][0]["title"], f"About {TOKENS[NAME]}")
+
+    def test_a_file_that_also_names_a_file_id_is_refused(self):
+        """The provider might read the uploaded file, which never passes through here."""
+        part = {"type": "file", "file": {"filename": "a.txt", "file_data": data_url("text/plain", b"harmless"),
+                                         "file_id": "file-abc"}}
+        body = {"model": CHAT_MODEL, "messages": [{"role": "user", "content": [part]}]}
+        self.openai_error(self.send(body, path="/v1/chat/completions"), 403)
+
+    def test_a_system_block_other_than_text_is_refused(self):
+        body = {"model": CHAT_MODEL, "system": [{"type": "image", "source": {}}], "messages": []}
+        self.error(self.send(body), 403)
+
+    def test_an_internal_error_on_an_openai_path_answers_in_openai_form_and_is_recorded(self):
+        def broken(*args, **kwargs):
+            raise KeyError("boom")
+        saved = inference.formats.collect
+        inference.formats.collect = broken
+        try:
+            with self.assertLogs(level="ERROR"):
+                out = self.send({"model": CHAT_MODEL, "messages": []}, path="/v1/chat/completions")
+        finally:
+            inference.formats.collect = saved
+        self.openai_error(out, 502)
+        self.assertEqual(self.store.items["req-1"].kind, "chat", "recorded, so the refusal reaches the caller")
 
 
 class ChatAnswerTestCase(OpenAITestCase):
@@ -329,6 +460,15 @@ class ChatAnswerTestCase(OpenAITestCase):
         joined = "".join(c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] for c in stream_data(out))
         self.assertEqual(json.loads(joined), {"email": EMAIL})
 
+    def test_a_streamed_custom_tool_call_is_restored(self):
+        self.record()
+        chunks = [{"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "type": "custom", "custom": {"input": piece}}]}}]}
+            for piece in ("mail ", TOKENS[EMAIL][:6], TOKENS[EMAIL][6:])]
+        out = self.returned(self.answer(sse(*chunks), "text/event-stream"))
+        joined = "".join(c["choices"][0]["delta"]["tool_calls"][0]["custom"]["input"] for c in stream_data(out))
+        self.assertEqual(joined, f"mail {EMAIL}")
+
     def test_streamed_reasoning_is_restored(self):
         self.record()
         chunks = [{"choices": [{"index": 0, "delta": {"reasoning": piece}}]}
@@ -348,6 +488,16 @@ class ResponsesAnswerTestCase(OpenAITestCase):
         self.assertEqual(output[0]["content"][0]["text"], f"About {NAME}")
         self.assertEqual(output[1]["content"][0]["text"], f"Hello {NAME}")
         self.assertEqual(json.loads(output[2]["arguments"]), {"email": EMAIL})
+
+    def test_the_echoed_instructions_are_given_back_without_the_note(self):
+        self.record("responses")
+        answer = {"object": "response", "instructions": f"Customer is {TOKENS[NAME]}.\n\n{inference.SYSTEM_NOTE}",
+                  "output": [{"type": "message", "content": [{"type": "output_text", "text": "Done."}]}]}
+        doc = json.loads(self.returned(self.answer(json.dumps(answer))))
+        self.assertEqual(doc["instructions"], f"Customer is {NAME}.")
+        answer["instructions"] = inference.SYSTEM_NOTE
+        self.assertIsNone(json.loads(self.returned(self.answer(json.dumps(answer))))["instructions"],
+                          "instructions the caller never sent come back as none")
 
     def test_every_copy_of_a_streamed_text_is_restored_alike(self):
         self.record("responses")
@@ -433,6 +583,12 @@ class RestorerTestCase(unittest.TestCase):
     def test_arguments_cut_short_are_restored_with_escaping(self):
         out = self.restorer('Dan "D" O').json_string('{"name": "' + TOKENS[NAME])
         self.assertEqual(out, '{"name": "Dan \\"D\\" O')
+
+    def test_free_form_arguments_get_plain_values(self):
+        out = self.restorer('Dan "D" O').json_string("Send the letter to " + TOKENS[NAME])
+        self.assertEqual(out, 'Send the letter to Dan "D" O')
+        out = self.restorer('Dan "D" O').json_string(TOKENS[NAME] + " gets the letter")
+        self.assertEqual(out, 'Dan "D" O gets the letter', "a leading token is not the start of a JSON array")
 
     def test_arguments_without_tokens_are_left_byte_for_byte(self):
         original = '{"name":   "x"}'

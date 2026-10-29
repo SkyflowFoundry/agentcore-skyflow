@@ -178,7 +178,7 @@ What each recognised call gets:
 | Path | Request | Answer |
 | --- | --- | --- |
 | `/v1/messages` | de-identified | re-identified, as JSON or as a buffered stream |
-| `/v1/messages/count_tokens` | de-identified | passed |
+| `/v1/messages/count_tokens` | de-identified, though the gateway answers that it does not support the path on either connector | passed |
 | `/model/{id}/invoke` | de-identified when the body is Anthropic's, refused otherwise | re-identified |
 | `/model/{id}/invoke-with-response-stream` | as for `invoke` | refused while the rule re-identifies |
 | `/v1/chat/completions` | de-identified | re-identified, as JSON or as a buffered stream |
@@ -232,6 +232,13 @@ Behaviour worth knowing:
   Thinking blocks and server-tool blocks such as `web_search_tool_result` came
   from the provider and go back as they came, but only in an assistant turn.
   Anywhere else the client wrote them, so they are refused.
+- **Every path reads every format.** The gateway hands a body on unchanged,
+  and the model behind a path may read it in another format. A Messages call
+  to DeepSeek reaches an OpenAI endpoint, and a Chat Completions call to
+  Claude reaches InvokeModel. So the interceptor de-identifies Anthropic,
+  Chat Completions and Responses fields wherever they appear, and refuses
+  fields that only other model families read, such as `prompt`, `inputText`
+  and Cohere's `message`.
 - **The OpenAI formats carry tool-call arguments as a JSON string.** The
   interceptor parses them, de-identifies or restores the strings inside and
   writes them back as JSON. Arguments cut short by the token limit are not
@@ -342,8 +349,9 @@ agentcore deploy --target dev -y
 #    Note the gateway name is prefixed with the project name.
 python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 
-# 4. shield the model: a Bedrock inference target on the gateway, plus the
-#    gateway role's Bedrock permissions. Needs the gateway from step 2. The
+# 4. shield the model: the Bedrock and Mantle inference targets on the
+#    gateway, plus the gateway role's permissions for both. Needs the gateway
+#    from step 2. The
 #    region must be the one in agentcore/aws-targets.json, because the CLI's
 #    default region may be another. The synth refuses a gateway id of None,
 #    which is what the lookup prints when it finds nothing.
@@ -360,10 +368,12 @@ cd -
 The stack adds two targets. `bedrock` uses the Bedrock runtime connector and
 `mantle` the Mantle connector, which serves the OpenAI APIs for models the
 runtime connector does not, such as gpt-oss on Responses. The Mantle target
-needs `bedrock-mantle:CreateInference` and its Get and List actions on the
+needs `bedrock-mantle:CreateInference`, `ListModels` and `GetModel` on the
 account's projects, which the stack grants. Deploy with
-`-c inferenceMantle=false` to leave it out. A client picks a target by
-qualifying the model id, as in `mantle/openai.gpt-oss-120b`.
+`-c inferenceMantle=false` to leave it out. Do that in a Region where Mantle
+is not offered, because a target that fails to create rolls back the whole
+stack and the `bedrock` target with it. A client picks a target by qualifying
+the model id, as in `mantle/openai.gpt-oss-120b`.
 
 Deploying with `-c inferenceTargetName=<name>` names the Bedrock target
 otherwise, and then Flow needs `MODEL_GATEWAY_TARGET=<name>` too, because it
@@ -958,3 +968,12 @@ tokenizing those would break tool discovery.
    refused when it would need re-identifying, because its binary event stream
    is not parsed yet.
 8. **Shielded answers do not stream word by word.** The gateway buffers them.
+9. **Tools the provider runs are outside the shield.** Anthropic's
+   `mcp_servers`, Responses tools of type `mcp` and Chat Completions'
+   `web_search_options` pass as given. What such a tool fetches reaches the
+   model without passing the interceptor, as server-tool results always have.
+10. **A Responses call that continues a stored conversation is refused under
+    `response.only: minted_for_request`.** `previous_response_id`,
+    `conversation` and `item_reference` build on turns the provider stored,
+    which mint no tokens in this call. Send the whole conversation in `input`,
+    or restore `any_vault_token`.

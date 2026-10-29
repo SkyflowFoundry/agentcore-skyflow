@@ -140,11 +140,12 @@ A response with no record is left to `httpPayloads`, which blocks it by default.
 
 Each dialect gets a small adapter that lists the parts to transform and writes the results back. Adapters live in a new `src/inference.py`.
 
-1. **Anthropic Messages is built.** Claude models on Bedrock serve it through the `bedrock-runtime` connector. The adapter covers JSON answers and buffered streams. For a stream it joins each content block's deltas, re-identifies the joined text and writes it back as one delta. `count_tokens` requests are de-identified too.
+1. **Anthropic Messages is built.** Claude models on Bedrock serve it through the `bedrock-runtime` connector. The adapter covers JSON answers and buffered streams. For a stream it joins each content block's deltas, re-identifies the joined text and writes it back as one delta. `count_tokens` requests are de-identified too, although the gateway answered on 29 October 2026 that it does not support that path on either connector.
 2. **Bedrock `InvokeModel` is built for JSON answers from Claude.** Its body is the Anthropic payload for Claude models, so it reuses the first adapter. Other model families send their own bodies, such as Llama's `prompt`, so a body without `anthropic_version` and `messages` is refused. A streamed InvokeModel answer uses AWS event-stream framing, which is not parsed yet, so such a call is refused while the rule re-identifies. Any other path under `/v1/` or `/model/` is refused too, so it cannot fall through to `httpPayloads`.
 3. **OpenAI Chat Completions is built.** It reaches gpt-oss and DeepSeek and Qwen and Mistral Large 3 and Gemma 3 through both connectors. The adapter reads every role's content and content parts. Tool-call arguments are a JSON string, so they are parsed and written back as JSON. Reasoning text is restored too. Images and files arrive as base64 data URLs and take the attachment paths Anthropic's use.
 4. **OpenAI Responses is built.** Today it reaches only gpt-oss, through the Mantle connector. Its streams repeat the finished text in the `.done` event and in every event that carries the finished part or item or response, and each copy is restored alike.
-5. **An answer is read by its own shape.** The gateway's Bedrock connector answers a Messages call to DeepSeek or Qwen in Chat Completions form, so the response side detects the format from the body. An answer in no known shape passes when it carries nothing to restore and fails under the rule's failure mode when it does.
+5. **A request is read in every format at once.** The gateway hands a body on unchanged, so a Messages call to DeepSeek is read by an OpenAI endpoint and a Chat Completions call to Claude by InvokeModel. The request side reads Anthropic, Chat Completions and Responses fields on every path and refuses fields only other model families read. A code review found that reading by path alone let Chat-style `tool_calls` on the Messages path reach DeepSeek in clear.
+6. **An answer is read by its own shape.** The gateway's Bedrock connector answers a Messages call to DeepSeek or Qwen in Chat Completions form, so the response side detects the format from the body. An answer in no known shape passes when it carries nothing to restore and fails under the rule's failure mode when it does.
 
 `src/model_formats.py` holds the three formats and nothing about Skyflow. `src/inference.py` does the Skyflow side for all of them.
 
@@ -162,7 +163,7 @@ The project schema can express inference only as a `passthrough` target, not as 
 
 1. `SkyflowInterceptorStack` gains the DynamoDB table for per-request records, with put and get grants for the interceptor and its name in `INFERENCE_RECORD_TABLE`.
 2. A new `SkyflowInferenceStack` adds a `bedrock-runtime` connector target on SkyflowGateway with `GATEWAY_IAM_ROLE` outbound auth. It also grants the gateway role `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` and the seven list calls that the inference target documentation names for model discovery. CDK 2.261 does not model inference targets yet, so the target configuration is a CloudFormation property override. CloudFormation itself supports it.
-3. The same stack adds a `bedrock-mantle` connector target named `mantle` and grants `bedrock-mantle:CreateInference` with its Get and List actions on the account's projects. `-c inferenceMantle=false` leaves it out.
+3. The same stack adds a `bedrock-mantle` connector target named `mantle` and grants `bedrock-mantle:CreateInference`, `ListModels` and `GetModel` on the account's projects. A scratch target reached READY with exactly those. `-c inferenceMantle=false` leaves it out.
 
 The deliberate exception in `agentcore/cdk/lib/cdk-stack.ts` stays as it is.
 

@@ -77,10 +77,12 @@ export class InferenceStack extends cdk.Stack {
     const mantle = props.mantle ?? true;
     if (mantle) {
       // Mantle authorizes inference on the account's projects rather than on
-      // model ARNs. This is the minimum policy its documentation gives for
-      // SigV4 callers.
+      // model ARNs. Model discovery lists and reads models, and inference
+      // creates them. A scratch target reached READY and served Chat
+      // Completions, Responses and Messages with these three and nothing more.
+      // Mantle's Get* and List* would also reach stored responses and files.
       policy.addStatements(new iam.PolicyStatement({
-        actions: ['bedrock-mantle:CreateInference', 'bedrock-mantle:Get*', 'bedrock-mantle:List*'],
+        actions: ['bedrock-mantle:CreateInference', 'bedrock-mantle:ListModels', 'bedrock-mantle:GetModel'],
         resources: [`arn:aws:bedrock-mantle:${this.region}:${this.account}:project/*`],
       }));
     }
