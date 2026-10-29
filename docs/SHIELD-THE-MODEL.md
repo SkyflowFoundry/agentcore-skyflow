@@ -4,6 +4,8 @@
 
 Built on 28 October 2026 and not yet deployed. A spike on a scratch gateway answered the open behaviour questions first. Its results are under [Spike results](#spike-results). The finished code then ran end to end on a second scratch gateway, and the code with the review fixes on a third. Those results are under [Live verification](#live-verification). SkyflowGateway is unchanged until the deploy steps in `gateway/interceptor/README.md` run.
 
+On 29 October 2026 a format spike tested which models answer on which API through each connector. Its results are under [Format spike](#format-spike). The OpenAI Chat Completions and Responses adapters followed and ran end to end on a fourth scratch gateway.
+
 ## Decisions
 
 1. **Naming.** This completes "Shield the model". The mode keeps sensitive data out of everything the model reads, from any source the policy names: message contents, attached files and tool results.
@@ -138,9 +140,14 @@ A response with no record is left to `httpPayloads`, which blocks it by default.
 
 Each dialect gets a small adapter that lists the parts to transform and writes the results back. Adapters live in a new `src/inference.py`.
 
-1. **Anthropic Messages is built.** Claude models on Bedrock serve it through the `bedrock-runtime` connector. The adapter covers JSON answers and buffered streams. For a stream it joins each content block's deltas, re-identifies the joined text and writes it back as one delta. `count_tokens` requests are de-identified too.
+1. **Anthropic Messages is built.** Claude models on Bedrock serve it through the `bedrock-runtime` connector. The adapter covers JSON answers and buffered streams. For a stream it joins each content block's deltas, re-identifies the joined text and writes it back as one delta. `count_tokens` requests are de-identified too, although the gateway answered on 29 October 2026 that it does not support that path on either connector.
 2. **Bedrock `InvokeModel` is built for JSON answers from Claude.** Its body is the Anthropic payload for Claude models, so it reuses the first adapter. Other model families send their own bodies, such as Llama's `prompt`, so a body without `anthropic_version` and `messages` is refused. A streamed InvokeModel answer uses AWS event-stream framing, which is not parsed yet, so such a call is refused while the rule re-identifies. Any other path under `/v1/` or `/model/` is refused too, so it cannot fall through to `httpPayloads`.
-3. **OpenAI Chat Completions and Responses are not built.** They are refused while a rule does anything.
+3. **OpenAI Chat Completions is built.** It reaches gpt-oss and DeepSeek and Qwen and Mistral Large 3 and Gemma 3 through both connectors. The adapter reads every role's content and content parts. Tool-call arguments are a JSON string, so they are parsed and written back as JSON. Reasoning text is restored too. Images and files arrive as base64 data URLs and take the attachment paths Anthropic's use.
+4. **OpenAI Responses is built.** Today it reaches only gpt-oss, through the Mantle connector. Its streams repeat the finished text in the `.done` event and in every event that carries the finished part or item or response, and each copy is restored alike.
+5. **A request is read in every format at once.** The gateway hands a body on unchanged, so a Messages call to DeepSeek is read by an OpenAI endpoint and a Chat Completions call to Claude by InvokeModel. The request side reads Anthropic, Chat Completions and Responses fields on every path and refuses fields only other model families read. A code review found that reading by path alone let Chat-style `tool_calls` on the Messages path reach DeepSeek in clear.
+6. **An answer is read by its own shape.** The gateway's Bedrock connector answers a Messages call to DeepSeek or Qwen in Chat Completions form, so the response side detects the format from the body. An answer in no known shape passes when it carries nothing to restore and fails under the rule's failure mode when it does.
+
+`src/model_formats.py` holds the three formats and nothing about Skyflow. `src/inference.py` does the Skyflow side for all of them.
 
 ### Streaming
 
@@ -156,12 +163,13 @@ The project schema can express inference only as a `passthrough` target, not as 
 
 1. `SkyflowInterceptorStack` gains the DynamoDB table for per-request records, with put and get grants for the interceptor and its name in `INFERENCE_RECORD_TABLE`.
 2. A new `SkyflowInferenceStack` adds a `bedrock-runtime` connector target on SkyflowGateway with `GATEWAY_IAM_ROLE` outbound auth. It also grants the gateway role `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` and the seven list calls that the inference target documentation names for model discovery. CDK 2.261 does not model inference targets yet, so the target configuration is a CloudFormation property override. CloudFormation itself supports it.
+3. The same stack adds a `bedrock-mantle` connector target named `mantle` and grants `bedrock-mantle:CreateInference`, `ListModels` and `GetModel` on the account's projects. A scratch target reached READY with exactly those. `-c inferenceMantle=false` leaves it out.
 
 The deliberate exception in `agentcore/cdk/lib/cdk-stack.ts` stays as it is.
 
 ## Steps
 
-Steps 1 to 7 are done. Step 8 is half done. Step 9 is done except for the blog.
+Steps 1 to 7 are done. Step 8 is done except for InvokeModel streams. Step 9 is done except for the blog. Step 10 is next.
 
 1. Add the `inference` policy model, its validation and its tests to `src/policy.py`.
 2. Add the Anthropic Messages adapter for text parts with tests for JSON bodies and buffered streams. Thinking blocks must pass through byte for byte.
@@ -170,8 +178,9 @@ Steps 1 to 7 are done. Step 8 is half done. Step 9 is done except for the blog.
 5. Add the inference target stack and its IAM grants.
 6. Add `MODEL_VIA_GATEWAY` to Flow with tests in `tests/flow/`.
 7. Add attachments: text documents first, then PDFs and images through Detect's file API.
-8. Add the InvokeModel adapter and then the OpenAI adapters. InvokeModel JSON is done. InvokeModel streams and the OpenAI dialects remain.
+8. Add the InvokeModel adapter and then the OpenAI adapters. InvokeModel JSON and both OpenAI formats are done. InvokeModel streams remain.
 9. Update the interceptor README and `AGENTS.md` and the shipped policy. Then decide whether the blog should describe this.
+10. Add the long tail. Llama and Nova answer on no OpenAI path, so they need their native InvokeModel bodies and a decoder for the binary event stream. Smaller models also mangle tokens, so restoring needs to tolerate a token that lost a bracket or changed case.
 
 ## Live verification
 
@@ -206,6 +215,44 @@ The code with the review fixes ran on a fresh scratch gateway on 29 October 2026
 | The interceptor's logs | 1,243 lines and none contained any of the fictional values. |
 
 The run showed that the gateway invokes the RESPONSE interceptor even after the REQUEST side refuses an inference call. The first attempt's refusals were replaced by the generic `httpPayloads` block for that reason. The request side now writes a record for every refusal, so the refusal reaches the caller as written. The second attempt confirmed it.
+
+### OpenAI formats
+
+The Chat Completions and Responses adapters ran on a fresh scratch gateway on 29 October 2026 with both a Bedrock runtime target and a Mantle target. Everything was deleted afterwards.
+
+| Check | Result |
+| --- | --- |
+| Chat Completions plain and streamed on DeepSeek V3.2 and Qwen3 32B and Gemma 3 27B through the Bedrock connector, and on Mistral Large 3 and gpt-oss 120B through Mantle | Every call answered. The model never saw the name, and the real email came back in eight of ten. |
+| Chat Completions tool calls plain and streamed on gpt-oss and Qwen | The arguments came back as JSON holding the real email. |
+| A Chat Completions history with an earlier tool call and tool result | The real phone number from the tool result came back. |
+| An image as a data URL on Gemma | The model read the name as blacked out. |
+| Responses plain and streamed and with a tool call on gpt-oss | The real email came back in the deltas and in the completed response, and in the tool call's arguments. |
+| A Messages call to DeepSeek answered in Chat Completions form | The real email came back. |
+| The Anthropic checks from the earlier runs | All passed again on the refactored code. |
+| The interceptor's logs | 1,444 lines and none contained any of the fictional values. |
+
+The two misses were Gemma streamed and Mistral plain. Asked to write the name reversed, they also garbled the email token as `HfbFlJn@EMAIL_ADDRESS_nJFlbfH`, which no exact match can restore. That is the token mangling step 10 covers. A first image test also failed because Detect could not read text drawn in Pillow's tiny default font. The same image with a normal font came back blacked out.
+
+## Format spike
+
+The spike put both connectors on one scratch gateway with a logging interceptor and sent the same prompt to each model family on every API. The interceptor replaced the name going in and upper-cased the answer coming back, which showed it can rewrite both directions in every format that answered.
+
+| Models | Chat Completions | Responses | Messages |
+| --- | --- | --- | --- |
+| Claude Sonnet 5 | no | no | both connectors |
+| gpt-oss 120B | both connectors | Mantle only | Bedrock connector, answered in Chat Completions form |
+| DeepSeek V3.2, Qwen3 32B, Mistral Large 3, Gemma 3 27B | both connectors | no | Bedrock connector, answered in Chat Completions form |
+| Llama 3.3, Llama 4 | no | no | no |
+| Nova Pro, Nova 2 Lite | no | no | no |
+
+Other findings.
+
+1. The interceptor always sees the client's own path, whichever connector serves it.
+2. The gateway translated nothing between formats in any case tried, although its documentation says it does. A Chat Completions call to Claude through the Bedrock connector failed for want of `anthropic_version`.
+3. Claude on Responses through the Bedrock connector answered 200 with an `UnknownOperationException` body.
+4. The Bedrock connector ends a Chat Completions stream with `data: [DONE]` and Mantle does not. Every chunk carries an `obfuscation` padding field.
+5. gpt-oss writes its reasoning between `<reasoning>` tags in the content through the Bedrock connector and in a `reasoning` field through Mantle.
+6. DeepSeek refused to use an obvious placeholder until told what it was, which is what the system note is for.
 
 ## Verification
 

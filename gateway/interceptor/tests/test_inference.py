@@ -204,8 +204,8 @@ class ClassifyTestCase(unittest.TestCase):
             "/inference/v1/messages": "messages",
             "/v1/messages/count_tokens": "count_tokens",
             "/v1/models": "models",
-            "/v1/chat/completions": "openai",
-            "/v1/responses": "openai",
+            "/v1/chat/completions": "chat",
+            "/v1/responses": "responses",
             "/model/us.anthropic.claude-sonnet-5/invoke": "invoke",
             "/model/us.anthropic.claude-sonnet-5/invoke-with-response-stream": "invoke_stream",
         }
@@ -567,10 +567,6 @@ class RefusalTestCase(InferenceTestCase):
         settings.build_client = lambda: real
         self.error(self.send({"model": MODEL, "messages": [{"role": "user", "content": f"Hi {NAME}"}]}), 502)
         self.assertEqual(len(inference._cache), 0)
-
-    def test_the_openai_dialect_is_refused_while_a_rule_is_active(self):
-        body = self.error(self.send({"model": MODEL, "messages": []}, path="/v1/chat/completions"), 403)
-        self.assertIn("OpenAI", body["error"]["message"])
 
     def test_a_streamed_invoke_cannot_be_reidentified_so_it_is_refused(self):
         out = self.send({"messages": []}, path="/model/global.anthropic.claude-sonnet-5/invoke-with-response-stream")
