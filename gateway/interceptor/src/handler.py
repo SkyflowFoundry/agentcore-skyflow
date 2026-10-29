@@ -11,19 +11,21 @@ Payload shapes (see gateway-interceptors-types in the AgentCore docs):
 - MCP targets   -> `event["mcp"]`, bodies are parsed JSON-RPC objects.
 - HTTP targets  -> `event["http"]`, bodies are base64-encoded strings. This
   covers AgentCore Runtime targets, `passthrough` targets, and inference
-  targets. They carry no tool identity and no MCP framing, so nothing here can
-  redact them. They are blocked unless the policy sets
-  `httpPayloads.action: passthrough`, which lets them through uninspected and
-  says so at WARNING on every call. Prefer an `mcpServer` target so tool calls
-  arrive as parsed MCP.
+  targets. Inference calls are shielded by `inference` when the policy has an
+  `inference` block (see that module). Everything else on `http` carries no
+  tool identity and no MCP framing, so nothing here can redact it. It is
+  blocked unless the policy sets `httpPayloads.action: passthrough`, which lets
+  it through uninspected and says so at WARNING on every call. Prefer an
+  `mcpServer` target so tool calls arrive as parsed MCP.
 
 Behaviour worth knowing:
 
 - Only `tools/call` is transformed. `tools/list`, `initialize` and friends pass
   through — a tool schema is not user data.
-- On MCP, a REQUEST short circuit still invokes the RESPONSE interceptor (unlike
-  HTTP, which skips it). The response path therefore tolerates an error body
-  with no `result`.
+- On MCP, a REQUEST short circuit still invokes the RESPONSE interceptor. The
+  response path therefore tolerates an error body with no `result`. A live
+  inference target invoked it after a short circuit too, so `inference`
+  records every refusal it returns.
 - With response streaming enabled the RESPONSE interceptor fires once per
   JSON-RPC event. Each event is transformed independently; only the first may
   set headers or status code, so this function never returns them.
@@ -51,6 +53,7 @@ import time
 
 import envelope
 import file_urls
+import inference
 import logsafe
 import payload as payload_utils
 import settings
@@ -91,7 +94,7 @@ def lambda_handler(event: dict, context) -> dict:
         return _on_request(mcp, context)
 
     if "http" in event:
-        return _on_http(event.get("http") or {})
+        return _on_http(event.get("http") or {}, context)
 
     logger.warning("unknown_payload_shape keys=%s", sorted(event.keys()))
     return {"interceptorOutputVersion": OUTPUT_VERSION, "mcp": {}}
@@ -100,23 +103,33 @@ def lambda_handler(event: dict, context) -> dict:
 # ---------------------------------------------------------------- http shape
 
 
-def _on_http(http: dict) -> dict:
-    """Block or pass an HTTP-shaped event, as `httpPayloads.action` says.
+def _on_http(http: dict, context=None) -> dict:
+    """Shield an inference call, or block or pass any other HTTP-shaped event.
 
-    AgentCore Runtime, passthrough and inference targets. Bodies are base64 and
-    carry no MCP framing, so there is no tool call to find and nothing to
-    redact. Passing them through silently would make a target the interceptor
-    never inspects look exactly like a protected one, so the default is to
-    refuse, and an explicit passthrough is logged at WARNING on every call.
+    Inference calls go to `inference` when the policy has an `inference`
+    block. Everything else is decided by `httpPayloads.action`: AgentCore
+    Runtime and passthrough targets, and inference targets without that block.
+    Their bodies are base64 and carry no MCP framing, so there is no tool call
+    to find and nothing to redact. Passing them through silently would make a
+    target the interceptor never inspects look exactly like a protected one, so
+    the default is to refuse, and an explicit passthrough is logged at WARNING
+    on every call.
     """
     direction = "response" if http.get("gatewayResponse") else "request"
     target = _http_target(http)
 
     try:
-        action = settings.load_policy().http_payloads
+        policy_set = settings.load_policy()
     except Exception:
         logger.exception("policy_load_failed direction=%s shape=http", direction)
         return _http_blocked("Interceptor policy unavailable")
+
+    if policy_set.inference is not None:
+        shielded = inference.handle(http, direction, policy_set, context)
+        if shielded is not None:
+            return shielded
+
+    action = policy_set.http_payloads
 
     if action == "passthrough":
         logger.warning(

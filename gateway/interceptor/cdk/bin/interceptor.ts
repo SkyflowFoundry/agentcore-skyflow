@@ -2,6 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
+import { InferenceStack } from '../lib/inference-stack';
 import { InterceptorStack } from '../lib/interceptor-stack';
 
 const app = new cdk.App();
@@ -84,6 +85,12 @@ function resolveEnv(): { account: string; region: string } {
  *   stackName         CloudFormation stack name (default SkyflowInterceptorStack);
  *                     set it, with policyParameterName, for a second deployment
  *                     in the same account and region
+ *
+ * Shield the model (adds SkyflowInferenceStack, deployed after agentcore deploy):
+ *   gatewayIdentifier the gateway agentcore deploy created
+ *   gatewayRoleArn    that gateway's execution role
+ *   inferenceTargetName  target name (default bedrock)
+ *   inferenceStackName   CloudFormation stack name (default SkyflowInferenceStack)
  */
 function required(name: string): string {
   const value = app.node.tryGetContext(name);
@@ -116,3 +123,22 @@ new InterceptorStack(app, app.node.tryGetContext('stackName') ?? 'SkyflowInterce
   metricNamespace: app.node.tryGetContext('metricNamespace'),
   alarmTopicArn: app.node.tryGetContext('alarmTopicArn'),
 });
+
+const gatewayIdentifier = app.node.tryGetContext('gatewayIdentifier');
+if (gatewayIdentifier) {
+  // A lookup that finds nothing prints None from the AWS CLI, and that would
+  // otherwise reach CloudFormation as a gateway name.
+  const gatewayRoleArn = required('gatewayRoleArn');
+  if (['none', 'null'].includes(String(gatewayIdentifier).toLowerCase())) {
+    throw new Error(`gatewayIdentifier is '${gatewayIdentifier}'. The gateway lookup found no gateway; check its name and region.`);
+  }
+  if (!gatewayRoleArn.startsWith('arn:')) {
+    throw new Error(`gatewayRoleArn must be an IAM role ARN, got '${gatewayRoleArn}'`);
+  }
+  new InferenceStack(app, app.node.tryGetContext('inferenceStackName') ?? 'SkyflowInferenceStack', {
+    env,
+    gatewayIdentifier,
+    gatewayRoleArn,
+    targetName: app.node.tryGetContext('inferenceTargetName'),
+  });
+}

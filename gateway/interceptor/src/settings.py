@@ -18,6 +18,7 @@ Environment variables (set by the CDK stack):
 | `ALLOW_UPSTREAM_PAYLOAD_LOGGING` | `true` to let the policy's `logUpstreamPayloads` take effect. Unset, the flag is ignored |
 | `POLICY_MAX_STALE_SECONDS` | How long the last good policy keeps serving while SSM cannot be read, default 3600 |
 | `SKYFLOW_TIMEOUT_SECONDS` | Per-request timeout for Skyflow calls, default 5 |
+| `INFERENCE_RECORD_TABLE` | DynamoDB table that carries a model call's decision from its request to its response. Shield the model needs it |
 """
 
 from __future__ import annotations
@@ -31,12 +32,14 @@ import time
 import boto3
 
 from policy import PolicySet
+from records import RecordStore
 from skyflow_client import SkyflowClient
 
 logger = logging.getLogger(__name__)
 
 _ssm = None
 _secrets = None
+_dynamodb = None
 
 #: `(loaded_at, policy)`: the last policy SSM answered with, and when.
 _policy_cache: tuple[float, PolicySet] | None = None
@@ -81,6 +84,19 @@ def _secrets_client():
     if _secrets is None:
         _secrets = boto3.client("secretsmanager")
     return _secrets
+
+
+def _dynamodb_client():
+    global _dynamodb
+    if _dynamodb is None:
+        _dynamodb = boto3.client("dynamodb")
+    return _dynamodb
+
+
+def record_store() -> RecordStore | None:
+    """The per-call record table, or None when the stack configured none."""
+    name = os.environ.get("INFERENCE_RECORD_TABLE", "").strip()
+    return RecordStore(name, _dynamodb_client()) if name else None
 
 
 def _cache_ttl() -> float:

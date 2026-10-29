@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cwActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
@@ -64,15 +65,16 @@ export interface InterceptorStackProps extends cdk.StackProps {
  */
 const METRICS: Array<[string, string[], string | null]> = [
   // [metric, log terms, alarm description or null for no alarm]
-  ['FailClosed', ['request_fail_closed', 'response_fail_closed'],
-    'A tool call was blocked because de-identification could not complete.'],
-  ['FailOpen', ['request_fail_open', 'response_fail_open'],
-    'A tool call went through unprotected because a fail_open rule hit an error.'],
+  ['FailClosed', ['request_fail_closed', 'response_fail_closed', 'inference_fail_closed'],
+    'A tool or model call was blocked because de-identification could not complete.'],
+  ['FailOpen', ['request_fail_open', 'response_fail_open', 'inference_fail_open'],
+    'A tool or model call went through unprotected because a fail_open rule hit an error.'],
   ['PolicyUnavailable', ['policy_load_failed', 'policy_refresh_failed'],
     'The interceptor could not read its policy from SSM and is serving a stale one or failing closed.'],
   ['HttpPayloadBlocked', ['http_payload_blocked'], null],
   ['HttpPayloadPassthrough', ['http_payload_passthrough'],
     'An HTTP-shaped target was let through uninspected.'],
+  ['InferenceBlocked', ['inference_blocked'], null],
 ];
 
 /**
@@ -85,6 +87,7 @@ const METRICS: Array<[string, string[], string | null]> = [
 export class InterceptorStack extends cdk.Stack {
   public readonly interceptorFunction: lambda.Function;
   public readonly policyParameter: ssm.StringParameter;
+  public readonly inferenceRecords: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: InterceptorStackProps) {
     super(scope, id, props);
@@ -137,6 +140,17 @@ export class InterceptorStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // Shield the model writes one short-lived record per model call under the
+    // gateway's REQUEST_ID, because the response event carries no request.
+    // Records hold the rule's response settings and the tokens the request
+    // minted, never user data, and expire through the TTL attribute.
+    this.inferenceRecords = new dynamodb.Table(this, 'InferenceRecords', {
+      partitionKey: { name: 'requestId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'expiresAt',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.interceptorFunction = new lambda.Function(this, 'SkyflowInterceptor', {
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'handler.lambda_handler',
@@ -168,6 +182,7 @@ export class InterceptorStack extends cdk.Stack {
         ALLOW_UPSTREAM_PAYLOAD_LOGGING: String(props.allowUpstreamPayloadLogging ?? false),
         POLICY_MAX_STALE_SECONDS: String(props.policyMaxStaleSeconds ?? 3600),
         SKYFLOW_TIMEOUT_SECONDS: String(props.skyflowTimeoutSeconds ?? 5),
+        INFERENCE_RECORD_TABLE: this.inferenceRecords.tableName,
       },
     });
 
@@ -205,6 +220,7 @@ export class InterceptorStack extends cdk.Stack {
 
     this.policyParameter.grantRead(this.interceptorFunction);
     skyflowSecret.grantRead(this.interceptorFunction);
+    this.inferenceRecords.grant(this.interceptorFunction, 'dynamodb:PutItem', 'dynamodb:GetItem');
 
     // The AgentCore stack imports this export by name, attaches the function to
     // its gateway and grants the gateway role permission to invoke it. Renaming

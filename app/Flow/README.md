@@ -11,7 +11,18 @@ commands like `deploy`, `dev`, and `invoke` rely on the configuration stored her
 The main entrypoint to your app is defined in `main.py`. Using the AgentCore SDK `@app.entrypoint` decorator, this
 file defines a Starlette ASGI app with the chosen Agent framework SDK running within.
 
-`model/load.py` instantiates your chosen model provider.
+`model/load.py` instantiates the model. By default it sends model calls through
+the Skyflow gateway's inference target so that shield the model applies, using
+`model/gateway.py` to find the gateway and sign the calls. Set
+`MODEL_VIA_GATEWAY=0` to call Bedrock directly. With it on, the agent refuses
+to start when it cannot tell which gateway to use, rather than call Bedrock
+past the shield.
+
+Through the gateway Flow speaks the Anthropic Messages API, so
+`BEDROCK_MODEL_ID` must name an Anthropic Claude model. The whole conversation
+goes to the interceptor on every turn, and a Lambda event holds at most 6 MB,
+so a very long session or several large attachments will eventually be
+refused as too large.
 
 `mcp_client/` supplies the agent's MCP tools. It is three modules so each can be
 tested at the weight it needs: `endpoints.py` decides which endpoints to connect
@@ -31,7 +42,11 @@ invoking the agent.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity |
-| `BEDROCK_MODEL_ID` | No | Model or inference-profile id; defaults to `global.anthropic.claude-sonnet-5` |
+| `BEDROCK_MODEL_ID` | No | Model or inference-profile id; defaults to `global.anthropic.claude-sonnet-5`. Through the gateway it must be a Claude model |
+| `MODEL_VIA_GATEWAY` | No | `0` calls Bedrock directly instead of through the gateway's inference target. Default `1` |
+| `MODEL_GATEWAY_URL` | No | Gateway MCP URL for model calls. Defaults to the one `AWS_IAM` gateway discovered, and is required when there are several |
+| `MODEL_GATEWAY_TARGET` | No | Inference target the model id is qualified with. Default `bedrock`. Set it when the stack was deployed with another `inferenceTargetName` |
+| `MODEL_MAX_TOKENS` | No | Longest answer in tokens, thinking included. Default 32000 |
 | `AGENTCORE_GATEWAY_<NAME>_URL`, `_AUTH_TYPE` | Injected | One pair per gateway in the project; the agent discovers them rather than hardcoding a URL |
 | `MCP_ENDPOINTS` | No | Comma-separated MCP URLs that replace everything discovered. With no gateway injected and no `MCP_ENDPOINTS`, the agent refuses to start rather than fall back to a public server |
 | `MCP_AUTH_TYPE` | No | `AWS_IAM`, `CUSTOM_JWT` or `NONE` for `MCP_ENDPOINTS` |
@@ -46,7 +61,9 @@ If installation was successful, a virtual environment is already created with de
 Activate the environment with `source .venv/bin/activate` on macOS/Linux, `.venv\Scripts\activate.bat` in Windows
 Command Prompt, or `.\.venv\Scripts\activate.ps1` in Windows PowerShell.
 
-`agentcore dev` will start a local server on 0.0.0.0:8080.
+`agentcore dev` will start a local server on 0.0.0.0:8080. It injects the deployed gateways' variables, so a local
+agent sends its model calls through the deployed gateway too, signed with your own credentials. Those need
+`bedrock-agentcore:InvokeGateway` on the gateway. Set `MODEL_VIA_GATEWAY=0` to call Bedrock directly instead.
 
 In a new terminal, you can invoke that server with:
 

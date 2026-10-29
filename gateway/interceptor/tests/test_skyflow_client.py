@@ -98,10 +98,31 @@ class RequestShapeTestCase(unittest.TestCase):
         self.assertEqual(body, {"text": "[NAME_abc]", "vault_id": "vault123"})
         self.assertEqual(result.text, "Jane Doe")
 
-    def test_missing_fields_fall_back_to_the_input(self):
-        with mock.patch("urllib.request.urlopen", return_value=response({})):
-            self.assertEqual(client().deidentify("original", ["name"]).processed_text, "original")
-            self.assertEqual(client().reidentify("original").text, "original")
+    def test_a_success_without_the_result_is_an_error_not_the_input(self):
+        """Handing back the input would pass plaintext on as if it were de-identified."""
+        with mock.patch("urllib.request.urlopen", return_value=response({"entities": []})):
+            with self.assertRaisesRegex(SkyflowError, "without processed_text"):
+                client().deidentify("Jane Doe", ["name"])
+            with self.assertRaisesRegex(SkyflowError, "without text"):
+                client().reidentify("[NAME_abc]")
+
+    def test_a_result_that_is_not_a_string_is_an_error(self):
+        with mock.patch("urllib.request.urlopen", return_value=response({"processed_text": None})):
+            with self.assertRaises(SkyflowError):
+                client().deidentify("Jane Doe", ["name"])
+
+    def test_a_success_body_that_is_not_a_json_object_is_an_error(self):
+        for raw in (b"<html>maintenance</html>", b"[]"):
+            with self.subTest(raw=raw):
+                resp = response({})
+                resp.read.return_value = raw
+                with mock.patch("urllib.request.urlopen", return_value=resp):
+                    with self.assertRaises(SkyflowError):
+                        client().deidentify("Jane Doe", ["name"])
+
+    def test_an_empty_result_is_still_a_result(self):
+        with mock.patch("urllib.request.urlopen", return_value=response({"processed_text": ""})):
+            self.assertEqual(client().deidentify("Jane Doe", ["name"]).processed_text, "")
 
 
 class RetryTestCase(unittest.TestCase):

@@ -16,7 +16,8 @@ dependencies = [
     # arrives transitively with mcp, but a direct import deserves a direct pin.
     "httpx >= 0.27.0",
     "mcp ~= 1.24.0",
-    "strands-agents >= 1.15.0",
+    # The anthropic extra serves model calls through the gateway; see model/gateway.py.
+    "strands-agents[anthropic] >= 1.15.0",
     
 ]
 

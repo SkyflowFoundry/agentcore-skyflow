@@ -64,17 +64,21 @@ Both reach the same upstream, but `passthrough` delivers the `http` shape —
 base64 bodies with no MCP framing, so there is no tool name or arguments to
 match a policy against. The interceptor blocks `http`-shaped calls unless the
 policy sets `httpPayloads.action` to `passthrough`; see
-`interceptor/README.md`.
+`interceptor/README.md`. Inference targets are the exception. The policy's
+`inference` block shields the model calls they carry, because a model request
+has a known shape even without MCP framing.
 
 Other behaviour worth knowing:
 
 - Every MCP method arrives at the same handler, `tools/list` included. Dispatch
   on `body.method`; a tool schema is not user data.
 - On MCP, a REQUEST short-circuit **still invokes** the RESPONSE interceptor.
-  On HTTP it does not.
+  On an inference target it does too: a live run on 29 October 2026 saw the
+  RESPONSE interceptor called after every refusal the REQUEST side returned.
+  Do not rely on HTTP skipping it.
 - With response streaming enabled, RESPONSE fires once per JSON-RPC event and
   only the first may set headers or status code.
-- Lambda synchronous invocation caps request and response at 6 MB combined.
+- Lambda synchronous invocation caps the request and the response at 6 MB each.
   `payloadFilter` can drop `RESPONSE_BODY`, but only for the `http` shape.
 - Headers are withheld unless `passRequestHeaders` is true. Leave it off unless
   needed — headers carry bearer tokens. The Skyflow interceptor blanks
