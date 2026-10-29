@@ -497,6 +497,16 @@ class RefusalTestCase(InferenceTestCase):
         self.assertEqual(self.send(conversation())["http"], {})
         self.assertIn("req-1", self.store.items)
 
+    def test_a_refusal_reaches_the_caller_as_written(self):
+        """The gateway invokes the RESPONSE interceptor after a refusal too. Seen live."""
+        refused = self.send({"prompt": f"Write to {NAME}"}, path="/model/meta.llama3-1-8b-instruct-v1:0/invoke")
+        response = refused["http"]["transformedGatewayResponse"]
+        self.assertEqual(self.store.items["req-1"].response_action, "none")
+        event = {"interceptorInputVersion": "1.0", "http": {"gatewayRequest": None, "gatewayResponse": {
+            "statusCode": response["statusCode"], "headers": response["headers"], "body": response["body"],
+            "contentType": "application/json"}}}
+        self.assertEqual(handler.lambda_handler(event, Context())["http"], {}, "passed, not replaced by httpPayloads")
+
     def test_a_bug_fails_closed_even_under_fail_open(self):
         """fail_open is for Skyflow outages. A misread body must not be sent on as it came."""
         self.use(policy({**SHIELD, "failure": {"onError": "fail_open"}}))
@@ -521,7 +531,7 @@ class RefusalTestCase(InferenceTestCase):
         finally:
             inference.MAX_TRANSFORMED_BODY = saved
         self.assertEqual(body["error"]["type"], "request_too_large")
-        self.assertNotIn("req-1", self.store.items)
+        self.assertEqual(self.store.items["req-1"].tokens, frozenset(), "the refusal's record lists no tokens")
 
     def test_another_model_familys_invoke_body_is_refused(self):
         """Llama, Titan, Cohere and Mistral bodies are not read, so they are not passed on."""
@@ -549,6 +559,14 @@ class RefusalTestCase(InferenceTestCase):
         out = self.send({"messages": []}, path="/model/m/converse")
         self.assertEqual(out["http"]["transformedGatewayResponse"]["headers"],
                          {"x-amzn-errortype": "AccessDeniedException"})
+
+    def test_a_skyflow_answer_without_its_result_fails_closed_and_is_not_cached(self):
+        """The real client, answering 200 with no processed_text: nothing reaches the model."""
+        real = SkyflowClient("https://test.vault.skyflowapis.com", "vault123", "key")
+        real._post = lambda path, body: {"entities": []}
+        settings.build_client = lambda: real
+        self.error(self.send({"model": MODEL, "messages": [{"role": "user", "content": f"Hi {NAME}"}]}), 502)
+        self.assertEqual(len(inference._cache), 0)
 
     def test_the_openai_dialect_is_refused_while_a_rule_is_active(self):
         body = self.error(self.send({"model": MODEL, "messages": []}, path="/v1/chat/completions"), 403)

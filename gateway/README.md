@@ -73,7 +73,9 @@ Other behaviour worth knowing:
 - Every MCP method arrives at the same handler, `tools/list` included. Dispatch
   on `body.method`; a tool schema is not user data.
 - On MCP, a REQUEST short-circuit **still invokes** the RESPONSE interceptor.
-  On HTTP it does not.
+  On an inference target it does too: a live run on 29 October 2026 saw the
+  RESPONSE interceptor called after every refusal the REQUEST side returned.
+  Do not rely on HTTP skipping it.
 - With response streaming enabled, RESPONSE fires once per JSON-RPC event and
   only the first may set headers or status code.
 - Lambda synchronous invocation caps the request and the response at 6 MB each.

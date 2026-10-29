@@ -33,6 +33,8 @@ assistant turn, which is the only place the provider puts them.
 The request side then writes a record under the gateway's `REQUEST_ID` (see
 `records`) so the response side can apply the same rule and, with
 `response.only: minted_for_request`, restore only the tokens this call minted.
+It writes one for a refused call too, because the gateway still invokes the
+response side, and without a record `httpPayloads` would replace the refusal.
 
 The gateway buffers every inference answer before the interceptor sees it, so
 a stream arrives whole. A token can straddle two text deltas, so each content
@@ -207,9 +209,6 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
     call = classify(request.get("path") or "", body)
     if call is None:
         return None
-    if call.kind in ("unsupported", "invoke_unsupported"):
-        logger.warning("inference_blocked kind=%s reason=unknown_path", call.kind)
-        return refusal(call.kind, "Shield the model does not recognise this model API path, so the call was blocked.", 403)
 
     store = settings.record_store()
     rid = request_id(context)
@@ -218,20 +217,26 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         logger.error("inference_blocked kind=%s reason=%s", call.kind, reason)
         return refusal(call.kind, "Shield the model is not set up on this gateway, so the model call was blocked.", 403)
 
+    def refuse(message: str, status: int) -> dict:
+        return _refuse(store, rid, call, message, status)
+
+    if call.kind in ("unsupported", "invoke_unsupported"):
+        logger.warning("inference_blocked kind=%s reason=unknown_path", call.kind)
+        return refuse("Shield the model does not recognise this model API path, so the call was blocked.", 403)
+
     if call.kind == "models":
         return _remember(store, rid, CallRecord(kind="models"), call) or passthrough()
 
     rule = policy_set.resolve_inference(call.model)
     if rule is None:
         logger.warning("inference_blocked kind=%s model=%s reason=no_rule", call.kind, call.model)
-        return refusal(call.kind, "No shield-the-model rule covers this model, so the call was blocked.", 403)
+        return refuse("No shield-the-model rule covers this model, so the call was blocked.", 403)
     if call.kind == "openai" and not rule.is_noop:
         logger.warning("inference_blocked kind=%s model=%s reason=dialect_not_supported", call.kind, call.model)
-        return refusal(call.kind, "Shield the model does not support the OpenAI dialect yet. Use the Anthropic Messages API.", 403)
+        return refuse("Shield the model does not support the OpenAI dialect yet. Use the Anthropic Messages API.", 403)
     if call.kind == "invoke_stream" and rule.response.action == "reidentify":
         logger.warning("inference_blocked kind=%s model=%s reason=stream_not_supported", call.kind, call.model)
-        return refusal(
-            call.kind,
+        return refuse(
             "Streamed InvokeModel answers cannot be re-identified yet. Use InvokeModel without "
             "streaming or the Anthropic Messages API, which can stream.",
             403,
@@ -248,11 +253,10 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         logger.info("inference_request kind=%s model=%s action=none", call.kind, call.model)
         return _remember(store, rid, record, call) or passthrough()
     if not isinstance(body, dict):
-        return refusal(call.kind, "The model request body is not a JSON object.", 400)
+        return refuse("The model request body is not a JSON object.", 400)
     if not _is_anthropic_body(call, body):
         logger.warning("inference_blocked kind=%s model=%s reason=body_not_anthropic", call.kind, call.model)
-        return refusal(
-            call.kind,
+        return refuse(
             "Shield the model reads only Anthropic Messages request bodies, so the model call was blocked.",
             403,
         )
@@ -261,7 +265,7 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         new_body, minted, stats = deidentify_request(body, rule, settings.build_client(), context)
     except Refused as exc:
         logger.warning("inference_blocked kind=%s model=%s reason=%s", call.kind, call.model, exc)
-        return refusal(call.kind, f"{exc}, so the model call was blocked.", 403)
+        return refuse(f"{exc}, so the model call was blocked.", 403)
     except SkyflowError as exc:
         # Only a Skyflow failure is the failure mode's to decide. Anything else
         # is a bug or a body this module misread, and passing the original on
@@ -270,12 +274,12 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
             logger.warning("inference_fail_open direction=request kind=%s model=%s err=%s", call.kind, call.model, exc)
             return _remember(store, rid, record, call) or passthrough()
         logger.error("inference_fail_closed direction=request kind=%s model=%s err=%s", call.kind, call.model, exc)
-        return refusal(call.kind, "Sensitive-data processing failed, so the model call was blocked.", 502)
+        return refuse("Sensitive-data processing failed, so the model call was blocked.", 502)
 
     encoded = base64.b64encode(json.dumps(new_body).encode("utf-8")).decode()
     if len(encoded) > MAX_TRANSFORMED_BODY:
         logger.warning("inference_blocked kind=%s model=%s reason=too_large bytes=%d", call.kind, call.model, len(encoded))
-        return refusal(call.kind, "The de-identified model request is too large to hand back to the gateway.", 413)
+        return refuse("The de-identified model request is too large to hand back to the gateway.", 413)
     blocked = _remember(store, rid, replace(record, tokens=frozenset(minted)), call)
     if blocked:
         return blocked
@@ -299,6 +303,22 @@ def _is_anthropic_body(call: Call, body: dict) -> bool:
     if call.kind.startswith("invoke"):
         return "anthropic_version" in body
     return True
+
+
+def _refuse(store, rid: str, call: Call, message: str, status: int) -> dict:
+    """Refuse the call and record that its answer is the refusal itself.
+
+    The gateway still invokes the RESPONSE interceptor after the request side
+    has answered. Without a record that answer would be left to
+    `httpPayloads`, whose block replaces the refusal and its status with its
+    own, so the caller would never see why. The record does nothing, which
+    lets the refusal through as written. It holds no user data.
+    """
+    try:
+        store.put(rid, CallRecord(kind=call.kind))
+    except Exception as exc:  # noqa: BLE001 - the call is refused either way
+        logger.error("inference_record_write_failed kind=%s err=%s", call.kind, type(exc).__name__)
+    return refusal(call.kind, message, status)
 
 
 def _remember(store, rid: str, record: CallRecord, call: Call) -> dict | None:

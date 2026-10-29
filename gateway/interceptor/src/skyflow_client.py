@@ -120,6 +120,34 @@ class FileRunResult:
         return None
 
 
+def _json_object(raw: bytes, path: str) -> dict[str, Any]:
+    """A success body as a JSON object, or SkyflowError.
+
+    A 200 that is not a JSON object is a failure like any other, so the caller's
+    failure mode decides it instead of a parsing error escaping.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SkyflowError(f"Skyflow {path} answered 200 with a body that is not JSON") from exc
+    if not isinstance(data, dict):
+        raise SkyflowError(f"Skyflow {path} answered 200 with JSON that is not an object")
+    return data
+
+
+def _text_field(data: dict[str, Any], key: str, path: str) -> str:
+    """A string field of a success body, or SkyflowError.
+
+    Never the input instead. Returning the text that was sent would pass
+    plaintext on as if Skyflow had de-identified it, and the inference cache
+    would keep serving it.
+    """
+    value = data.get(key)
+    if not isinstance(value, str):
+        raise SkyflowError(f"Skyflow {path} answered 200 without {key}")
+    return value
+
+
 class RunTimeout(SkyflowError):
     """The run did not reach a terminal state inside the caller's deadline."""
 
@@ -238,16 +266,17 @@ class SkyflowClient:
             # which are the API default and cannot be re-identified.
             body["token_type"] = {"vault_token": list(vault_token_entity_types)}
 
-        data = self._post("/v1/detect/deidentify/string", body)
+        path = "/v1/detect/deidentify/string"
+        data = self._post(path, body)
         return DeidentifyResult(
-            processed_text=data.get("processed_text", text),
+            processed_text=_text_field(data, "processed_text", path),
             entities=data.get("entities", []),
         )
 
     def reidentify(self, text: str) -> ReidentifyResult:
         body = {"text": text, "vault_id": self._vault_id}
-        data = self._post("/v1/detect/reidentify/string", body)
-        return ReidentifyResult(text=data.get("text", text))
+        path = "/v1/detect/reidentify/string"
+        return ReidentifyResult(text=_text_field(self._post(path, body), "text", path))
 
     # ------------------------------------------------------------ files (v2)
 
@@ -415,7 +444,7 @@ class SkyflowClient:
             )
             try:
                 with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    return _json_object(resp.read(), path)
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and self._refresh_api_key and not key_refreshed:
                     # A rotated key: re-read it once and try again. Does not

@@ -22,9 +22,10 @@ Behaviour worth knowing:
 
 - Only `tools/call` is transformed. `tools/list`, `initialize` and friends pass
   through — a tool schema is not user data.
-- On MCP, a REQUEST short circuit still invokes the RESPONSE interceptor (unlike
-  HTTP, which skips it). The response path therefore tolerates an error body
-  with no `result`.
+- On MCP, a REQUEST short circuit still invokes the RESPONSE interceptor. The
+  response path therefore tolerates an error body with no `result`. A live
+  inference target invoked it after a short circuit too, so `inference`
+  records every refusal it returns.
 - With response streaming enabled the RESPONSE interceptor fires once per
   JSON-RPC event. Each event is transformed independently; only the first may
   set headers or status code, so this function never returns them.

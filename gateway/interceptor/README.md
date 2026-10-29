@@ -258,6 +258,11 @@ Flow sends its model calls through the gateway by default. See
 - **The Skyflow timeout is configurable.** `SKYFLOW_TIMEOUT_SECONDS`, default
   five, CDK context `skyflowTimeoutSeconds`. Raise it if large fetched pages
   fail closed on a slow vault.
+- **A success without a result is a failure.** A 200 from the string endpoints
+  that is not a JSON object, or that lacks `processed_text` or `text`, raises
+  like any other Skyflow error, and the rule's failure mode decides the call.
+  The client never hands back the text it sent in place of the answer, because
+  that would pass plaintext on as if it had been de-identified.
 
 ### Validation rule
 

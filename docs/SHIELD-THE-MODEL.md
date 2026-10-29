@@ -2,7 +2,7 @@
 
 ## Status
 
-Built on 28 October 2026 and not yet deployed. A spike on a scratch gateway answered the open behaviour questions first. Its results are under [Spike results](#spike-results). The finished code then ran end to end on a second scratch gateway. Those results are under [Live verification](#live-verification). SkyflowGateway is unchanged until the deploy steps in `gateway/interceptor/README.md` run.
+Built on 28 October 2026 and not yet deployed. A spike on a scratch gateway answered the open behaviour questions first. Its results are under [Spike results](#spike-results). The finished code then ran end to end on a second scratch gateway, and the code with the review fixes on a third. Those results are under [Live verification](#live-verification). SkyflowGateway is unchanged until the deploy steps in `gateway/interceptor/README.md` run.
 
 ## Decisions
 
@@ -190,6 +190,22 @@ The finished interceptor code ran on a scratch gateway on 28 October 2026. It us
 | The interceptor's logs | No line contained any of the fictional values. |
 
 With the system note on, the model still sometimes remarked that a value was a placeholder. The note reduces this but does not prevent it.
+
+### After the code review
+
+The code with the review fixes ran on a fresh scratch gateway on 29 October 2026. Its gateway role held exactly the statements `SkyflowInferenceStack` grants, with the seven named list actions in place of `bedrock:List*`. Every check above passed again, and these were added. Everything was deleted afterwards.
+
+| Check | Result |
+| --- | --- |
+| The target with the narrowed permissions | It reached READY, and `GET /v1/models` listed 319 models. |
+| InvokeModel with an inference-profile ARN as the model id | The interceptor read the decoded ARN path, minted three tokens and restored the real email in the answer. |
+| A Llama-shaped InvokeModel body | Refused with a 403 before the model ran. |
+| `POST /v1/complete` | Refused with a 403 before the model ran. |
+| A prompt with nothing to de-identify | Answered normally. Skyflow returned `processed_text` with no entities in it, so the stricter client does not break this case. |
+| Flow's own `load_model()` in a two-turn Strands agent on one event loop | Both turns answered with the real values. The SDK client had retries off and a 32000-token limit. |
+| The interceptor's logs | 1,243 lines and none contained any of the fictional values. |
+
+The run showed that the gateway invokes the RESPONSE interceptor even after the REQUEST side refuses an inference call. The first attempt's refusals were replaced by the generic `httpPayloads` block for that reason. The request side now writes a record for every refusal, so the refusal reaches the caller as written. The second attempt confirmed it.
 
 ## Verification
 
