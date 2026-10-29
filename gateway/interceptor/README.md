@@ -168,9 +168,9 @@ the answer before the agent sees it.
 | `request.systemNote` | Adds one sentence to the system prompt explaining the tokens. The model may still remark on them. |
 | `response.parts` | What is re-identified: `text` is the model's prose and `tool_call` the arguments of a tool call it makes. |
 | `response.only` | `minted_for_request` restores only tokens this call's request minted. `any_vault_token` restores every vault token, as the tool path does. |
-| `attachments.maxBytes` | Largest attached file. The request arrives as base64 of a JSON body that holds base64, inside Lambda's 6 MB limit. |
-| `entities`, `scope`, `failure` | As for tools. Only `scope.minLength` applies to conversation text. `entities` defaults to `defaults.entities`. |
-| `inferenceOverrides` | `models` globs, first match wins, whole sub-blocks replace. |
+| `attachments.maxBytes` | Largest attached file, decoded. The de-identified file is held to the same limit. Lambda takes 6 MB in and 6 MB out, and a request arrives as base64 of a JSON body that holds base64, so 2 MB is about the most that fits. |
+| `entities`, `scope`, `failure` | As for tools. Only `scope.minLength` applies to conversation text, and it defaults to 3. `entities` defaults to `defaults.entities` and must not be empty while the request de-identifies. `failure.onError` applies to Skyflow failures only. |
+| `inferenceOverrides` | `models` globs, first match wins, whole sub-blocks replace. An override's `request` without `action` means `none`. |
 
 What each recognised call gets:
 
@@ -178,10 +178,18 @@ What each recognised call gets:
 | --- | --- | --- |
 | `/v1/messages` | de-identified | re-identified, as JSON or as a buffered stream |
 | `/v1/messages/count_tokens` | de-identified | passed |
-| `/model/{id}/invoke` | de-identified | re-identified |
-| `/model/{id}/invoke-with-response-stream` | de-identified | refused while the rule re-identifies |
+| `/model/{id}/invoke` | de-identified when the body is Anthropic's, refused otherwise | re-identified |
+| `/model/{id}/invoke-with-response-stream` | as for `invoke` | refused while the rule re-identifies |
 | `/v1/models` | passed | passed |
 | `/v1/chat/completions`, `/v1/responses` | refused while the rule does anything | |
+| any other `/v1/...` or `/model/...` path | refused | |
+
+The model id in an InvokeModel path may be an inference-profile ARN. Only
+Anthropic's InvokeModel body, which names `anthropic_version` and `messages`, is
+read. A body in another model family's shape, such as Llama's `prompt`, is
+refused rather than passed on unread. Batches, files, legacy completions and
+Converse are refused for the same reason, and they never fall through to
+`httpPayloads`.
 
 Behaviour worth knowing:
 
@@ -203,10 +211,19 @@ Behaviour worth knowing:
   refused because the interceptor cannot read it.
 - **Unknown content blocks are refused.** A block type the interceptor does not
   recognise could carry anything, so a rule that de-identifies refuses the call.
-  Server-tool blocks such as `web_search_tool_result` came from the provider and
-  go back as they came.
+  Thinking blocks and server-tool blocks such as `web_search_tool_result` came
+  from the provider and go back as they came, but only in an assistant turn.
+  Anywhere else the client wrote them, so they are refused.
+- **Attachments are checked first.** A call refused for an attachment is
+  refused before any text goes to Skyflow, so it mints no tokens.
 - **A warm Lambda caches de-identified strings.** Vault tokens are
   deterministic, so a conversation's earlier turns cost nothing on later calls.
+  The cache holds at most 4096 strings and 32 million characters.
+- **`fail_open` covers Skyflow only.** A body the interceptor cannot parse is
+  refused under either failure mode, because passing it on would forward
+  exactly what it failed to inspect.
+- **A request too large to hand back is refused.** Lambda returns at most
+  6 MB, so a de-identified body over 5 MB is answered with a 413.
 - **Errors come back in the caller's dialect.** Refusals are 403s and failures
   502s, shaped as Anthropic, Bedrock or OpenAI errors so the client's SDK raises
   a typed exception. Each logs `inference_blocked` or `inference_fail_closed`.
@@ -289,14 +306,37 @@ agentcore deploy --target dev -y
 python3 scripts/attach_interceptor.py --gateway-name agentflow-SkyflowGateway --check
 
 # 4. shield the model: a Bedrock inference target on the gateway, plus the
-#    gateway role's Bedrock permissions. Needs the gateway from step 2.
-GW=$(aws bedrock-agentcore-control list-gateways \
+#    gateway role's Bedrock permissions. Needs the gateway from step 2. The
+#    region must be the one in agentcore/aws-targets.json, because the CLI's
+#    default region may be another. The synth refuses a gateway id of None,
+#    which is what the lookup prints when it finds nothing.
+REGION=$(python3 -c "import json; print(json.load(open('agentcore/aws-targets.json'))[0]['region'])")
+GW=$(aws bedrock-agentcore-control list-gateways --region "$REGION" \
   --query "items[?name=='agentflow-SkyflowGateway'].gatewayId | [0]" --output text)
-ROLE=$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$GW" --query roleArn --output text)
+ROLE=$(aws bedrock-agentcore-control get-gateway --region "$REGION" --gateway-identifier "$GW" \
+  --query roleArn --output text)
 cd gateway/interceptor/cdk
 npx cdk deploy SkyflowInferenceStack -c gatewayIdentifier="$GW" -c gatewayRoleArn="$ROLE" --require-approval never
 cd -
 ```
+
+The target is named `bedrock`. Deploying with `-c inferenceTargetName=<name>`
+names it otherwise, and then Flow needs `MODEL_GATEWAY_TARGET=<name>` too,
+because it qualifies the model id with the target name.
+
+`SkyflowInferenceStack` adds a target to a gateway that `agentcore deploy`
+owns, so the gateway cannot be removed or replaced while the target exists.
+Before `agentcore remove gateway`, or a change that replaces the gateway such as
+renaming it, destroy the target first:
+
+```bash
+cd gateway/interceptor/cdk
+npx cdk destroy SkyflowInferenceStack -c gatewayIdentifier="$GW" -c gatewayRoleArn="$ROLE" --force
+cd -
+```
+
+Then run step 4 again against the new gateway. Destroying the stack also takes
+the Bedrock permissions back from the gateway role.
 
 Flow sends its model calls through that target by default, so they fail until
 step 4 has run. On a fresh deployment run step 4 straight after step 2. On an
@@ -743,6 +783,7 @@ any occurrence in a five-minute window.
 | `PolicyUnavailable` | Policy loads that failed, and refreshes serving a stale policy | Yes |
 | `HttpPayloadBlocked` | HTTP-shaped events refused | No: blocking is the intended outcome |
 | `HttpPayloadPassthrough` | HTTP-shaped events let through uninspected | Yes |
+| `InferenceBlocked` | Model calls refused by the shield-the-model rule | No: refusing is the intended outcome |
 
 The alarms change state on their own. To be told, deploy with
 `-c alarmTopicArn=<SNS topic ARN>`. A test checks that every term a metric
@@ -817,7 +858,7 @@ uv run --with boto3 python -m unittest discover \
 | Suite | Covers |
 | --- | --- |
 | `test_http_payloads.py` | HTTP-shaped events (SC-16091): blocked by default on both directions, explicit passthrough, WARNING logs without bodies or full paths, policy parsing |
-| `test_inference.py` | Shield the model: path routing, every request part, thinking blocks left alone, attachments and their refusals, records, minted-only restore, JSON and split-stream answers, failure modes, the inference policy and the base64 file client |
+| `test_inference.py` | Shield the model: path routing including ARN model ids, unknown paths and other model families' bodies refused, every request part, provider blocks left alone only in assistant turns, attachments and their refusals, records, minted-only restore, JSON and split-stream answers, failure modes, the cache's bounds, the inference policy and the base64 file client |
 | `test_handler.py` | Dispatch, direction routing, overrides, fail-closed/open, streaming, round trip |
 | `test_policy.py` | Parsing, scope globs, override precedence, tool-name splitting, validation |
 | `test_payload.py` | Traversal, write-back, non-mutation, parallelism and its cap, error propagation |
@@ -864,8 +905,9 @@ tokenizing those would break tool discovery.
    streaming gateway. Leave streaming off.
 6. **Nothing prunes vault tokens.** Every de-identification writes tokens that
    persist in the vault.
-7. **Shield the model speaks Anthropic Messages and InvokeModel only.** The
-   OpenAI dialects are refused while a rule is active, and a streamed
-   InvokeModel answer is refused when it would need re-identifying, because its
-   binary event stream is not parsed yet.
+7. **Shield the model speaks Anthropic Messages and Claude's InvokeModel only.**
+   The OpenAI dialects and other model families' InvokeModel bodies are refused
+   while a rule is active. A streamed InvokeModel answer is refused when it
+   would need re-identifying, because its binary event stream is not parsed
+   yet.
 8. **Shielded answers do not stream word by word.** The gateway buffers them.

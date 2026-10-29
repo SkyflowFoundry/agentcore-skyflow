@@ -44,6 +44,10 @@ INFERENCE_RESPONSE_PARTS = ("text", "tool_call")
 #: into printing some other token and having the gateway resolve it.
 #: `any_vault_token` restores every vault token, as the tool path does.
 REIDENTIFY_SCOPES = ("minted_for_request", "any_vault_token")
+#: Shortest string de-identified in a model call when `inference.scope` names
+#: no `minLength`. Lower than the tool default of 8, because a whole chat turn
+#: can be as short as a name such as `Li Wu`.
+INFERENCE_MIN_LENGTH = 3
 
 DEFAULT_ENTITIES = [
     "name",
@@ -115,13 +119,14 @@ class Scope:
         return len(value) >= self.min_length
 
     @classmethod
-    def from_json(cls, raw: Any, where: str) -> "Scope":
+    def from_json(cls, raw: Any, where: str, default_min_length: int = 8) -> "Scope":
+        """Parse a `scope` block. `default_min_length` applies when it names none."""
         if raw is None:
-            return cls()
+            return cls(min_length=default_min_length)
         if not isinstance(raw, dict):
             raise PolicyError(f"{where} must be an object, got {type(raw).__name__}")
         return cls(
-            min_length=int(raw.get("minLength", 8)),
+            min_length=int(raw.get("minLength", default_min_length)),
             include_keys=tuple(raw.get("includeKeys", ["*"])),
             exclude_keys=tuple(raw.get("excludeKeys", [])),
         )
@@ -667,7 +672,7 @@ class InferenceRule:
     entities: tuple[str, ...] = tuple(DEFAULT_ENTITIES)
     #: Only `minLength` applies to conversation text. The key globs apply to
     #: the arguments of tool calls, which are JSON like any tool payload.
-    scope: Scope = field(default_factory=lambda: Scope(min_length=3))
+    scope: Scope = field(default_factory=lambda: Scope(min_length=INFERENCE_MIN_LENGTH))
     attachments: Attachments = field(default_factory=Attachments)
     failure: Failure = field(default_factory=Failure)
 
@@ -705,7 +710,8 @@ class InferenceOverride:
             request=InferenceRequest.from_json(raw["request"], f"{where}.request") if "request" in raw else None,
             response=InferenceResponse.from_json(raw["response"], f"{where}.response") if "response" in raw else None,
             entities=tuple(entities) if entities is not None else None,
-            scope=Scope.from_json(raw["scope"], f"{where}.scope") if "scope" in raw else None,
+            scope=(Scope.from_json(raw["scope"], f"{where}.scope", INFERENCE_MIN_LENGTH)
+                   if "scope" in raw else None),
             attachments=Attachments.from_json(raw["attachments"], f"{where}.attachments") if "attachments" in raw else None,
             failure=Failure.from_json(raw["failure"], f"{where}.failure") if "failure" in raw else None,
         )
@@ -722,7 +728,7 @@ def _inference_rule(raw: Any, default_entities: tuple[str, ...]) -> InferenceRul
         request=InferenceRequest.from_json(raw.get("request"), "inference.request"),
         response=InferenceResponse.from_json(raw.get("response"), "inference.response"),
         entities=tuple(entities) if entities is not None else default_entities,
-        scope=Scope.from_json(raw["scope"], "inference.scope") if "scope" in raw else Scope(min_length=3),
+        scope=Scope.from_json(raw.get("scope"), "inference.scope", INFERENCE_MIN_LENGTH),
         attachments=Attachments.from_json(raw.get("attachments"), "inference.attachments"),
         failure=Failure.from_json(raw.get("failure"), "inference.failure"),
     )
@@ -926,6 +932,10 @@ class PolicySet:
             (f"inferenceOverrides[{i}]", self._materialize(ov)) for i, ov in enumerate(self.inference_overrides)
         ]
         for where, rule in rules:
+            if rule.request.action == "deidentify" and not rule.entities:
+                # Detect given no entity types would still answer, with counter
+                # tokens for whatever it finds, which no answer can restore.
+                raise PolicyError(f"{where}: request de-identifies but entities is empty. Name at least one entity.")
             if rule.response.action != "reidentify":
                 continue
             if rule.request.action == "deidentify" and rule.request.token_type != "vault_token":

@@ -76,7 +76,7 @@ Other behaviour worth knowing:
   On HTTP it does not.
 - With response streaming enabled, RESPONSE fires once per JSON-RPC event and
   only the first may set headers or status code.
-- Lambda synchronous invocation caps request and response at 6 MB combined.
+- Lambda synchronous invocation caps the request and the response at 6 MB each.
   `payloadFilter` can drop `RESPONSE_BODY`, but only for the `http` shape.
 - Headers are withheld unless `passRequestHeaders` is true. Leave it off unless
   needed — headers carry bearer tokens. The Skyflow interceptor blanks

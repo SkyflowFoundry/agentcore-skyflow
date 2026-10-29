@@ -115,7 +115,7 @@ class FileRunResult:
         not the document and must not be swapped in for it.
         """
         for output in self.outputs:
-            if output.extension != "json" or "ENTIT" not in output.file_type.upper():
+            if output.extension.lower() != "json" or "ENTIT" not in output.file_type.upper():
                 return output
         return None
 

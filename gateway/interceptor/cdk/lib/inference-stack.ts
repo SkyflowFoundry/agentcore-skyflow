@@ -33,7 +33,8 @@ export class InferenceStack extends cdk.Stack {
 
     // The gateway role calls Bedrock for every model call the target serves.
     // Model discovery also lists models, profiles and routers, and the target
-    // never reaches READY without those permissions.
+    // never reaches READY without those permissions. The list is the set the
+    // inference target documentation names, in place of bedrock:List*.
     const role = iam.Role.fromRoleArn(this, 'GatewayRole', props.gatewayRoleArn, { mutable: true });
     const policy = new iam.Policy(this, 'GatewayInferencePolicy', {
       roles: [role],
@@ -49,7 +50,18 @@ export class InferenceStack extends cdk.Stack {
           ],
         }),
         new iam.PolicyStatement({
-          actions: ['bedrock:List*', 'bedrock:GetInferenceProfile', 'bedrock:GetFoundationModel'],
+          actions: [
+            'bedrock:ListFoundationModels',
+            'bedrock:ListInferenceProfiles',
+            'bedrock:ListProvisionedModelThroughputs',
+            'bedrock:ListCustomModelDeployments',
+            'bedrock:ListImportedModels',
+            'bedrock:ListMarketplaceModelEndpoints',
+            'bedrock:ListPromptRouters',
+            'bedrock:GetInferenceProfile',
+            'bedrock:GetFoundationModel',
+          ],
+          // List actions take no resource ARN.
           resources: ['*'],
         }),
       ],

@@ -10,20 +10,16 @@ the variables that control that.
 
 | Variable | Description |
 | --- | --- |
-| `BEDROCK_MODEL_ID` | Bedrock model or inference-profile id. Defaults to the value below. |
+| `BEDROCK_MODEL_ID` | Bedrock model or inference-profile id. Defaults to the value below. Through the gateway it must name an Anthropic Claude model, because Flow speaks the Anthropic Messages API there. |
 """
 
 import os
 
 from strands.models.bedrock import BedrockModel
 
-from model.gateway import GatewayModelAuth, resolve
+from model.gateway import resolve
 
 DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-5"
-
-#: A shielded answer is returned only once the whole of it has been generated
-#: and re-identified, so a long answer can take minutes.
-GATEWAY_TIMEOUT_SECONDS = 300.0
 
 
 def load_model():
@@ -35,18 +31,6 @@ def load_model():
 
     # Imported here so a deployment that calls Bedrock directly does not need
     # the Anthropic SDK at all.
-    import httpx
     from strands.models.anthropic import AnthropicModel
 
-    return AnthropicModel(
-        client_args={
-            "base_url": gateway.base_url,
-            # Required by the SDK and dropped by GatewayModelAuth before signing.
-            "api_key": "unused-requests-are-sigv4-signed",
-            "http_client": httpx.AsyncClient(
-                auth=GatewayModelAuth(gateway.region), timeout=GATEWAY_TIMEOUT_SECONDS
-            ),
-        },
-        model_id=gateway.model,
-        max_tokens=gateway.max_tokens,
-    )
+    return AnthropicModel(client_args=gateway.client_args(), model_id=gateway.model, max_tokens=gateway.max_tokens)

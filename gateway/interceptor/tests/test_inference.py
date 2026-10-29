@@ -61,6 +61,8 @@ class FakeSkyflow:
         self.reidentified: list[str] = []
         self.files: list[tuple[str, str, dict]] = []
         self.fail = False
+        self.bug = False
+        self.max_bytes: list[int] = []
         self.file_output = FileRunResult(
             status="SUCCESS", output_type="BASE64",
             outputs=(FileOutput(url=base64.b64encode(b"%PDF redacted").decode(), file_type="redacted", extension="pdf"),),
@@ -69,6 +71,8 @@ class FakeSkyflow:
     def deidentify(self, text, entity_types, vault_token_entity_types=None):
         if self.fail:
             raise SkyflowError("Skyflow /v1/detect/deidentify/string failed with status 503")
+        if self.bug:
+            raise TypeError("'NoneType' object is not subscriptable")
         self.deidentified.append(text)
         for value in sorted(TOKENS, key=len, reverse=True):
             text = text.replace(value, TOKENS[value])
@@ -90,6 +94,7 @@ class FakeSkyflow:
         return self.file_output
 
     def processed_file_bytes(self, run, output, max_bytes):
+        self.max_bytes.append(max_bytes)
         return base64.b64decode(output.url)
 
 
@@ -171,7 +176,7 @@ class InferenceTestCase(unittest.TestCase):
         self.store = FakeStore()
         settings.record_store = lambda: self.store
         settings.build_client = lambda: self.client
-        inference._cache.clear()
+        inference._cache_clear()
         self.use(policy(SHIELD))
 
     def tearDown(self):
@@ -212,6 +217,20 @@ class ClassifyTestCase(unittest.TestCase):
         arn = "arn:aws:bedrock:us-east-1:123:inference-profile/global.anthropic.claude-sonnet-5"
         call = inference.classify(f"/model/{arn.replace(':', '%3A').replace('/', '%2F')}/invoke", None)
         self.assertEqual(call.model, arn)
+
+    def test_an_invoke_path_holding_a_decoded_arn_is_recognised(self):
+        """The gateway hands the interceptor the path decoded, slash and all."""
+        arn = "arn:aws:bedrock:us-east-1:123:inference-profile/global.anthropic.claude-sonnet-5"
+        for op, kind in (("invoke", "invoke"), ("invoke-with-response-stream", "invoke_stream")):
+            with self.subTest(op=op):
+                call = inference.classify(f"/model/{arn}/{op}", None)
+                self.assertEqual((call.kind, call.model), (kind, arn))
+
+    def test_other_model_api_paths_are_unsupported(self):
+        for path, kind in {"/v1/complete": "unsupported", "/v1/messages/batches": "unsupported",
+                           "/v1/files": "unsupported", "/model/m/converse": "invoke_unsupported"}.items():
+            with self.subTest(path=path):
+                self.assertEqual(inference.classify(path, {"model": "m"}).kind, kind)
 
     def test_other_http_paths_are_not_inference(self):
         self.assertIsNone(inference.classify("/billing-runtime/invocations", {"model": "m"}))
@@ -281,6 +300,73 @@ class RequestTestCase(InferenceTestCase):
         self.assertEqual(out, {"interceptorOutputVersion": "1.0", "http": {}})
         self.assertEqual(self.store.items["req-1"].kind, "models")
 
+    def test_an_invoke_by_inference_profile_arn_is_deidentified(self):
+        arn = "arn:aws:bedrock:us-east-1:123:inference-profile/global.anthropic.claude-sonnet-5"
+        body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 50,
+                "messages": [{"role": "user", "content": f"Hello {NAME}"}]}
+        out = self.send(body, path=f"/model/{arn}/invoke")
+        self.assertEqual(self.sent_body(out)["messages"][0]["content"], f"Hello {TOKENS[NAME]}")
+
+    def test_a_thinking_block_is_never_sent_to_skyflow(self):
+        """Even when it holds a value, because its signature covers the text."""
+        thinking = {"type": "thinking", "thinking": f"The customer is {NAME}.", "signature": SIGNATURE}
+        body = {"model": MODEL, "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": [thinking, {"type": "text", "text": "Hello."}]},
+            {"role": "user", "content": f"I am {NAME}."}]}
+        sent = self.sent_body(self.send(body))
+        self.assertEqual(sent["messages"][1]["content"][0], thinking)
+        self.assertNotIn(thinking["thinking"], self.client.deidentified)
+
+    def test_a_server_tool_result_in_an_assistant_turn_goes_back_as_it_came(self):
+        result = {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                  "content": [{"type": "web_search_result", "title": "News", "url": "https://example.com"}]}
+        body = {"model": MODEL, "messages": [
+            {"role": "user", "content": f"Search for {NAME}"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "x"}},
+                result, {"type": "text", "text": "Found it."}]},
+            {"role": "user", "content": "Thanks."}]}
+        sent = self.sent_body(self.send(body))
+        self.assertEqual(sent["messages"][1]["content"][1], result)
+
+    def test_provider_blocks_outside_an_assistant_turn_are_refused(self):
+        for block in ({"type": "web_search_tool_result", "tool_use_id": "s", "content": NAME},
+                      {"type": "mcp_tool_result", "tool_use_id": "s", "content": NAME},
+                      {"type": "thinking", "thinking": NAME, "signature": SIGNATURE}):
+            with self.subTest(block=block["type"]):
+                body = {"model": MODEL, "messages": [{"role": "user", "content": [block]}]}
+                self.assertIn("outside an assistant turn", self.error(self.send(body), 403)["error"]["message"])
+        self.assertEqual(self.client.deidentified, [])
+
+    def test_only_tokens_the_call_minted_are_recorded(self):
+        """A token the caller already sent is not one this call minted."""
+        self.send({"model": MODEL, "messages": [{"role": "user", "content": f"{FOREIGN} met {NAME}"}]})
+        self.assertEqual(self.store.items["req-1"].tokens, frozenset({TOKENS[NAME]}))
+
+    def test_the_cache_keeps_rules_with_different_entities_apart(self):
+        body = {"model": MODEL, "messages": [{"role": "user", "content": f"Hi {NAME}"}]}
+        self.use(policy({**SHIELD, "entities": ["name"]}))
+        self.send(body)
+        self.use(policy({**SHIELD, "entities": ["name", "email_address"]}))
+        self.send(body, rid="req-2")
+        self.assertEqual(self.client.deidentified, [f"Hi {NAME}", f"Hi {NAME}"])
+
+    def test_a_search_result_in_a_user_turn_belongs_to_the_user_part(self):
+        self.use(policy({**SHIELD, "request": {"action": "deidentify", "parts": ["user"]}}))
+        result = {"type": "search_result", "source": "https://example.com", "title": f"About {NAME}",
+                  "content": [{"type": "text", "text": f"Mail {EMAIL}"}]}
+        sent = self.sent_body(self.send({"model": MODEL, "messages": [{"role": "user", "content": [result]}]}))
+        block = sent["messages"][0]["content"][0]
+        self.assertEqual(block["title"], f"About {TOKENS[NAME]}")
+        self.assertEqual(block["content"][0]["text"], f"Mail {TOKENS[EMAIL]}")
+
+    def test_a_system_message_in_the_conversation_is_the_system_part(self):
+        self.use(policy({**SHIELD, "request": {"action": "deidentify", "parts": ["system"]}}))
+        body = {"model": MODEL, "messages": [{"role": "user", "content": "Hi"},
+                                             {"role": "system", "content": f"The customer is {NAME}."}]}
+        self.assertEqual(self.sent_body(self.send(body))["messages"][1]["content"], f"The customer is {TOKENS[NAME]}.")
+
 
 class AttachmentTestCase(InferenceTestCase):
     def message(self, *blocks):
@@ -332,6 +418,34 @@ class AttachmentTestCase(InferenceTestCase):
                                               "data": base64.b64encode(b"%PDF too big").decode()}}
         self.assertIn("attachment limit", self.error(self.send(self.message(doc)), 403)["error"]["message"])
 
+    def test_a_jpeg_comes_back_as_image_jpeg(self):
+        """Detect names the output `jpg`, and the provider accepts only `image/jpeg`."""
+        self.client.file_output = FileRunResult(status="SUCCESS", output_type="BASE64", outputs=(
+            FileOutput(url=base64.b64encode(b"JPEG redacted").decode(), file_type="redacted", extension="jpg"),))
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": base64.b64encode(b"JPEG original").decode()}}
+        sent = self.sent_body(self.send(self.message(image)))
+        self.assertEqual(sent["messages"][0]["content"][0]["source"]["media_type"], "image/jpeg")
+
+    def test_a_processed_file_is_held_to_the_attachment_limit(self):
+        self.use(policy({**SHIELD, "attachments": {"maxBytes": 1000}}))
+        doc = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                              "data": base64.b64encode(b"%PDF original").decode()}}
+        self.send(self.message(doc))
+        self.assertEqual(self.client.max_bytes, [1000])
+
+    def test_attachments_are_checked_before_any_text_is_deidentified(self):
+        self.use(policy({**SHIELD, "attachments": {"maxBytes": 4}}))
+        doc = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                              "data": base64.b64encode(b"%PDF too big").decode()}}
+        self.error(self.send(self.message({"type": "text", "text": f"From {NAME}"}, doc)), 403)
+        self.assertEqual(self.client.deidentified, [], "no token was minted for a refused call")
+
+    def test_an_attachment_without_a_source_object_is_refused(self):
+        for block in ({"type": "image", "source": "aGVsbG8="}, {"type": "document"}):
+            with self.subTest(block=block):
+                self.assertIn("no source object", self.error(self.send(self.message(block)), 403)["error"]["message"])
+
     def test_an_unsupported_media_type_is_refused(self):
         image = {"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": b64("x")}}
         self.assertIn("image/webp", self.error(self.send(self.message(image)), 403)["error"]["message"])
@@ -382,6 +496,59 @@ class RefusalTestCase(InferenceTestCase):
         self.client.fail = True
         self.assertEqual(self.send(conversation())["http"], {})
         self.assertIn("req-1", self.store.items)
+
+    def test_a_bug_fails_closed_even_under_fail_open(self):
+        """fail_open is for Skyflow outages. A misread body must not be sent on as it came."""
+        self.use(policy({**SHIELD, "failure": {"onError": "fail_open"}}))
+        self.client.bug = True
+        with self.assertLogs(level="ERROR") as logs:
+            self.error(self.send(conversation()), 502)
+        self.assertTrue(any("inference_fail_closed" in line for line in logs.output))
+
+    def test_an_error_outside_the_request_logic_refuses_instead_of_raising(self):
+        def broken():
+            raise RuntimeError("no region")
+        settings.record_store = broken
+        with self.assertLogs(level="ERROR") as logs:
+            self.error(self.send(conversation()), 502)
+        self.assertTrue(any("reason=internal_error err=RuntimeError" in line for line in logs.output))
+
+    def test_a_request_too_large_to_hand_back_is_refused(self):
+        saved = inference.MAX_TRANSFORMED_BODY
+        inference.MAX_TRANSFORMED_BODY = 100
+        try:
+            body = self.error(self.send(conversation()), 413)
+        finally:
+            inference.MAX_TRANSFORMED_BODY = saved
+        self.assertEqual(body["error"]["type"], "request_too_large")
+        self.assertNotIn("req-1", self.store.items)
+
+    def test_another_model_familys_invoke_body_is_refused(self):
+        """Llama, Titan, Cohere and Mistral bodies are not read, so they are not passed on."""
+        bodies = {
+            "meta.llama3-70b-instruct-v1:0": {"prompt": f"Write to {NAME}", "max_gen_len": 50},
+            "amazon.titan-text-express-v1": {"inputText": f"Write to {NAME}"},
+            "cohere.command-r-v1:0": {"message": f"Write to {NAME}", "chat_history": []},
+            "mistral.mistral-large-2407-v1:0": {"messages": [{"role": "user", "content": f"Write to {NAME}"}]},
+        }
+        for model, body in bodies.items():
+            with self.subTest(model=model):
+                out = self.send(body, path=f"/model/{model}/invoke")
+                response = out["http"]["transformedGatewayResponse"]
+                self.assertEqual(response["statusCode"], 403)
+                self.assertEqual(response["headers"], {"x-amzn-errortype": "AccessDeniedException"})
+        self.assertEqual(self.client.deidentified, [])
+
+    def test_a_messages_body_without_messages_is_refused(self):
+        self.error(self.send({"model": MODEL, "prompt": f"Write to {NAME}"}), 403)
+
+    def test_an_unknown_model_api_path_is_refused_even_under_passthrough(self):
+        self.use(policy(SHIELD, http_payloads={"action": "passthrough"}))
+        body = self.error(self.send({"model": MODEL, "prompt": f"Human: {NAME}"}, path="/v1/complete"), 403)
+        self.assertIn("does not recognise", body["error"]["message"])
+        out = self.send({"messages": []}, path="/model/m/converse")
+        self.assertEqual(out["http"]["transformedGatewayResponse"]["headers"],
+                         {"x-amzn-errortype": "AccessDeniedException"})
 
     def test_the_openai_dialect_is_refused_while_a_rule_is_active(self):
         body = self.error(self.send({"model": MODEL, "messages": []}, path="/v1/chat/completions"), 403)
@@ -485,6 +652,26 @@ class ResponseTestCase(InferenceTestCase):
         self.assertEqual(self.answer(json.dumps({"content": [{"type": "text", "text": "No names."}]}))["http"], {})
         self.assertEqual(self.client.reidentified, [])
 
+    def test_an_invoke_answer_is_reidentified(self):
+        self.send({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 50,
+                   "messages": [{"role": "user", "content": f"Hello {NAME}"}]},
+                  path="/model/global.anthropic.claude-sonnet-5/invoke")
+        self.assertEqual(self.store.items["req-1"].response_action, "reidentify")
+        answer = {"content": [{"type": "text", "text": f"Hello {TOKENS[NAME]}"}]}
+        doc = json.loads(self.returned(self.answer(json.dumps(answer))))
+        self.assertEqual(doc["content"][0]["text"], f"Hello {NAME}")
+
+    def test_a_status_code_sent_as_a_string_is_read_as_a_number(self):
+        self.record()
+        self.assertEqual(self.answer(json.dumps({"type": "error"}), status="500")["http"], {})
+
+    def test_a_record_table_that_cannot_be_reached_leaves_the_answer_to_http_payloads(self):
+        def broken():
+            raise RuntimeError("no region")
+        settings.record_store = broken
+        out = self.answer(json.dumps({"content": [{"type": "text", "text": TOKENS[NAME]}]}))
+        self.assertEqual(self.error(out, 403)["error"]["code"], "SENSITIVE_DATA_UNINSPECTED")
+
     def test_a_reidentify_failure_fails_closed(self):
         self.record()
         self.client.fail = True
@@ -559,6 +746,18 @@ class PolicyTestCase(unittest.TestCase):
         with self.assertRaises(PolicyError):
             PolicySet.from_json(policy({"request": {"action": "deidentify", "parts": ["prompt"]}}))
 
+    def test_a_scope_without_min_length_keeps_the_inference_default(self):
+        shield = {**SHIELD, "scope": {"excludeKeys": ["id"]}}
+        policy_set = PolicySet.from_json(policy(shield, overrides=[{"models": ["*haiku*"], "scope": {}}]))
+        self.assertEqual(policy_set.resolve_inference(MODEL).scope.min_length, 3)
+        self.assertEqual(policy_set.resolve_inference("claude-haiku-5-5").scope.min_length, 3)
+
+    def test_deidentifying_needs_at_least_one_entity(self):
+        with self.assertRaises(PolicyError):
+            PolicySet.from_json(policy({**SHIELD, "entities": []}))
+        with self.assertRaises(PolicyError):
+            PolicySet.from_json(policy(SHIELD, overrides=[{"models": ["*haiku*"], "entities": []}]))
+
     def test_overrides_need_an_inference_block(self):
         with self.assertRaises(PolicyError):
             PolicySet.from_json(policy(overrides=[{"models": ["*"]}]))
@@ -567,6 +766,29 @@ class PolicyTestCase(unittest.TestCase):
         shipped = json.loads((SRC.parent / "config" / "policy.json").read_text())
         rule = PolicySet.from_json(shipped).resolve_inference(MODEL)
         self.assertEqual((rule.request.action, rule.response.action), ("deidentify", "reidentify"))
+
+
+class CacheTestCase(unittest.TestCase):
+    def setUp(self):
+        self.saved = (inference.CACHE_ENTRIES, inference.CACHE_CHARACTERS)
+        inference._cache_clear()
+
+    def tearDown(self):
+        inference.CACHE_ENTRIES, inference.CACHE_CHARACTERS = self.saved
+        inference._cache_clear()
+
+    def test_the_cache_is_bounded_by_characters(self):
+        inference.CACHE_CHARACTERS = 100
+        for n in range(5):
+            inference._cache_put((True, ("name",), str(n) * 30), (str(n) * 20, frozenset()))
+        self.assertLessEqual(inference._cache_size, 100)
+        self.assertIsNone(inference._cache_get((True, ("name",), "0" * 30)), "the oldest entry went first")
+        self.assertIsNotNone(inference._cache_get((True, ("name",), "4" * 30)))
+
+    def test_an_entry_larger_than_the_cache_is_not_kept(self):
+        inference.CACHE_CHARACTERS = 10
+        inference._cache_put((True, (), "x" * 20), ("y" * 20, frozenset()))
+        self.assertEqual((len(inference._cache), inference._cache_size), (0, 0))
 
 
 class FileClientTestCase(unittest.TestCase):
@@ -595,6 +817,12 @@ class FileClientTestCase(unittest.TestCase):
         run = FileRunResult(status="SUCCESS", output_type="PRESIGNED_URL")
         with self.assertRaises(SkyflowError):
             self.client().processed_file_bytes(run, FileOutput("http://x/y", "redacted", "pdf"), 10)
+
+    def test_entity_metadata_is_never_taken_for_the_document(self):
+        run = FileRunResult(status="SUCCESS", outputs=(
+            FileOutput(url="e", file_type="entities", extension="JSON"),
+            FileOutput(url="d", file_type="redacted_file", extension="pdf")))
+        self.assertEqual(run.first_document().url, "d")
 
     def test_a_run_reports_its_output_type(self):
         client = self.client()

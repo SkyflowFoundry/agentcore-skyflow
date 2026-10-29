@@ -126,10 +126,19 @@ new InterceptorStack(app, app.node.tryGetContext('stackName') ?? 'SkyflowInterce
 
 const gatewayIdentifier = app.node.tryGetContext('gatewayIdentifier');
 if (gatewayIdentifier) {
+  // A lookup that finds nothing prints None from the AWS CLI, and that would
+  // otherwise reach CloudFormation as a gateway name.
+  const gatewayRoleArn = required('gatewayRoleArn');
+  if (['none', 'null'].includes(String(gatewayIdentifier).toLowerCase())) {
+    throw new Error(`gatewayIdentifier is '${gatewayIdentifier}'. The gateway lookup found no gateway; check its name and region.`);
+  }
+  if (!gatewayRoleArn.startsWith('arn:')) {
+    throw new Error(`gatewayRoleArn must be an IAM role ARN, got '${gatewayRoleArn}'`);
+  }
   new InferenceStack(app, app.node.tryGetContext('inferenceStackName') ?? 'SkyflowInferenceStack', {
     env,
     gatewayIdentifier,
-    gatewayRoleArn: required('gatewayRoleArn'),
+    gatewayRoleArn,
     targetName: app.node.tryGetContext('inferenceTargetName'),
   });
 }

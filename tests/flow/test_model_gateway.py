@@ -43,20 +43,31 @@ class ResolveTestCase(unittest.TestCase):
         )
         self.assertEqual(gateway.region, "us-east-1")
         self.assertEqual(gateway.model, f"bedrock/{MODEL}")
-        self.assertEqual(gateway.max_tokens, 4096)
+        self.assertEqual(gateway.max_tokens, 32000)
 
     def test_it_can_be_turned_off(self):
         for value in ("0", "false", "No", "off"):
             with self.subTest(value=value):
                 self.assertIsNone(resolve(MODEL, {**INJECTED, "MODEL_VIA_GATEWAY": value}))
+        self.assertIsNone(resolve(MODEL, {"MODEL_VIA_GATEWAY": "0"}), "no gateway is needed when it is off")
 
-    def test_without_a_gateway_flow_calls_bedrock_directly(self):
-        """Local development without a deployed gateway keeps working."""
-        self.assertIsNone(resolve(MODEL, {}))
+    def test_without_a_gateway_the_runtime_refuses_to_start(self):
+        """Calling Bedrock directly instead would skip the shield without a word."""
+        with self.assertRaisesRegex(RuntimeError, "MODEL_VIA_GATEWAY=0"):
+            resolve(MODEL, {})
 
     def test_a_gateway_without_iam_auth_is_not_used_for_models(self):
         env = {"GATEWAY_OTHER_URL": "https://other.example.com/mcp", "GATEWAY_OTHER_AUTH_TYPE": "CUSTOM_JWT"}
-        self.assertIsNone(resolve(MODEL, env))
+        with self.assertRaisesRegex(RuntimeError, "no AWS_IAM gateway"):
+            resolve(MODEL, env)
+
+    def test_several_iam_gateways_need_an_explicit_choice(self):
+        other = "https://other-xyz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+        env = {**INJECTED, "GATEWAY_OTHER_URL": other, "GATEWAY_OTHER_AUTH_TYPE": "AWS_IAM"}
+        with self.assertRaisesRegex(RuntimeError, "MODEL_GATEWAY_URL"):
+            resolve(MODEL, env)
+        self.assertEqual(resolve(MODEL, {**env, "MODEL_GATEWAY_URL": other}).base_url,
+                         "https://other-xyz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference")
 
     def test_an_explicit_url_and_target_win(self):
         other = "https://other-xyz.gateway.bedrock-agentcore.eu-west-2.amazonaws.com/mcp"
@@ -65,6 +76,19 @@ class ResolveTestCase(unittest.TestCase):
         self.assertEqual(gateway.region, "eu-west-2")
         self.assertEqual(gateway.model, f"anthropic/{MODEL}")
         self.assertEqual(gateway.max_tokens, 1024)
+
+
+class ClientArgsTestCase(unittest.TestCase):
+    def test_the_sdk_never_retries_a_shielded_call(self):
+        """Each retry would run the model and Skyflow again. Strands retries throttling itself."""
+        self.assertEqual(resolve(MODEL, INJECTED).client_args(FakeSession())["max_retries"], 0)
+
+    def test_calls_go_to_the_inference_path_signed_and_without_an_api_key(self):
+        args = resolve(MODEL, INJECTED).client_args(FakeSession())
+        self.assertTrue(args["base_url"].endswith(".amazonaws.com/inference"))
+        client = args["http_client"]
+        self.assertIsInstance(client.auth, GatewayModelAuth)
+        self.assertEqual(client.timeout.read, 900.0)
 
 
 class HelpersTestCase(unittest.TestCase):

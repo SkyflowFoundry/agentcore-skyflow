@@ -112,12 +112,16 @@ jobs:
         # No AWS credentials: account and region come from
         # agentcore/aws-targets.json, and the Skyflow secret is referenced by
         # name, so nothing here performs a lookup. Vault identifiers live in the
-        # gitignored cdk.context.json, so CI supplies placeholders.
+        # gitignored cdk.context.json, so CI supplies placeholders. The gateway
+        # placeholders add the shield-the-model inference stack to the synth.
         run: |
           npm run build
           npx cdk synth --quiet \
             -c skyflowVaultUrl=https://ci.vault.example.com \
-            -c skyflowVaultId=ci-placeholder
+            -c skyflowVaultId=ci-placeholder \
+            -c gatewayIdentifier=ci-gateway-placeholder \
+            -c gatewayRoleArn=arn:aws:iam::123456789012:role/ci-placeholder
+          test -f cdk.out/SkyflowInferenceStack.template.json
 
       - name: Assert the Lambda bundle carries no dependencies
         # The interceptor deploys as plain source with no layer and no vendored

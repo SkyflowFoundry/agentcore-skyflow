@@ -89,9 +89,9 @@ Deploy injects one set per reachable resource, so an agent never hardcodes a URL
 | `MCP_ENDPOINTS` | Override — comma-separated MCP URLs that *replace* everything discovered. With neither this nor a gateway, the agent refuses to start. |
 | `MCP_AUTH_TYPE` | Auth for `MCP_ENDPOINTS`: `AWS_IAM`, `CUSTOM_JWT` or `NONE`. Defaults to `CUSTOM_JWT` when `MCP_BEARER_TOKEN` is set, else `NONE`. |
 | `MCP_BEARER_TOKEN` | Bearer token for `CUSTOM_JWT` endpoints. |
-| `BEDROCK_MODEL_ID` | Model or inference-profile id. Defaults to `global.anthropic.claude-sonnet-5`; the template's original default is not subscribed in this account. |
-| `MODEL_VIA_GATEWAY` | `0` sends model calls straight to Bedrock. Default `1`: they go through `SkyflowGateway`'s inference target so shield the model applies. |
-| `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_TARGET`, `MODEL_MAX_TOKENS` | Which gateway and inference target model calls use, and the longest answer. Default the first `AWS_IAM` gateway, `bedrock` and 4096. |
+| `BEDROCK_MODEL_ID` | Model or inference-profile id. Defaults to `global.anthropic.claude-sonnet-5`; the template's original default is not subscribed in this account. Through the gateway it must name a Claude model, because Flow speaks the Anthropic Messages API there. |
+| `MODEL_VIA_GATEWAY` | `0` sends model calls straight to Bedrock. Default `1`: they go through `SkyflowGateway`'s inference target so shield the model applies, and the agent refuses to start when it cannot tell which gateway to use. |
+| `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_TARGET`, `MODEL_MAX_TOKENS` | Which gateway and inference target model calls use, and the longest answer including thinking. Default the one `AWS_IAM` gateway discovered, `bedrock` and 32000. `MODEL_GATEWAY_URL` is required when more than one `AWS_IAM` gateway is wired in. |
 | `LOCAL_DEV` | Set to `1` to use `.env.local` instead of AgentCore Identity. |
 
 `SkyflowGateway` is `AWS_IAM`, so Flow SigV4-signs each MCP request with its execution role instead

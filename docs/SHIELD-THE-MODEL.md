@@ -101,7 +101,7 @@ A new top-level `inference` block sits beside `defaults` and `overrides` in `pol
   "failure": { "onError": "fail_closed" }
 },
 "inferenceOverrides": [
-  { "models": ["*haiku*"], "request": { "parts": ["user", "tool_result"] } }
+  { "models": ["*haiku*"], "request": { "action": "deidentify", "parts": ["user", "tool_result"] } }
 ]
 ```
 
@@ -115,9 +115,11 @@ A new top-level `inference` block sits beside `defaults` and `overrides` in `pol
 | `response.action` | `reidentify` or `none`. |
 | `response.parts` | `text` is the model's prose. `tool_call` is the arguments of a tool call the model makes. The agent then sends that call through the gateway's tool rules. |
 | `response.only` | `minted_for_request` re-identifies only tokens that the request side minted for this call. `any_vault_token` re-identifies every vault token, as the tool path does today. |
-| `attachments` | A size limit for attached files. A larger one is refused. Lambda's 6 MB payload limit applies to base64 of a JSON body that itself holds base64. |
-| `entities` and `scope` | As for tools. `entities` defaults to the policy's default entities. Only `scope.minLength` applies to conversation text. |
-| `failure.onError` | As for tools. |
+| `attachments` | A size limit for attached files, decoded. A larger one is refused, and the de-identified file is held to the same limit. Lambda takes 6 MB in and 6 MB out, and the event holds base64 of a JSON body that itself holds base64. |
+| `entities` and `scope` | As for tools. `entities` defaults to the policy's default entities and must not be empty while the request de-identifies. Only `scope.minLength` applies to conversation text, and it defaults to 3. |
+| `failure.onError` | As for tools, but only for Skyflow failures. A body the interceptor cannot parse is always refused. |
+
+An override replaces whole sub-blocks, as overrides for tools do. A `request` block in an override that leaves out `action` means `none`, so the example names it.
 
 ### Carrying the decision to the response
 
@@ -127,17 +129,17 @@ A response with no record is left to `httpPayloads`, which blocks it by default.
 
 ### What gets de-identified
 
-1. **Text parts** go to Skyflow Detect's string API. The adapter joins all strings for one call into as few Detect requests as it can, because the spike showed joined text costs half as much.
+1. **Text parts** go to Skyflow Detect's string API. Each distinct string goes once, eight at a time in parallel. The spike showed that joining them into fewer requests would cost about half as much, but joining is not built yet.
 2. **Text documents** are strings and go the same way.
 3. **PDFs, images and Office files** go to Skyflow Detect's v2 file API as `dataSource: BASE64` and always one way. A PDF comes back with counter tokens such as `NAME_1`. An image comes back with the values blacked out. Neither can be restored, which matches the decision above. A small PDF took about a second.
-4. **A per-container cache** keeps the result for any string it has already de-identified while the Lambda stays warm. Vault tokens are deterministic, so the cache returns what Detect would. Earlier turns of a conversation then cost almost nothing on later calls.
+4. **A per-container cache** keeps the result for any string it has already de-identified while the Lambda stays warm. Vault tokens are deterministic, so the cache returns what Detect would. Earlier turns of a conversation then cost almost nothing on later calls. It holds at most 4096 strings and 32 million characters.
 
 ### Dialect adapters
 
 Each dialect gets a small adapter that lists the parts to transform and writes the results back. Adapters live in a new `src/inference.py`.
 
 1. **Anthropic Messages is built.** Claude models on Bedrock serve it through the `bedrock-runtime` connector. The adapter covers JSON answers and buffered streams. For a stream it joins each content block's deltas, re-identifies the joined text and writes it back as one delta. `count_tokens` requests are de-identified too.
-2. **Bedrock `InvokeModel` is built for JSON answers.** Its body is the Anthropic payload for Claude models, so it reuses the first adapter. A streamed InvokeModel answer uses AWS event-stream framing, which is not parsed yet, so such a call is refused while the rule re-identifies.
+2. **Bedrock `InvokeModel` is built for JSON answers from Claude.** Its body is the Anthropic payload for Claude models, so it reuses the first adapter. Other model families send their own bodies, such as Llama's `prompt`, so a body without `anthropic_version` and `messages` is refused. A streamed InvokeModel answer uses AWS event-stream framing, which is not parsed yet, so such a call is refused while the rule re-identifies. Any other path under `/v1/` or `/model/` is refused too, so it cannot fall through to `httpPayloads`.
 3. **OpenAI Chat Completions and Responses are not built.** They are refused while a rule does anything.
 
 ### Streaming
@@ -146,14 +148,14 @@ The gateway buffers every inference response before the interceptor sees it. Wit
 
 ### Flow
 
-Flow sends its model calls through the gateway by default. `model/load.py` returns a Strands model that sends Anthropic Messages to `<gateway>/inference`, and `MODEL_VIA_GATEWAY=0` switches back to calling Bedrock directly. Without a discoverable IAM gateway, as in local development, it calls Bedrock directly anyway. It reuses the SigV4 `httpx` auth in `mcp_client/sigv4.py`, because SkyflowGateway uses IAM inbound auth. Strands' Anthropic model needs the `anthropic-version` header, which the Anthropic SDK sends by itself.
+Flow sends its model calls through the gateway by default. `model/load.py` returns a Strands model that sends Anthropic Messages to `<gateway>/inference`, and `MODEL_VIA_GATEWAY=0` switches back to calling Bedrock directly. Without exactly one IAM gateway or a `MODEL_GATEWAY_URL` it refuses to start rather than skip the shield. `agentcore dev` injects the deployed gateway too, so local development goes through it. The Anthropic SDK's own retries are off, because each retry would run the model and Skyflow again, and Strands already retries throttled calls. It reuses the SigV4 `httpx` auth in `mcp_client/sigv4.py`, because SkyflowGateway uses IAM inbound auth. Strands' Anthropic model needs the `anthropic-version` header, which the Anthropic SDK sends by itself.
 
 ### Infrastructure
 
 The project schema can express inference only as a `passthrough` target, not as an inference connector. Two CDK changes in `gateway/interceptor/cdk` cover it.
 
 1. `SkyflowInterceptorStack` gains the DynamoDB table for per-request records, with put and get grants for the interceptor and its name in `INFERENCE_RECORD_TABLE`.
-2. A new `SkyflowInferenceStack` adds a `bedrock-runtime` connector target on SkyflowGateway with `GATEWAY_IAM_ROLE` outbound auth. It also grants the gateway role `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` and the list calls that model discovery needs. CDK 2.261 does not model inference targets yet, so the target configuration is a CloudFormation property override. CloudFormation itself supports it.
+2. A new `SkyflowInferenceStack` adds a `bedrock-runtime` connector target on SkyflowGateway with `GATEWAY_IAM_ROLE` outbound auth. It also grants the gateway role `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` and the seven list calls that the inference target documentation names for model discovery. CDK 2.261 does not model inference targets yet, so the target configuration is a CloudFormation property override. CloudFormation itself supports it.
 
 The deliberate exception in `agentcore/cdk/lib/cdk-stack.ts` stays as it is.
 

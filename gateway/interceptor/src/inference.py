@@ -14,15 +14,21 @@ module handles the calls it understands and leaves everything else to the
 | `/model/{id}/invoke-with-response-stream` | de-identified | refused when the rule re-identifies, because the binary event stream is not parsed yet |
 | `/v1/models` | passed | passed |
 | `/v1/chat/completions`, `/v1/responses` | passed only when the rule does nothing, refused otherwise | |
+| any other `/v1/...` or `/model/...` path | refused | |
 
-Paths arrive without the `/inference` prefix the client used.
+Paths arrive without the `/inference` prefix the client used, and a model id
+arrives decoded, so an inference-profile ARN in an InvokeModel path carries a
+`/` of its own. InvokeModel bodies are read only in Anthropic's shape. Another
+model family's body, such as Llama's `prompt`, is refused rather than passed
+on unread.
 
 What the request side de-identifies is chosen by the rule's `request.parts`:
 the system prompt, user and assistant turns, earlier tool calls, tool results
 and attached documents and images. Tool definitions are never touched, and
 neither are thinking blocks, whose `signature` the provider checks on the next
 turn. Server-side tool blocks such as `web_search_tool_result` were produced
-by the provider, so they go back as they came.
+by the provider, so they go back as they came. Both are left alone only in an
+assistant turn, which is the only place the provider puts them.
 
 The request side then writes a record under the gateway's `REQUEST_ID` (see
 `records`) so the response side can apply the same rule and, with
@@ -74,6 +80,11 @@ MAX_PARALLEL_CALLS = 8
 FILE_RESERVE_SECONDS = 5.0
 NO_CONTEXT_BUDGET_SECONDS = 60.0
 
+#: Largest de-identified request body, base64 encoded, that is handed back to
+#: the gateway. Lambda returns at most 6 MB and the body sits inside a JSON
+#: envelope, so a larger one is refused here rather than failing the Lambda.
+MAX_TRANSFORMED_BODY = 5 * 1024 * 1024
+
 #: Attachment media type to Detect `dataFormat`.
 MEDIA_FORMATS = {
     "application/pdf": "pdf",
@@ -95,15 +106,30 @@ MEDIA_FORMATS = {
 #: Detect's file API one way: tokens that cannot be restored, or redacted
 #: regions in an image.
 TEXT_FORMATS = frozenset({"txt", "csv", "json"})
-MEDIA_BY_EXTENSION = {fmt: media for media, fmt in MEDIA_FORMATS.items()}
+#: Detect's output extension to the media type the provider expects. Built by
+#: hand because `image/jpg` and `image/jpeg` share a format and the provider
+#: accepts only `image/jpeg`.
+MEDIA_BY_EXTENSION = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "tif": "image/tiff",
+    "tiff": "image/tiff",
+}
 
 #: The part of a message a text block belongs to, by the message's role.
-ROLE_PARTS = {"user": "user", "assistant": "assistant"}
+#: A `system` message in `messages` is a mid-conversation system prompt.
+ROLE_PARTS = {"user": "user", "assistant": "assistant", "system": "system"}
 
 #: Block types that the provider produced and checks or reads back verbatim.
+#: Server-tool results, whose types end in `_tool_result`, are treated alike.
 UNTOUCHED_BLOCKS = frozenset({"thinking", "redacted_thinking", "server_tool_use"})
 
-_INVOKE = re.compile(r"^/model/(?P<model>[^/]+)/(?P<op>invoke|invoke-with-response-stream)$")
+#: A decoded model id can hold a `/`, as an inference-profile ARN does.
+_INVOKE = re.compile(r"^/model/(?P<model>.+)/(?P<op>invoke|invoke-with-response-stream)$")
 
 
 class Refused(Exception):
@@ -144,14 +170,27 @@ def classify(path: str, body: Any) -> Call | None:
     if match:
         kind = "invoke" if match.group("op") == "invoke" else "invoke_stream"
         return Call(kind, urllib.parse.unquote(match.group("model")))
+    # Batches, files, legacy completions, Converse and whatever the gateway
+    # adds next all carry model input this module does not read. They must not
+    # fall through to `httpPayloads`, where `passthrough` would send them on.
+    if path.startswith("/model/"):
+        return Call("invoke_unsupported")
+    if path.startswith("/v1/"):
+        return Call("unsupported")
     return None
 
 
 def handle(http: dict, direction: str, policy_set: PolicySet, context) -> dict | None:
     """Handle an HTTP event that is inference traffic, or return None to leave it alone."""
-    if direction == "request":
-        return _on_request(http.get("gatewayRequest") or {}, policy_set, context)
-    return _on_response(http.get("gatewayResponse") or {}, context)
+    try:
+        if direction == "request":
+            return _on_request(http.get("gatewayRequest") or {}, policy_set, context)
+        return _on_response(http.get("gatewayResponse") or {}, context)
+    except Exception as exc:  # noqa: BLE001 - a bug must refuse the call, not fail the Lambda
+        # Only the type is logged, because an exception's message can quote
+        # the body it choked on.
+        logger.error("inference_fail_closed direction=%s reason=internal_error err=%s", direction, type(exc).__name__)
+        return refusal("messages", "The interceptor could not process the model call, so it was blocked.", 502)
 
 
 # ------------------------------------------------------------- request side
@@ -168,6 +207,9 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
     call = classify(request.get("path") or "", body)
     if call is None:
         return None
+    if call.kind in ("unsupported", "invoke_unsupported"):
+        logger.warning("inference_blocked kind=%s reason=unknown_path", call.kind)
+        return refusal(call.kind, "Shield the model does not recognise this model API path, so the call was blocked.", 403)
 
     store = settings.record_store()
     rid = request_id(context)
@@ -207,19 +249,33 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         return _remember(store, rid, record, call) or passthrough()
     if not isinstance(body, dict):
         return refusal(call.kind, "The model request body is not a JSON object.", 400)
+    if not _is_anthropic_body(call, body):
+        logger.warning("inference_blocked kind=%s model=%s reason=body_not_anthropic", call.kind, call.model)
+        return refusal(
+            call.kind,
+            "Shield the model reads only Anthropic Messages request bodies, so the model call was blocked.",
+            403,
+        )
 
     try:
         new_body, minted, stats = deidentify_request(body, rule, settings.build_client(), context)
     except Refused as exc:
         logger.warning("inference_blocked kind=%s model=%s reason=%s", call.kind, call.model, exc)
         return refusal(call.kind, f"{exc}, so the model call was blocked.", 403)
-    except Exception as exc:  # noqa: BLE001 - SkyflowError or a bug; either way decided by failure mode
+    except SkyflowError as exc:
+        # Only a Skyflow failure is the failure mode's to decide. Anything else
+        # is a bug or a body this module misread, and passing the original on
+        # would forward exactly what it failed to inspect.
         if rule.failure.on_error == "fail_open":
             logger.warning("inference_fail_open direction=request kind=%s model=%s err=%s", call.kind, call.model, exc)
             return _remember(store, rid, record, call) or passthrough()
         logger.error("inference_fail_closed direction=request kind=%s model=%s err=%s", call.kind, call.model, exc)
         return refusal(call.kind, "Sensitive-data processing failed, so the model call was blocked.", 502)
 
+    encoded = base64.b64encode(json.dumps(new_body).encode("utf-8")).decode()
+    if len(encoded) > MAX_TRANSFORMED_BODY:
+        logger.warning("inference_blocked kind=%s model=%s reason=too_large bytes=%d", call.kind, call.model, len(encoded))
+        return refusal(call.kind, "The de-identified model request is too large to hand back to the gateway.", 413)
     blocked = _remember(store, rid, replace(record, tokens=frozenset(minted)), call)
     if blocked:
         return blocked
@@ -227,8 +283,22 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         "inference_request_transformed kind=%s model=%s strings=%d files=%d tokens=%d",
         call.kind, call.model, stats["strings"], stats["files"], len(minted),
     )
-    encoded = base64.b64encode(json.dumps(new_body).encode("utf-8")).decode()
     return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {"transformedGatewayRequest": {"body": encoded}}}
+
+
+def _is_anthropic_body(call: Call, body: dict) -> bool:
+    """Whether a request body is in the Anthropic Messages shape this module reads.
+
+    Bedrock's InvokeModel takes each model family's own body: `prompt` for
+    Llama, `inputText` for Titan, `message` and `chat_history` for Cohere.
+    None of those are read here, so only Anthropic's, which names
+    `anthropic_version`, is let through.
+    """
+    if not isinstance(body.get("messages"), list):
+        return False
+    if call.kind.startswith("invoke"):
+        return "anthropic_version" in body
+    return True
 
 
 def _remember(store, rid: str, record: CallRecord, call: Call) -> dict | None:
@@ -255,6 +325,9 @@ def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, c
     body = copy.deepcopy(body)
     parts = set(rule.request.parts)
     texts, inputs, files = _collect(body, parts)
+    # Every attachment is checked before anything is sent to Skyflow, so a call
+    # that will be refused for one of them mints no tokens first.
+    checked = [(source, part, _check_attachment(source, part, rule)) for source, part in files]
     deidentifier = _Deidentifier(client, rule)
 
     # Each distinct string is sent once, in parallel, whatever its position.
@@ -280,8 +353,8 @@ def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, c
     for holder, key, value in slots:
         holder[key] = results[value][0]
 
-    for source, part in files:
-        minted |= _deidentify_file(source, part, rule, client, deidentifier, context)
+    for source, part, attachment in checked:
+        minted |= _deidentify_file(source, part, attachment, rule, client, deidentifier, context)
 
     if rule.request.system_note and TOKEN.search(json.dumps(body.get("messages") or [])):
         _add_system_note(body)
@@ -327,6 +400,10 @@ def _collect_block(block, text_part: str, parts: set[str], texts, inputs, files)
         if text_part in parts:
             texts.append((block, "text"))
     elif kind in UNTOUCHED_BLOCKS or (kind.endswith("_tool_result") and kind != "tool_result"):
+        # The provider writes these into its own turn. Anywhere else one came
+        # from the client, and skipping it would wave through whatever it holds.
+        if text_part != "assistant":
+            raise Refused(f"A {kind} block outside an assistant turn cannot be inspected")
         return
     elif kind == "tool_use":
         if "tool_call" in parts and isinstance(block.get("input"), (dict, list)):
@@ -340,18 +417,20 @@ def _collect_block(block, text_part: str, parts: set[str], texts, inputs, files)
             for inner in content:
                 _collect_block(inner, "tool_result", parts, texts, inputs, files)
     elif kind == "search_result":
-        if "tool_result" in parts:
+        # Part of whatever holds it: a tool result's when a tool returned it,
+        # the turn's when the caller put it straight into a message.
+        if text_part in parts:
             if isinstance(block.get("title"), str):
                 texts.append((block, "title"))
             for inner in block.get("content") or []:
-                _collect_block(inner, "tool_result", parts, texts, inputs, files)
+                _collect_block(inner, text_part, parts, texts, inputs, files)
     elif kind == "document":
         if "document" not in parts:
             return
         for key in ("title", "context"):
             if isinstance(block.get(key), str):
                 texts.append((block, key))
-        source = block.get("source") or {}
+        source = _source(block, "document")
         source_type = source.get("type")
         if source_type == "text":
             texts.append((source, "data"))
@@ -365,12 +444,19 @@ def _collect_block(block, text_part: str, parts: set[str], texts, inputs, files)
     elif kind == "image":
         if "image" not in parts:
             return
-        source = block.get("source") or {}
+        source = _source(block, "image")
         if source.get("type") != "base64":
             raise Refused("An attached image sent by reference cannot be inspected")
         files.append((source, "image"))
     else:
         raise Refused(f"A {kind or 'untyped'} content block is not supported by shield the model")
+
+
+def _source(block: dict, part: str) -> dict:
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise Refused(f"An attached {part} has no source object")
+    return source
 
 
 def _add_system_note(body: dict) -> None:
@@ -383,13 +469,22 @@ def _add_system_note(body: dict) -> None:
         body["system"] = SYSTEM_NOTE
 
 
-def _deidentify_file(source: dict, part: str, rule: InferenceRule, client, deidentifier, context) -> set[str]:
-    """De-identify one base64 attachment in place. Returns the tokens it minted."""
-    media = (source.get("media_type") or "").lower()
+@dataclass(frozen=True)
+class _Attachment:
+    media: str
+    data_format: str
+    raw: bytes
+
+
+def _check_attachment(source: dict, part: str, rule: InferenceRule) -> _Attachment:
+    """Refuse an attachment that cannot be de-identified, before any Skyflow call."""
+    media = str(source.get("media_type") or "").lower()
     data_format = MEDIA_FORMATS.get(media)
     if data_format is None:
         raise Refused(f"An attached {part} of type {media or 'unknown'} cannot be de-identified")
-    data = source.get("data") or ""
+    data = source.get("data")
+    if not isinstance(data, str):
+        raise Refused(f"An attached {part} has no base64 data")
     try:
         raw = base64.b64decode(data, validate=True)
     except ValueError as exc:
@@ -397,20 +492,27 @@ def _deidentify_file(source: dict, part: str, rule: InferenceRule, client, deide
     limit = rule.attachments.max_bytes
     if len(raw) > limit:
         raise Refused(f"An attached {part} is {len(raw)} bytes, over the {limit}-byte attachment limit")
-
     if data_format in TEXT_FORMATS:
         try:
-            text = raw.decode("utf-8")
+            raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise Refused(f"An attached {part} says it is text but is not UTF-8") from exc
-        processed, minted = deidentifier.text(text)
+    return _Attachment(media, data_format, raw)
+
+
+def _deidentify_file(source: dict, part: str, attachment: _Attachment, rule: InferenceRule, client,
+                     deidentifier, context) -> set[str]:
+    """De-identify one checked base64 attachment in place. Returns the tokens it minted."""
+    if attachment.data_format in TEXT_FORMATS:
+        processed, minted = deidentifier.text(attachment.raw.decode("utf-8"))
         source["data"] = base64.b64encode(processed.encode("utf-8")).decode()
         return set(minted)
 
     # One way. Counter tokens take no vault destination, and PDFs and images
     # cannot carry vault tokens at all.
+    data_format = attachment.data_format
     configuration = build_file_configuration(rule.entities, "counter", data_format)
-    run_id = client.deidentify_file_base64(data, data_format, configuration)
+    run_id = client.deidentify_file_base64(source["data"], data_format, configuration)
     logger.info("inference_file_submitted part=%s format=%s run_id=%s", part, data_format, run_id)
     run = client.wait_for_run(run_id, _remaining_seconds(context), reserve_seconds=FILE_RESERVE_SECONDS)
     if not run.succeeded:
@@ -418,10 +520,12 @@ def _deidentify_file(source: dict, part: str, rule: InferenceRule, client, deide
     output = run.first_document()
     if output is None:
         raise SkyflowError(f"Skyflow file run {run_id} returned no file")
-    content = client.processed_file_bytes(run, output, max_bytes=limit * 2)
+    # The de-identified file is held to the same limit as the original, so a
+    # request that fitted in the Lambda's 6 MB on the way in fits on the way out.
+    content = client.processed_file_bytes(run, output, max_bytes=rule.attachments.max_bytes)
     source["data"] = base64.b64encode(content).decode()
     returned = MEDIA_BY_EXTENSION.get((output.extension or "").lower())
-    if returned and returned != media:
+    if returned and returned != attachment.media:
         source["media_type"] = returned
     return set()
 
@@ -450,10 +554,18 @@ class _Deidentifier:
         return processed, minted
 
 
-#: Recent de-identifications, kept while the Lambda stays warm.
+#: Recent de-identifications, kept while the Lambda stays warm. Bounded by
+#: characters as well as entries, because one text attachment can run to
+#: megabytes and is resent with every turn of its conversation.
 CACHE_ENTRIES = 4096
+CACHE_CHARACTERS = 32 * 1024 * 1024
 _cache: OrderedDict = OrderedDict()
+_cache_size = 0
 _cache_lock = threading.Lock()
+
+
+def _entry_size(key, value) -> int:
+    return len(key[-1]) + len(value[0])
 
 
 def _cache_get(key):
@@ -465,11 +577,26 @@ def _cache_get(key):
 
 
 def _cache_put(key, value) -> None:
+    global _cache_size
+    size = _entry_size(key, value)
+    if size > CACHE_CHARACTERS:
+        return
     with _cache_lock:
+        old = _cache.pop(key, None)
+        if old is not None:
+            _cache_size -= _entry_size(key, old)
         _cache[key] = value
-        _cache.move_to_end(key)
-        while len(_cache) > CACHE_ENTRIES:
-            _cache.popitem(last=False)
+        _cache_size += size
+        while len(_cache) > CACHE_ENTRIES or _cache_size > CACHE_CHARACTERS:
+            evicted_key, evicted = _cache.popitem(last=False)
+            _cache_size -= _entry_size(evicted_key, evicted)
+
+
+def _cache_clear() -> None:
+    global _cache_size
+    with _cache_lock:
+        _cache.clear()
+        _cache_size = 0
 
 
 def _parallel(function: Callable[[str], Any], values: list[str]) -> dict[str, Any]:
@@ -493,19 +620,19 @@ def _remaining_seconds(context):
 
 
 def _on_response(response: dict, context) -> dict | None:
-    store = settings.record_store()
     rid = request_id(context)
-    if store is None or rid is None:
+    if rid is None:
         return None
     try:
-        record = store.get(rid)
+        store = settings.record_store()
+        record = store.get(rid) if store is not None else None
     except Exception as exc:  # noqa: BLE001 - no record means the ordinary HTTP rule decides
         logger.error("inference_record_read_failed err=%s", type(exc).__name__)
         return None
     if record is None:
         return None
 
-    status = response.get("statusCode") or 200
+    status = _status(response.get("statusCode"))
     if record.response_action != "reidentify" or status >= 400:
         logger.info("inference_response kind=%s action=none status=%s", record.kind, status)
         return passthrough()
@@ -535,6 +662,14 @@ def _on_response(response: dict, context) -> dict | None:
         return passthrough()
     encoded = base64.b64encode(new_text.encode("utf-8")).decode()
     return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {"transformedGatewayResponse": {"body": encoded}}}
+
+
+def _status(value) -> int:
+    """The answer's status code. A missing or unreadable one is treated as success."""
+    try:
+        return int(value or 200)
+    except (TypeError, ValueError):
+        return 200
 
 
 class _Restorer:
@@ -686,15 +821,17 @@ def passthrough() -> dict:
 def refusal(kind: str, message: str, status: int) -> dict:
     """An error answer in the caller's dialect, so its SDK raises a typed error."""
     headers = None
-    if kind in ("invoke", "invoke_stream"):
+    if kind.startswith("invoke"):
         body = {"message": message}
         headers = {"x-amzn-errortype": {
-            400: "ValidationException", 403: "AccessDeniedException",
+            400: "ValidationException", 403: "AccessDeniedException", 413: "ValidationException",
         }.get(status, "InternalServerException")}
     elif kind == "openai":
         body = {"error": {"message": message, "type": "skyflow_shield_the_model", "code": status}}
     else:
-        error_type = {400: "invalid_request_error", 403: "permission_error"}.get(status, "api_error")
+        error_type = {
+            400: "invalid_request_error", 403: "permission_error", 413: "request_too_large",
+        }.get(status, "api_error")
         body = {"type": "error", "error": {"type": error_type, "message": message}}
     out: dict = {
         "statusCode": status,
