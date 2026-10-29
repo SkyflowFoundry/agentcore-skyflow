@@ -17,13 +17,21 @@ export interface InferenceStackProps extends cdk.StackProps {
    * bedrock/global.anthropic.claude-sonnet-5. Default bedrock.
    */
   readonly targetName?: string;
+  /**
+   * Also add a bedrock-mantle target. It serves the OpenAI Chat Completions
+   * and Responses APIs for models the Bedrock runtime target does not, such
+   * as gpt-oss on Responses. Default true.
+   */
+  readonly mantle?: boolean;
+  /** Name of the Mantle target. Default mantle. */
+  readonly mantleTargetName?: string;
 }
 
 /**
- * A Bedrock inference target on the Skyflow gateway, for shield the model.
+ * Bedrock inference targets on the Skyflow gateway, for shield the model.
  *
  * The project schema can only express inference as a `passthrough` target, so
- * this stack adds the connector target beside what `agentcore deploy` owns.
+ * this stack adds the connector targets beside what `agentcore deploy` owns.
  * It deploys after `agentcore deploy`, because the gateway has to exist first,
  * and it leaves the gateway itself alone.
  */
@@ -66,6 +74,16 @@ export class InferenceStack extends cdk.Stack {
         }),
       ],
     });
+    const mantle = props.mantle ?? true;
+    if (mantle) {
+      // Mantle authorizes inference on the account's projects rather than on
+      // model ARNs. This is the minimum policy its documentation gives for
+      // SigV4 callers.
+      policy.addStatements(new iam.PolicyStatement({
+        actions: ['bedrock-mantle:CreateInference', 'bedrock-mantle:Get*', 'bedrock-mantle:List*'],
+        resources: [`arn:aws:bedrock-mantle:${this.region}:${this.account}:project/*`],
+      }));
+    }
 
     const target = new agentcore.CfnGatewayTarget(this, 'BedrockInference', {
       gatewayIdentifier: props.gatewayIdentifier,
@@ -85,6 +103,26 @@ export class InferenceStack extends cdk.Stack {
       value: target.attrTargetId,
       description: 'Gateway target that serves /inference for Bedrock models',
     });
+
+    if (mantle) {
+      const mantleTarget = new agentcore.CfnGatewayTarget(this, 'MantleInference', {
+        gatewayIdentifier: props.gatewayIdentifier,
+        name: props.mantleTargetName ?? 'mantle',
+        description: 'Amazon Bedrock models on the OpenAI APIs through Mantle, shielded by the Skyflow interceptor',
+        targetConfiguration: {},
+        credentialProviderConfigurations: [{ credentialProviderType: 'GATEWAY_IAM_ROLE' }],
+      });
+      mantleTarget.addPropertyOverride('TargetConfiguration', {
+        Inference: { Connector: { Source: { ConnectorId: 'bedrock-mantle' } } },
+      });
+      mantleTarget.node.addDependency(policy);
+      // Created after the Bedrock target, one at a time, as every live run did.
+      mantleTarget.node.addDependency(target);
+      new cdk.CfnOutput(this, 'MantleTargetId', {
+        value: mantleTarget.attrTargetId,
+        description: 'Gateway target that serves /inference for Bedrock models through Mantle',
+      });
+    }
 
     cdk.Tags.of(this).add('agentcore:component', 'skyflow-inference-target');
   }

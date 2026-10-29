@@ -12,8 +12,9 @@ module handles the calls it understands and leaves everything else to the
 | `/v1/messages/count_tokens` | de-identified | passed, it is a count |
 | `/model/{id}/invoke` (Bedrock, Anthropic body) | de-identified | re-identified |
 | `/model/{id}/invoke-with-response-stream` | de-identified | refused when the rule re-identifies, because the binary event stream is not parsed yet |
+| `/v1/chat/completions` (OpenAI Chat Completions) | de-identified | re-identified, JSON or buffered stream |
+| `/v1/responses` (OpenAI Responses) | de-identified | re-identified, JSON or buffered stream |
 | `/v1/models` | passed | passed |
-| `/v1/chat/completions`, `/v1/responses` | passed only when the rule does nothing, refused otherwise | |
 | any other `/v1/...` or `/model/...` path | refused | |
 
 Paths arrive without the `/inference` prefix the client used, and a model id
@@ -24,11 +25,10 @@ on unread.
 
 What the request side de-identifies is chosen by the rule's `request.parts`:
 the system prompt, user and assistant turns, earlier tool calls, tool results
-and attached documents and images. Tool definitions are never touched, and
-neither are thinking blocks, whose `signature` the provider checks on the next
-turn. Server-side tool blocks such as `web_search_tool_result` were produced
-by the provider, so they go back as they came. Both are left alone only in an
-assistant turn, which is the only place the provider puts them.
+and attached documents and images. `model_formats` knows where each part sits
+in each API's body and in each kind of answer. This module does the Skyflow
+side: de-identifying what it finds, minting and recording tokens, and
+restoring them in the answer.
 
 The request side then writes a record under the gateway's `REQUEST_ID` (see
 `records`) so the response side can apply the same rule and, with
@@ -37,8 +37,7 @@ It writes one for a refused call too, because the gateway still invokes the
 response side, and without a record `httpPayloads` would replace the refusal.
 
 The gateway buffers every inference answer before the interceptor sees it, so
-a stream arrives whole. A token can straddle two text deltas, so each content
-block's deltas are joined, re-identified and written back as one delta.
+a stream arrives whole and is restored in one pass.
 """
 
 from __future__ import annotations
@@ -56,8 +55,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
+import model_formats as formats
 import payload as payload_utils
 import settings
+from model_formats import SYSTEM_NOTE, TOKEN, Refused, UnreadableAnswer  # noqa: F401 - re-exported
 from policy import InferenceRule, PolicySet
 from records import CallRecord, request_id
 from skyflow_client import SkyflowClient, SkyflowError, build_file_configuration
@@ -65,17 +66,6 @@ from skyflow_client import SkyflowClient, SkyflowError, build_file_configuration
 logger = logging.getLogger(__name__)
 
 OUTPUT_VERSION = "1.0"
-
-#: A Skyflow token such as `[NAME_AJbrIud]` or `[EMAIL_ADDRESS_nJFlbfH]`.
-TOKEN = re.compile(r"\[[A-Z][A-Z0-9_]*_[A-Za-z0-9]+\]")
-
-#: Added to the system prompt when the conversation carries tokens. Without it
-#: a model given `[NAME_AJbrIud]` may say the name looks like a placeholder.
-SYSTEM_NOTE = (
-    "Some values in this conversation have been replaced with tokens in square brackets, "
-    "such as [NAME_AbCdEfG]. Each token stands for one real value. Use the tokens exactly "
-    "as written, including in tool calls, and do not remark on them."
-)
 
 MAX_PARALLEL_CALLS = 8
 #: Seconds kept back from the Lambda budget while an attachment's run polls.
@@ -122,20 +112,8 @@ MEDIA_BY_EXTENSION = {
     "tiff": "image/tiff",
 }
 
-#: The part of a message a text block belongs to, by the message's role.
-#: A `system` message in `messages` is a mid-conversation system prompt.
-ROLE_PARTS = {"user": "user", "assistant": "assistant", "system": "system"}
-
-#: Block types that the provider produced and checks or reads back verbatim.
-#: Server-tool results, whose types end in `_tool_result`, are treated alike.
-UNTOUCHED_BLOCKS = frozenset({"thinking", "redacted_thinking", "server_tool_use"})
-
 #: A decoded model id can hold a `/`, as an inference-profile ARN does.
 _INVOKE = re.compile(r"^/model/(?P<model>.+)/(?P<op>invoke|invoke-with-response-stream)$")
-
-
-class Refused(Exception):
-    """The call carries something this rule cannot protect, so it is refused."""
 
 
 @dataclass(frozen=True)
@@ -148,7 +126,7 @@ class Call:
     @property
     def reads_answers(self) -> bool:
         """Whether the answer is model text that `response` rules apply to."""
-        return self.kind in ("messages", "invoke")
+        return self.kind in ("messages", "invoke", "chat", "responses")
 
 
 # ------------------------------------------------------------------ routing
@@ -166,8 +144,10 @@ def classify(path: str, body: Any) -> Call | None:
         return Call("count_tokens", str(model))
     if path == "/v1/models" or path.startswith("/v1/models/"):
         return Call("models")
-    if path in ("/v1/chat/completions", "/v1/responses"):
-        return Call("openai", str(model))
+    if path == "/v1/chat/completions":
+        return Call("chat", str(model))
+    if path == "/v1/responses":
+        return Call("responses", str(model))
     match = _INVOKE.match(path)
     if match:
         kind = "invoke" if match.group("op") == "invoke" else "invoke_stream"
@@ -231,9 +211,6 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
     if rule is None:
         logger.warning("inference_blocked kind=%s model=%s reason=no_rule", call.kind, call.model)
         return refuse("No shield-the-model rule covers this model, so the call was blocked.", 403)
-    if call.kind == "openai" and not rule.is_noop:
-        logger.warning("inference_blocked kind=%s model=%s reason=dialect_not_supported", call.kind, call.model)
-        return refuse("Shield the model does not support the OpenAI dialect yet. Use the Anthropic Messages API.", 403)
     if call.kind == "invoke_stream" and rule.response.action == "reidentify":
         logger.warning("inference_blocked kind=%s model=%s reason=stream_not_supported", call.kind, call.model)
         return refuse(
@@ -254,15 +231,16 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         return _remember(store, rid, record, call) or passthrough()
     if not isinstance(body, dict):
         return refuse("The model request body is not a JSON object.", 400)
-    if not _is_anthropic_body(call, body):
-        logger.warning("inference_blocked kind=%s model=%s reason=body_not_anthropic", call.kind, call.model)
+    if not formats.readable(call.kind, body):
+        logger.warning("inference_blocked kind=%s model=%s reason=body_unreadable", call.kind, call.model)
         return refuse(
-            "Shield the model reads only Anthropic Messages request bodies, so the model call was blocked.",
+            "Shield the model cannot read this request body. InvokeModel bodies are read only in "
+            "Anthropic's shape, so the model call was blocked.",
             403,
         )
 
     try:
-        new_body, minted, stats = deidentify_request(body, rule, settings.build_client(), context)
+        new_body, minted, stats = deidentify_request(body, rule, settings.build_client(), context, call.kind)
     except Refused as exc:
         logger.warning("inference_blocked kind=%s model=%s reason=%s", call.kind, call.model, exc)
         return refuse(f"{exc}, so the model call was blocked.", 403)
@@ -288,21 +266,6 @@ def _on_request(request: dict, policy_set: PolicySet, context) -> dict | None:
         call.kind, call.model, stats["strings"], stats["files"], len(minted),
     )
     return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {"transformedGatewayRequest": {"body": encoded}}}
-
-
-def _is_anthropic_body(call: Call, body: dict) -> bool:
-    """Whether a request body is in the Anthropic Messages shape this module reads.
-
-    Bedrock's InvokeModel takes each model family's own body: `prompt` for
-    Llama, `inputText` for Titan, `message` and `chat_history` for Cohere.
-    None of those are read here, so only Anthropic's, which names
-    `anthropic_version`, is let through.
-    """
-    if not isinstance(body.get("messages"), list):
-        return False
-    if call.kind.startswith("invoke"):
-        return "anthropic_version" in body
-    return True
 
 
 def _refuse(store, rid: str, call: Call, message: str, status: int) -> dict:
@@ -336,29 +299,45 @@ def _remember(store, rid: str, record: CallRecord, call: Call) -> dict | None:
     return None
 
 
-def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, context=None):
-    """De-identify the parts of a Messages-shaped body that the rule names.
+def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, context=None, kind: str = "messages"):
+    """De-identify the parts of a request body that the rule names.
 
+    `kind` is the call kind, which says which API's format the body is in.
     Returns `(new_body, minted_tokens, stats)`. The body is copied, never
     changed in place.
     """
     body = copy.deepcopy(body)
-    parts = set(rule.request.parts)
-    texts, inputs, files = _collect(body, parts)
+    found = formats.collect(kind, body, set(rule.request.parts))
     # Every attachment is checked before anything is sent to Skyflow, so a call
     # that will be refused for one of them mints no tokens first.
-    checked = [(source, part, _check_attachment(source, part, rule)) for source, part in files]
+    checked = [(ref, _check_attachment(ref.source, ref.part, rule)) for ref in found.files]
     deidentifier = _Deidentifier(client, rule)
 
     # Each distinct string is sent once, in parallel, whatever its position.
     # A conversation repeats itself turn after turn, so this and the cache
     # are what keep a long history cheap.
     slots: list[tuple[Any, Any, str]] = []
-    for holder, key in texts:
+    for holder, key in found.texts:
         value = holder.get(key)
         if isinstance(value, str) and rule.scope.value_eligible(value):
             slots.append((holder, key, value))
-    for holder, key in inputs:
+    trees = list(found.trees)
+    # OpenAI tool-call arguments are JSON inside a string. They are parsed so
+    # the scope's key globs apply, and written back as JSON once done. A string
+    # that is not JSON is de-identified as text.
+    encoded: list[tuple[Any, Any, dict]] = []
+    for holder, key in found.json_strings:
+        try:
+            parsed = json.loads(holder[key])
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            wrapper = {key: parsed}
+            encoded.append((holder, key, wrapper))
+            trees.append((wrapper, key))
+        elif rule.scope.value_eligible(holder[key]):
+            slots.append((holder, key, holder[key]))
+    for holder, key in trees:
         for path, value in payload_utils.collect_strings({key: holder[key]}, rule.scope):
             container = holder
             for step in path[:-1]:
@@ -372,121 +351,20 @@ def deidentify_request(body: dict, rule: InferenceRule, client: SkyflowClient, c
         minted |= new_tokens
     for holder, key, value in slots:
         holder[key] = results[value][0]
+    for holder, key, wrapper in encoded:
+        holder[key] = json.dumps(wrapper[key])
 
-    for source, part, attachment in checked:
-        minted |= _deidentify_file(source, part, attachment, rule, client, deidentifier, context)
+    for ref, attachment in checked:
+        minted |= _deidentify_file(ref.source, ref.part, attachment, rule, client, deidentifier, context)
+        if ref.commit is not None:
+            ref.commit(ref.source)
 
-    if rule.request.system_note and TOKEN.search(json.dumps(body.get("messages") or [])):
-        _add_system_note(body)
+    # Tokens minted inside a base64 attachment cannot be seen in the body, so
+    # the minted set counts as well as tokens an earlier turn carried in.
+    if rule.request.system_note and (minted or TOKEN.search(json.dumps(body))):
+        formats.add_system_note(kind, body)
 
-    return body, minted, {"strings": len(distinct), "files": len(files)}
-
-
-def _collect(body: dict, parts: set[str]):
-    """Find every string and file the parts name, as `(holder, key)` pairs."""
-    texts: list[tuple[dict, str]] = []
-    inputs: list[tuple[dict, str]] = []
-    files: list[tuple[dict, str]] = []
-
-    system = body.get("system")
-    if "system" in parts:
-        if isinstance(system, str):
-            texts.append((body, "system"))
-        elif isinstance(system, list):
-            for block in system:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    texts.append((block, "text"))
-
-    for message in body.get("messages") or []:
-        if not isinstance(message, dict):
-            continue
-        role_part = ROLE_PARTS.get(message.get("role"), "user")
-        content = message.get("content")
-        if isinstance(content, str):
-            if role_part in parts:
-                texts.append((message, "content"))
-        elif isinstance(content, list):
-            for block in content:
-                _collect_block(block, role_part, parts, texts, inputs, files)
-    return texts, inputs, files
-
-
-def _collect_block(block, text_part: str, parts: set[str], texts, inputs, files) -> None:
-    if not isinstance(block, dict):
-        return
-    kind = block.get("type") or ""
-
-    if kind == "text":
-        if text_part in parts:
-            texts.append((block, "text"))
-    elif kind in UNTOUCHED_BLOCKS or (kind.endswith("_tool_result") and kind != "tool_result"):
-        # The provider writes these into its own turn. Anywhere else one came
-        # from the client, and skipping it would wave through whatever it holds.
-        if text_part != "assistant":
-            raise Refused(f"A {kind} block outside an assistant turn cannot be inspected")
-        return
-    elif kind == "tool_use":
-        if "tool_call" in parts and isinstance(block.get("input"), (dict, list)):
-            inputs.append((block, "input"))
-    elif kind == "tool_result":
-        content = block.get("content")
-        if isinstance(content, str):
-            if "tool_result" in parts:
-                texts.append((block, "content"))
-        elif isinstance(content, list):
-            for inner in content:
-                _collect_block(inner, "tool_result", parts, texts, inputs, files)
-    elif kind == "search_result":
-        # Part of whatever holds it: a tool result's when a tool returned it,
-        # the turn's when the caller put it straight into a message.
-        if text_part in parts:
-            if isinstance(block.get("title"), str):
-                texts.append((block, "title"))
-            for inner in block.get("content") or []:
-                _collect_block(inner, text_part, parts, texts, inputs, files)
-    elif kind == "document":
-        if "document" not in parts:
-            return
-        for key in ("title", "context"):
-            if isinstance(block.get(key), str):
-                texts.append((block, key))
-        source = _source(block, "document")
-        source_type = source.get("type")
-        if source_type == "text":
-            texts.append((source, "data"))
-        elif source_type == "base64":
-            files.append((source, "document"))
-        elif source_type == "content":
-            for inner in source.get("content") or []:
-                _collect_block(inner, "document", parts | {"document"}, texts, inputs, files)
-        else:
-            raise Refused(f"An attached document sent as {source_type or 'an unknown source'} cannot be inspected")
-    elif kind == "image":
-        if "image" not in parts:
-            return
-        source = _source(block, "image")
-        if source.get("type") != "base64":
-            raise Refused("An attached image sent by reference cannot be inspected")
-        files.append((source, "image"))
-    else:
-        raise Refused(f"A {kind or 'untyped'} content block is not supported by shield the model")
-
-
-def _source(block: dict, part: str) -> dict:
-    source = block.get("source")
-    if not isinstance(source, dict):
-        raise Refused(f"An attached {part} has no source object")
-    return source
-
-
-def _add_system_note(body: dict) -> None:
-    system = body.get("system")
-    if isinstance(system, list):
-        body["system"] = system + [{"type": "text", "text": SYSTEM_NOTE}]
-    elif isinstance(system, str) and system:
-        body["system"] = f"{system}\n\n{SYSTEM_NOTE}"
-    else:
-        body["system"] = SYSTEM_NOTE
+    return body, minted, {"strings": len(distinct), "files": len(checked)}
 
 
 @dataclass(frozen=True)
@@ -664,12 +542,7 @@ def _on_response(response: dict, context) -> dict | None:
             raise SkyflowError("the answer body was not passed to the interceptor")
         text = base64.b64decode(raw).decode("utf-8")
         restorer = _Restorer(settings.build_client(), record)
-        if content_type == "text/event-stream":
-            new_text, count = reidentify_stream(text, record.response_parts, restorer)
-        elif content_type in ("application/json", ""):
-            new_text, count = reidentify_json(text, record.response_parts, restorer)
-        else:
-            raise SkyflowError(f"cannot re-identify an answer of type {content_type}")
+        new_text, answer_format, count = formats.restore_answer(text, content_type, record.response_parts, restorer)
     except Exception as exc:  # noqa: BLE001 - decided by the record's failure mode
         if record.on_error == "fail_open":
             logger.warning("inference_fail_open direction=response kind=%s err=%s", record.kind, exc)
@@ -677,7 +550,7 @@ def _on_response(response: dict, context) -> dict | None:
         logger.error("inference_fail_closed direction=response kind=%s err=%s", record.kind, exc)
         return refusal(record.kind, "Sensitive-data processing failed, so the answer was withheld.", 502)
 
-    logger.info("inference_response kind=%s action=reidentify restored=%d", record.kind, count)
+    logger.info("inference_response kind=%s format=%s action=reidentify restored=%d", record.kind, answer_format, count)
     if not count:
         return passthrough()
     encoded = base64.b64encode(new_text.encode("utf-8")).decode()
@@ -693,7 +566,11 @@ def _status(value) -> int:
 
 
 class _Restorer:
-    """Re-identifies tokens in answer text, limited to minted ones when the record says so."""
+    """Re-identifies tokens in answer text, limited to minted ones when the record says so.
+
+    Each token is re-identified once per answer and the value reused, so every
+    copy of a text in a stream gets the same restored value.
+    """
 
     def __init__(self, client: SkyflowClient, record: CallRecord) -> None:
         self._client = client
@@ -702,26 +579,48 @@ class _Restorer:
         self._values: dict[str, str] = {}
         self._lock = threading.Lock()
 
-    def __call__(self, text: str) -> str:
+    def _wanted(self, text: str) -> set[str]:
         found = set(TOKEN.findall(text))
-        if self._only_minted:
-            found &= self._minted
+        return found & self._minted if self._only_minted else found
+
+    def pending(self, text: str) -> bool:
+        """Whether a text holds a token this answer would restore."""
+        return bool(self._wanted(text))
+
+    def text(self, text: str, escape: bool = False) -> str:
+        """Restore the tokens in a text. `escape` writes each value as it would sit inside a JSON string."""
+        found = self._wanted(text)
         if not found:
             return text
-        if not self._only_minted:
-            return self._client.reidentify(text).text
         missing = [token for token in found if token not in self._values]
         for token, value in _parallel(lambda t: self._client.reidentify(t).text, missing).items():
             with self._lock:
                 self._values[token] = value
         for token in sorted(found, key=len, reverse=True):
-            text = text.replace(token, self._values[token])
+            value = self._values[token]
+            text = text.replace(token, json.dumps(value)[1:-1] if escape else value)
         return text
+
+    __call__ = text
+
+    def json_string(self, value: str) -> str:
+        """Restore tool-call arguments held as JSON in a string.
+
+        Parsed when it parses, so a restored value is escaped by the encoder.
+        Arguments cut short by the token limit are not JSON, and their tokens
+        are replaced in place with escaped values.
+        """
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return self.text(value, escape=True)
+        new, changed = self.tree(parsed)
+        return json.dumps(new) if changed else value
 
     def tree(self, node) -> tuple[Any, int]:
         """Re-identify every string inside a JSON value. Returns `(node, changed)`."""
         if isinstance(node, str):
-            new = self(node)
+            new = self.text(node)
             return new, int(new != node)
         if isinstance(node, list):
             changed = 0
@@ -742,95 +641,6 @@ class _Restorer:
         return node, 0
 
 
-def reidentify_json(text: str, parts: tuple[str, ...], restore: _Restorer) -> tuple[str, int]:
-    """Re-identify an Anthropic message answer. Returns `(text, blocks_changed)`."""
-    doc = json.loads(text)
-    if not isinstance(doc, dict):
-        return text, 0
-    changed = 0
-    for block in doc.get("content") or []:
-        if not isinstance(block, dict):
-            continue
-        kind = block.get("type")
-        if kind == "text" and "text" in parts and isinstance(block.get("text"), str):
-            new = restore(block["text"])
-            if new != block["text"]:
-                block["text"] = new
-                changed += 1
-        elif kind == "tool_use" and "tool_call" in parts:
-            block["input"], n = restore.tree(block.get("input"))
-            changed += n
-    return (json.dumps(doc), changed) if changed else (text, 0)
-
-
-def reidentify_stream(text: str, parts: tuple[str, ...], restore: _Restorer) -> tuple[str, int]:
-    """Re-identify a buffered Anthropic server-sent event stream.
-
-    Returns `(text, blocks_changed)`. Each content block's deltas are joined
-    first, because a token can be split across two of them. The restored text
-    goes back as the block's first delta and the block's later deltas are
-    emptied, so the event sequence keeps its shape.
-    """
-    text = text.replace("\r\n", "\n")
-    events = []
-    text_deltas: dict[Any, list[int]] = {}
-    json_deltas: dict[Any, list[int]] = {}
-    for position, raw in enumerate(text.split("\n\n")):
-        lines = raw.split("\n")
-        data_line = next((i for i, line in enumerate(lines) if line.startswith("data:")), None)
-        data = None
-        if data_line is not None:
-            try:
-                data = json.loads(lines[data_line][5:].lstrip())
-            except ValueError:
-                data = None
-        events.append([lines, data_line, data, False])
-        if isinstance(data, dict) and data.get("type") == "content_block_delta":
-            delta = data.get("delta") or {}
-            if delta.get("type") == "text_delta":
-                text_deltas.setdefault(data.get("index"), []).append(position)
-            elif delta.get("type") == "input_json_delta":
-                json_deltas.setdefault(data.get("index"), []).append(position)
-
-    changed = 0
-
-    def rewrite(positions: list[int], field: str, value: str) -> None:
-        for n, position in enumerate(positions):
-            events[position][2]["delta"][field] = value if n == 0 else ""
-            events[position][3] = True
-
-    if "text" in parts:
-        for positions in text_deltas.values():
-            joined = "".join(events[p][2]["delta"].get("text", "") for p in positions)
-            new = restore(joined)
-            if new != joined:
-                rewrite(positions, "text", new)
-                changed += 1
-    if "tool_call" in parts:
-        for positions in json_deltas.values():
-            joined = "".join(events[p][2]["delta"].get("partial_json", "") for p in positions)
-            if not joined.strip():
-                continue
-            try:
-                arguments = json.loads(joined)
-            except ValueError as exc:
-                raise SkyflowError("a streamed tool call's arguments are not valid JSON") from exc
-            new_arguments, n = restore.tree(arguments)
-            if n:
-                rewrite(positions, "partial_json", json.dumps(new_arguments))
-                changed += n
-
-    if not changed:
-        return text, 0
-    out = []
-    for lines, data_line, data, dirty in events:
-        if dirty:
-            lines = list(lines)
-            lines[data_line] = "data: " + json.dumps(data)
-        out.append("\n".join(lines))
-    return "\n\n".join(out), changed
-
-
 # ------------------------------------------------------------------ outputs
 
 
@@ -846,7 +656,7 @@ def refusal(kind: str, message: str, status: int) -> dict:
         headers = {"x-amzn-errortype": {
             400: "ValidationException", 403: "AccessDeniedException", 413: "ValidationException",
         }.get(status, "InternalServerException")}
-    elif kind == "openai":
+    elif kind in ("chat", "responses"):
         body = {"error": {"message": message, "type": "skyflow_shield_the_model", "code": status}}
     else:
         error_type = {
