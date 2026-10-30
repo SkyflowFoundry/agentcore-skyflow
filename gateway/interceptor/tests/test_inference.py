@@ -37,7 +37,7 @@ from policy import PolicyError, PolicySet  # noqa: E402
 from records import CallRecord, RecordStore  # noqa: E402
 from skyflow_client import FileOutput, FileRunResult, SkyflowClient, SkyflowError, _safe_error_detail  # noqa: E402
 
-NAME, EMAIL, PHONE = "Daniel Okonkwo", "daniel.okonkwo@example.com", "+44 20 7946 0133"
+NAME, EMAIL, PHONE = "Mateo Jackson", "mateo_jackson@example.com", "555-0100"
 TOKENS = {NAME: "[NAME_AJbrIud]", EMAIL: "[EMAIL_ADDRESS_nJFlbfH]", PHONE: "[PHONE_NUMBER_sk9spjK]"}
 VALUES = {token: value for value, token in TOKENS.items()}
 FOREIGN = "[NAME_Zz9Yy8X]"

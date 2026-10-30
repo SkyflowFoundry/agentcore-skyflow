@@ -1,10 +1,14 @@
 # Skyflow de-identification inside an AgentCore Gateway
 
-This project puts Skyflow between an AI agent and the tools it calls. An Amazon
-Bedrock AgentCore Gateway fronts every MCP tool server and a Lambda interceptor
-rewrites each request and response as it passes through. You decide for each tool
-which side is allowed to see sensitive values and the interceptor enforces that
-decision in both directions.
+This project puts Skyflow between an AI agent and the tools and models it calls.
+An Amazon Bedrock AgentCore Gateway fronts every MCP tool server and the agent's
+model and a Lambda interceptor rewrites each request and response as it passes
+through. You decide for each tool which side is allowed to see sensitive values
+and the interceptor enforces that decision in both directions.
+
+It is the reference implementation for the AWS blog post "Protect agent tool
+calls with Skyflow and Amazon Bedrock AgentCore Gateway". To add the interceptor
+to a gateway you already run see [Use with your own gateway](#use-with-your-own-gateway).
 
 The interceptor is the part worth reading. Everything else in this repository
 exists to give it something real to sit in front of.
@@ -12,21 +16,32 @@ exists to give it something real to sit in front of.
 ## Capabilities
 
 1. **Tool arguments are de-identified before they leave AWS.** A search for a
-   customer by name reaches the upstream server as `[NAME_AJbrIud]` and the
+   customer by name reaches the upstream server as `[NAME_KhpdiUQ]` and the
    result comes back with the real name restored before the agent reads it.
-2. **The direction is configurable for each tool.** The same machinery can be
-   turned around so that the tool sees real data and the model never does. That
-   matters when a tool returns scraped web content full of personal data the
-   agent has no reason to read.
+2. **The model never reads a sensitive value.** The agent's model calls go
+   through the gateway's inference endpoint. The interceptor de-identifies the
+   prompt and the history and attached files and tool results before the model
+   provider sees them. It then restores the tokens it minted for that call in
+   the model's answer. A tool rule can also be turned around so that the tool
+   sees real data and its result reaches the agent already de-identified. That
+   suits scraped web content full of personal data the agent has no reason to
+   read.
 3. **Files behind signed URLs are de-identified before the agent opens them.**
    The gateway hands the signed URL to Skyflow and swaps in a new signed URL
    pointing at a cleaned copy. The bytes never pass through our code so file size
    does not matter.
 4. **Nothing in the agent knows any of this is happening.** The agent discovers
    its gateway from an injected environment variable and signs each request with
-   SigV4. Pointing it at a different endpoint takes one environment variable.
+   SigV4. Its model client points at the gateway's inference endpoint instead of
+   at Amazon Bedrock. Pointing it at a different endpoint takes one environment
+   variable.
 
 ## Architecture
+
+![The agent calls its tools and its model through AgentCore Gateway and the Skyflow interceptor runs at both interception points](docs/diagrams/fig1-reference-architecture.png)
+
+The walkthroughs for each mode are in [`docs/diagrams`](docs/diagrams). The
+text version below shows the tool path.
 
 ```text
 Flow (agent runtime)
@@ -51,7 +66,9 @@ Flow (agent runtime)
 One Lambda serves both interception points. It reads its policy from SSM
 Parameter Store and its Skyflow API key from Secrets Manager. Both are cached
 with a sixty second time to live so a policy change takes effect without a
-redeploy.
+redeploy. For model calls it also writes a short-lived record to DynamoDB of
+which tokens each call minted so the answer restores only those. The record
+holds no original values.
 
 ## Repository layout
 
@@ -173,6 +190,48 @@ longer waits for the interceptor stack.
 { "interceptorFunctionArn": "arn:aws:lambda:us-east-1:<account>:function:<name>" }
 ```
 
+**Step 4 shields the model.** It adds the inference targets to the gateway and
+must run before Flow can answer because Flow sends its model calls through the
+gateway by default. The commands are step 4 under
+[Deploy](gateway/interceptor/README.md#deploy) in the interceptor README.
+
+## Use with your own gateway
+
+The interceptor works on any AgentCore Gateway. You do not need the agent or the
+gateway in this repository.
+
+1. **Subscribe to Skyflow.** Skyflow is in
+   [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-zysz3tjic76qg).
+   Create a vault with Detect enabled and a long-lived API key.
+2. **Store the API key** in Secrets Manager as in step 0b above. The document
+   bucket is only for this repository's `s3` target and you can skip it.
+3. **Deploy the interceptor stack** as in step 1 above. It creates the Lambda
+   and its policy parameter and the DynamoDB table for model-call records and
+   the CloudWatch metrics and alarms.
+4. **Attach it to your gateway.** The script grants the gateway's role
+   `lambda:InvokeFunction` on that one function and attaches the interceptor at
+   both interception points. It keeps every other setting on the gateway.
+
+   ```bash
+   uv run --with boto3 python scripts/attach_interceptor.py --gateway-name <your-gateway> --region <region> \
+     --function-arn "$(aws cloudformation describe-stacks --stack-name SkyflowInterceptorStack \
+       --query "Stacks[0].Outputs[?OutputKey=='InterceptorFunctionArn'].OutputValue" --output text)"
+   uv run --with boto3 python scripts/attach_interceptor.py --gateway-name <your-gateway> --region <region> --check
+   ```
+
+   If CloudFormation or the CDK manages your gateway then declare the
+   interceptor there instead because the next stack update removes one the
+   script attached. `agentcore/cdk/lib/cdk-stack.ts` shows the
+   `interceptorConfigurations` and the two role grants to copy.
+5. **Write your policy.** Name your servers and tools in
+   `gateway/interceptor/config/policy.json` and publish it with
+   `scripts/put_policy.py`. [Policy](#policy) below explains the format. A tool
+   no rule names gets the defaults.
+6. **Shield the model if you want it.** Deploy `SkyflowInferenceStack` with your
+   gateway's identifier and role ARN as in step 4. Then point the agent's model
+   client at `<gateway URL>/inference` with SigV4 signing.
+   `app/Flow/model/gateway.py` does this for a Strands agent.
+
 ## Policy
 
 The policy lives at `gateway/interceptor/config/policy.json` and it is the source
@@ -248,6 +307,8 @@ CI runs five jobs on every push and pull request.
 
 | Path | What it covers |
 | --- | --- |
+| `docs/diagrams/` | The blog's reference architecture and one sequence diagram for each mode, with the script that draws them |
+| `docs/SHIELD-THE-MODEL.md` | How shield the model came to cover inference traffic and what the live runs showed |
 | `docs/DEMO.md` | How to prove the de-identification works against the deployed stack |
 | `docs/RECORDING.md` | The script for recording the blog demo: setup, three scenes, screenshots and teardown |
 | `gateway/README.md` | How AgentCore interceptors and targets work, including the payload shape trap that catches people out |
