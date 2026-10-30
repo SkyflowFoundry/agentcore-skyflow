@@ -113,7 +113,7 @@ shell set up as in step 1.
 Prompt the agent:
 
 ```
-Search the web for "Daniel Okonkwo dispute ACME Electronics London" and tell me what you find about the merchant.
+Search the web for "Mateo Jackson dispute AnyCompany Electronics London" and tell me what you find about the merchant.
 ```
 
 The console shows the `exa___web_search_exa` tool call with the customer's real
@@ -125,7 +125,7 @@ aws logs filter-log-events --log-group-name "$LOG_GROUP" --filter-pattern upstre
   --start-time "$(( $(date +%s) - 300 ))000" --query 'events[-1].message' --output text
 ```
 
-The query reads `[NAME_…] dispute ACME Electronics London`. The name is a vault
+The query reads `[NAME_…] dispute AnyCompany Electronics London`. The name is a vault
 token. London survives because the search rule's entity list leaves out
 locations, so the results are still about the right merchant. The agent's
 answer uses the real name again, because the response was re-identified on the
@@ -150,7 +150,7 @@ in the terminal. This output is Figure 4:
 $PY scripts/show_document.py samples/dispute-case-note.txt
 ```
 
-Tokens with a long random suffix, such as `[NAME_AJbrIud]`, are vault tokens
+Tokens with a long random suffix, such as `[NAME_KhpdiUQ]`, are vault tokens
 that someone with vault permissions can reverse.
 
 ### Scene 3: a policy change without a redeploy

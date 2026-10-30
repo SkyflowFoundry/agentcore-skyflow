@@ -92,11 +92,11 @@ aws s3 cp s3://$BUCKET/samples/dispute-case-note.txt -
 ```
 Card dispute case note
 Case: DSP-20481
-Customer: Daniel Okonkwo
-Email: daniel.okonkwo@example.com
-Phone: 555-0133
+Customer: Mateo Jackson
+Email: mateo_jackson@example.com
+Phone: 555-0100
 Card: 4111 1111 1111 1111
-Merchant: ACME Electronics, London
+Merchant: AnyCompany Electronics, London
 Notes: Disputes a £249.00 charge on 12 September. Order never arrived.
 ```
 
@@ -116,11 +116,11 @@ print(urllib.request.urlopen(url, timeout=60).read().decode())
 ```
 Card dispute case note
 Case: DSP-20481
-Customer: [NAME_AJbrIud]
-Email: [EMAIL_ADDRESS_nJFlbfH]
-Phone: [PHONE_NUMBER_VVwjCfV]
-Card: [CREDIT_CARD_k2LpQ8s]
-Merchant: ACME Electronics, [LOCATION_y3wQt7I]
+Customer: [NAME_KhpdiUQ]
+Email: [EMAIL_ADDRESS_n6Eg15w]
+Phone: [PHONE_NUMBER_OBUs3N7]
+Card: [CREDIT_CARD_20Nsush]
+Merchant: AnyCompany Electronics, [LOCATION_ybLHA45]
 Notes: Disputes a £249.00 charge on 12 September. Order never arrived.
 ```
 
@@ -131,7 +131,7 @@ London is tokenized in the document even though the web search rule keeps it.
 
 The long random suffix tells you which kind of token you got.
 
-1. `[NAME_AJbrIud]` is a vault token. Someone with vault permissions can recover
+1. `[NAME_KhpdiUQ]` is a vault token. Someone with vault permissions can recover
    the original out of band.
 2. `[NAME_1]` is a counter. Nothing can reverse it.
 
@@ -142,8 +142,8 @@ in the output tells you which kind you got.
 
 | Format | Result | Token |
 | --- | --- | --- |
-| `txt` | de-identified | `[NAME_AJbrIud]` vault token |
-| `docx` | de-identified | `[NAME_AJbrIud]` vault token |
+| `txt` | de-identified | `[NAME_KhpdiUQ]` vault token |
+| `docx` | de-identified | `[NAME_KhpdiUQ]` vault token |
 | `pdf` | de-identified | `[NAME_1]` counter |
 
 A PDF still gets de-identified and the original values are gone from the output.
@@ -235,7 +235,7 @@ app/Flow/.venv/bin/python scripts/demo_policy.py one-way-documents --region us-e
 ```
 
 Wait about sixty seconds for the interceptor cache to expire and call again. The
-tokens become `[NAME_1]` instead of `[NAME_AJbrIud]`. No redeploy is involved.
+tokens become `[NAME_1]` instead of `[NAME_KhpdiUQ]`. No redeploy is involved.
 
 Once you have seen that, put the shipped policy back:
 

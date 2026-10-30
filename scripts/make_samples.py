@@ -23,11 +23,11 @@ STEM = "dispute-case-note"
 LINES = [
     "Card dispute case note",
     "Case: DSP-20481",
-    "Customer: Daniel Okonkwo",
-    "Email: daniel.okonkwo@example.com",
-    "Phone: 555-0133",
+    "Customer: Mateo Jackson",
+    "Email: mateo_jackson@example.com",
+    "Phone: 555-0100",
     "Card: 4111 1111 1111 1111",
-    "Merchant: ACME Electronics, London",
+    "Merchant: AnyCompany Electronics, London",
     "Notes: Disputes a \u00a3249.00 charge on 12 September. Order never arrived.",
 ]
 

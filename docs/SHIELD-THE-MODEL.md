@@ -2,7 +2,7 @@
 
 ## Status
 
-Built on 28 October 2026 and not yet deployed. A spike on a scratch gateway answered the open behaviour questions first. Its results are under [Spike results](#spike-results). The finished code then ran end to end on a second scratch gateway, and the code with the review fixes on a third. Those results are under [Live verification](#live-verification). SkyflowGateway is unchanged until the deploy steps in `gateway/interceptor/README.md` run.
+Built on 28 October 2026 and deployed to SkyflowGateway on 29 October 2026. A spike on a scratch gateway answered the open behaviour questions first. Its results are under [Spike results](#spike-results). The finished code then ran end to end on a second scratch gateway, and the code with the review fixes on a third. Those results are under [Live verification](#live-verification). The deploy steps are in `gateway/interceptor/README.md`.
 
 On 29 October 2026 a format spike tested which models answer on which API through each connector. Its results are under [Format spike](#format-spike). The OpenAI Chat Completions and Responses adapters followed and ran end to end on a fourth scratch gateway.
 

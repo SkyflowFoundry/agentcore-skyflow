@@ -34,9 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 #: Values from the sample note that must not survive in the clean copy.
 SAMPLE_VALUES = (
-    "Daniel Okonkwo",
-    "daniel.okonkwo@example.com",
-    "555-0133",
+    "Mateo Jackson",
+    "mateo_jackson@example.com",
+    "555-0100",
     "4111 1111 1111 1111",
 )
 
